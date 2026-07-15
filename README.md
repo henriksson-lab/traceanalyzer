@@ -1,4 +1,4 @@
-# traceanalyzer
+# Trace analyzer
 
 Open-source, **post-measurement analysis** for automated-electrophoresis
 instruments — a replacement for the vendor software that ships with the Agilent
@@ -37,7 +37,8 @@ This is an early prototype focused on the Bioanalyzer reader.
     marker-ratio mass coefficients, molecular weight).
 - `docs/xad_format.md` — reverse-engineered `.xad` container + schema spec.
 - `scripts/fetch-testdata.sh` — download the demo fixtures (they aren't committed).
-- `crates/traceanalyzer` — Slint GUI: sample list + electropherogram plot.
+- `crates/traceanalyzer` — Trace analyzer Slint GUI: sample list +
+  electropherogram plot.
 - `testdata/` — real demo runs (from jwfoley/bioanalyzeR, MIT).
 
 ## Try it
@@ -53,6 +54,9 @@ cargo run -p traceio --example inspect -- testdata/demo_rna_nano.xml.gz
 # GUI viewer (needs a display):
 cargo run -p traceanalyzer -- testdata/demo_dna1000.xml.gz
 
+# macOS app bundle:
+make osx-app
+
 # Parser tests (validate against real demo files):
 cargo test -p traceio
 
@@ -67,7 +71,7 @@ The `inspect`/GUI loaders accept `.xad` (native), `.xml`, and `.xml.gz`.
 - `scripts/fetch-testdata.sh` downloads the gitignored demo fixtures into
   `testdata/`. The `traceio` integration tests and file-loading examples
   expect `demo_dna1000.xml.gz` and `demo_rna_nano.xml.gz` there.
-- `traceanalyzer` uses Slint plus the `winit` backend. Running the GUI needs a
+- Trace analyzer uses Slint plus the `winit` backend. Running the GUI needs a
   working display (`DISPLAY` or a Wayland session). In headless Linux CI, run GUI
   smoke commands under Xvfb, for example:
   `xvfb-run -a cargo run -p traceanalyzer -- testdata/demo_dna1000.xml.gz`.

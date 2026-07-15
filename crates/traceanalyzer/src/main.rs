@@ -17,6 +17,7 @@ use traceanalyzer::plot::{self, Series, Viewport, XAxis};
 use traceanalyzer::state::{AppState, Marker, MarkerDrag};
 use traceanalyzer::{gel, loading, overview, render, table};
 use traceio::calibration::{marker_times, MarkerOverride};
+use traceio::Electrophoresis;
 
 slint::include_modules!();
 
@@ -106,6 +107,31 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Rename focused trace, then advance to the next trace for bulk renaming.
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_rename_sample(move |name| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let table = {
+                let mut s = st.borrow_mut();
+                if !s.raw_mode() {
+                    let idx = s.primary();
+                    if let Some(sample) = s.run.samples.get_mut(idx) {
+                        sample.name = name.trim().to_string();
+                    }
+                    if idx + 1 < s.run.samples.len() {
+                        s.select_click(idx + 1, false, false);
+                        s.viewport = None;
+                    }
+                }
+                refresh_all(&ui, &mut s)
+            };
+            table.apply(&ui);
+            show_selected(&ui, &st.borrow());
+        });
+    }
+
     // Toggle peak-height normalization for overlaid traces.
     {
         let ui_weak = ui.as_weak();
@@ -176,11 +202,15 @@ fn main() -> anyhow::Result<()> {
                 if s.raw_mode() {
                     None
                 } else if s.overview_gel {
-                    let (w, _) = gel::size(s.run.samples.len());
-                    gel::lane_at(&s.run, fx as f64, w)
+                    let indices = overview_sample_indices(&s);
+                    let filtered = filtered_run(&s.run, &indices);
+                    let (w, _) = gel::size(filtered.samples.len());
+                    gel::lane_at(&filtered, fx as f64, w).and_then(|i| indices.get(i).copied())
                 } else {
-                    let layout = overview::layout(s.run.samples.len());
+                    let indices = overview_sample_indices(&s);
+                    let layout = overview::layout(indices.len());
                     overview::cell_at(&layout, fx as f64, fy as f64)
+                        .and_then(|i| indices.get(i).copied())
                 }
             };
             if let Some(idx) = idx {
@@ -216,6 +246,17 @@ fn main() -> anyhow::Result<()> {
         ui.on_toggle_overview_gel(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             st.borrow_mut().overview_gel ^= true;
+            refresh_overview(&ui, &st.borrow());
+        });
+    }
+
+    // Overview: include/exclude ladder wells.
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_toggle_overview_ladders(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            st.borrow_mut().overview_show_ladders ^= true;
             refresh_overview(&ui, &st.borrow());
         });
     }
@@ -295,7 +336,8 @@ fn main() -> anyhow::Result<()> {
             }
         });
     }
-    // Toggle marker-edit mode (raw-time axis + draggable marker lines).
+    // Toggle marker scaling. Internally, marker-edit mode means scaling is off:
+    // the plot switches to raw time and shows draggable marker lines.
     {
         let ui_weak = ui.as_weak();
         let st = state.clone();
@@ -415,6 +457,7 @@ fn refresh_all(ui: &AppWindow, st: &mut AppState) -> TableRefresh {
 fn refresh_overview(ui: &AppWindow, st: &AppState) {
     ui.set_overview_shared_y(st.overview_shared_y);
     ui.set_overview_gel(st.overview_gel);
+    ui.set_overview_show_ladders(st.overview_show_ladders);
     if st.raw_mode() {
         let w = plot::PLOT_W;
         let h = plot::PLOT_H;
@@ -426,18 +469,40 @@ fn refresh_overview(ui: &AppWindow, st: &AppState) {
         ui.set_overview_image_height(h as i32);
         ui.set_overview_image(rgb_to_image(&buf, w, h));
     } else if st.overview_gel {
-        let (w, h) = gel::size(st.run.samples.len());
-        let buf = gel::render(&st.run, w, h);
+        let indices = overview_sample_indices(st);
+        let run = filtered_run(&st.run, &indices);
+        let (w, h) = gel::size(run.samples.len());
+        let buf = gel::render(&run, w, h);
         ui.set_overview_image_width(w as i32);
         ui.set_overview_image_height(h as i32);
         ui.set_overview_image(rgb_to_image(&buf, w, h));
     } else {
-        let layout = overview::layout(st.run.samples.len());
-        let buf = overview::render(&st.run, st.y_mode, st.overview_shared_y, &layout);
+        let indices = overview_sample_indices(st);
+        let run = filtered_run(&st.run, &indices);
+        let layout = overview::layout(run.samples.len());
+        let buf = overview::render(&run, st.y_mode, st.overview_shared_y, &layout);
         ui.set_overview_image_width(layout.w as i32);
         ui.set_overview_image_height(layout.h as i32);
         ui.set_overview_image(rgb_to_image(&buf, layout.w, layout.h));
     }
+}
+
+fn overview_sample_indices(st: &AppState) -> Vec<usize> {
+    st.run
+        .samples
+        .iter()
+        .enumerate()
+        .filter_map(|(i, sample)| (st.overview_show_ladders || !sample.is_ladder).then_some(i))
+        .collect()
+}
+
+fn filtered_run(run: &Electrophoresis, indices: &[usize]) -> Electrophoresis {
+    let mut out = run.clone();
+    out.samples = indices
+        .iter()
+        .filter_map(|&i| run.samples.get(i).cloned())
+        .collect();
+    out
 }
 
 struct TableRefresh {
@@ -490,8 +555,20 @@ fn build_table_refresh(st: &mut AppState) -> TableRefresh {
 /// Push the current selection (primary index + per-row flags) into the UI.
 fn refresh_selection(ui: &AppWindow, st: &AppState) {
     ui.set_current_index(st.primary() as i32);
+    ui.set_rename_text(SharedString::from(current_trace_name(st)));
     let flags: Vec<bool> = st.selection_flags();
     ui.set_selected_flags(ModelRc::from(Rc::new(VecModel::from(flags))));
+}
+
+fn current_trace_name(st: &AppState) -> String {
+    if st.raw_mode() {
+        return String::new();
+    }
+    st.run
+        .samples
+        .get(st.primary())
+        .map(|s| s.name.clone())
+        .unwrap_or_default()
 }
 
 /// Build the plot series for the current selection (raw channel, single sample,

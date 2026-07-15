@@ -40,6 +40,8 @@ pub struct AppState {
     pub overview_shared_y: bool,
     /// Overview tab: show the virtual gel instead of the small-multiples grid.
     pub overview_gel: bool,
+    /// Overview tab: include ladder wells in the all-sample overview.
+    pub overview_show_ladders: bool,
     pub y_mode: YMode,
     /// Zoom/pan window; `None` means auto-fit the current entry.
     pub viewport: Option<Viewport>,
@@ -69,6 +71,7 @@ impl AppState {
             normalize: false,
             overview_shared_y: true,
             overview_gel: false,
+            overview_show_ladders: false,
             y_mode: YMode::Fluorescence,
             viewport: None,
             highlight_x: None,

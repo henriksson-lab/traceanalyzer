@@ -1,7 +1,7 @@
-import { ListView, VerticalBox, HorizontalBox, TabWidget, Button, StandardTableView, ScrollView } from "std-widgets.slint";
+import { ListView, VerticalBox, HorizontalBox, TabWidget, Button, StandardTableView, ScrollView, LineEdit } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
-    title: "traceanalyzer";
+    title: "Trace analyzer";
     preferred-width: 1040px;
     preferred-height: 620px;
     min-width: 720px;
@@ -12,6 +12,7 @@ export component AppWindow inherits Window {
     // Per-row selection flags, parallel to sample-names (multi-select overlay).
     in property <[bool]> selected-flags;
     in property <string> sample-info: "";
+    in-out property <string> rename-text: "";
     in property <string> y-mode-label: "fluorescence";
     in property <bool> normalize-on: false;
     in property <bool> marker-edit: false;
@@ -25,22 +26,25 @@ export component AppWindow inherits Window {
     in property <int> overview-image-height: 560;
     in property <bool> overview-shared-y: true;
     in property <bool> overview-gel: false;
+    in property <bool> overview-show-ladders: false;
     // Selected tab index; set from Rust to jump to Detail on an overview click.
     in-out property <int> active-tab: 0;
 
-    // Table tab: peak/region rows for the focused sample.
+    // Peak/region rows for the focused sample.
     in property <[[StandardListViewItem]]> table-rows;
     in-out property <int> table-current-row: -1;
     callback table-row-changed(int);
 
     // idx, ctrl-held, shift-held (for multi-select).
     callback select(int, bool, bool);
+    callback rename-sample(string);
     callback toggle-normalize();
     callback open-file();
     // fractional (0..1) click position on the overview image.
     callback overview-click(float, float);
     callback toggle-overview-yscale();
     callback toggle-overview-gel();
+    callback toggle-overview-ladders();
     // fractional-anchor x, y in 0..1; factor <1 zooms in, >1 zooms out
     callback zoom(float, float, float);
     // fractional pan delta (dx, dy) across the plot area
@@ -186,8 +190,18 @@ export component AppWindow inherits Window {
                                     text: root.normalize-on ? "Normalized ✓" : "Normalize";
                                     clicked => { root.toggle-normalize(); }
                                 }
+                                LineEdit {
+                                    min-width: 180px;
+                                    placeholder-text: "Trace name";
+                                    text <=> root.rename-text;
+                                    accepted(name) => { root.rename-sample(name); }
+                                }
                                 Button {
-                                    text: root.marker-edit ? "Markers ✓" : "Markers";
+                                    text: "Rename";
+                                    clicked => { root.rename-sample(root.rename-text); }
+                                }
+                                Button {
+                                    text: root.marker-edit ? "Scale to markers" : "Scale to markers ✓";
                                     clicked => { root.toggle-marker-edit(); }
                                 }
                                 if root.marker-edit: Button {
@@ -199,7 +213,8 @@ export component AppWindow inherits Window {
 
                         // plot image + interaction layer
                         Rectangle {
-                            height: self.width * 560.0 / 1600.0;
+                            preferred-height: self.width * 560.0 / 1600.0;
+                            max-height: 340px;
                             border-width: 1px;
                             border-color: #cccccc;
                             border-radius: 4px;
@@ -277,6 +292,31 @@ export component AppWindow inherits Window {
                             color: #444444;
                             wrap: word-wrap;
                         }
+
+                        Text {
+                            text: "peaks for: " + root.assay-title;
+                            font-size: 11px;
+                            color: #555555;
+                            overflow: elide;
+                        }
+
+                        StandardTableView {
+                            min-height: 130px;
+                            columns: [
+                                { title: "#", min-width: 40px },
+                                { title: "size", min-width: 70px },
+                                { title: "time (s)", min-width: 70px },
+                                { title: "area", min-width: 70px },
+                                { title: "height", min-width: 70px },
+                                { title: "% total", min-width: 60px },
+                                { title: "conc", min-width: 70px },
+                                { title: "molarity", min-width: 70px },
+                                { title: "note", min-width: 120px },
+                            ];
+                            rows: root.table-rows;
+                            current-row <=> root.table-current-row;
+                            current-row-changed(r) => { root.table-row-changed(r); }
+                        }
                     }
                 }
             }
@@ -295,6 +335,10 @@ export component AppWindow inherits Window {
                             text: root.overview-shared-y ? "Y-scale: shared" : "Y-scale: per-plot";
                             enabled: !root.overview-gel;
                             clicked => { root.toggle-overview-yscale(); }
+                        }
+                        Button {
+                            text: root.overview-show-ladders ? "Show ladders ✓" : "Show ladders";
+                            clicked => { root.toggle-overview-ladders(); }
                         }
                         Text {
                             text: root.overview-gel
@@ -336,34 +380,6 @@ export component AppWindow inherits Window {
                 }
             }
 
-            Tab {
-                title: "Table";
-                VerticalLayout {
-                    spacing: 4px;
-                    Text {
-                        text: "peaks for: " + root.assay-title;
-                        font-size: 11px;
-                        color: #555555;
-                        overflow: elide;
-                    }
-                    StandardTableView {
-                        columns: [
-                            { title: "#", min-width: 40px },
-                            { title: "size", min-width: 70px },
-                            { title: "time (s)", min-width: 70px },
-                            { title: "area", min-width: 70px },
-                            { title: "height", min-width: 70px },
-                            { title: "% total", min-width: 60px },
-                            { title: "conc", min-width: 70px },
-                            { title: "molarity", min-width: 70px },
-                            { title: "note", min-width: 120px },
-                        ];
-                        rows: root.table-rows;
-                        current-row <=> root.table-current-row;
-                        current-row-changed(r) => { root.table-row-changed(r); }
-                    }
-                }
-            }
         }
     }
 }

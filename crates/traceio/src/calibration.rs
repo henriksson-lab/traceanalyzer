@@ -41,18 +41,13 @@ const LOWER_MARKER_NAMES: [&str; 2] = ["Lower Marker", "edited Lower Marker"];
 const UPPER_MARKER_NAMES: [&str; 2] = ["Upper Marker", "edited Upper Marker"];
 
 /// Mobility-model fitting method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Method {
     /// Hyman-filtered FMM cubic spline (bioanalyzeR default; monotone).
+    #[default]
     Hyman,
     /// Piecewise-linear interpolation (`approxfun`); NA outside the ladder.
     Interpolation,
-}
-
-impl Default for Method {
-    fn default() -> Self {
-        Method::Hyman
-    }
 }
 
 /// Fill `aligned_time` and `length` for every sample of a Bioanalyzer run.
@@ -170,14 +165,18 @@ fn alignment(
     let lower_time = ov
         .and_then(|o| o.lower_time)
         .or_else(|| det_lower.map(|i| s.peaks[i].time))?;
-    let lower_aligned = det_lower.map(|i| s.peaks[i].aligned_time).or(ref_lower_aligned)?;
+    let lower_aligned = det_lower
+        .map(|i| s.peaks[i].aligned_time)
+        .or(ref_lower_aligned)?;
 
     if has_upper {
         let det_upper = find_marker(s, &UPPER_MARKER_NAMES, upper_conc);
         let upper_time = ov
             .and_then(|o| o.upper_time)
             .or_else(|| det_upper.map(|i| s.peaks[i].time))?;
-        let upper_aligned = det_upper.map(|i| s.peaks[i].aligned_time).or(ref_upper_aligned)?;
+        let upper_aligned = det_upper
+            .map(|i| s.peaks[i].aligned_time)
+            .or(ref_upper_aligned)?;
         let dt = upper_time - lower_time;
         if dt == 0.0 {
             return None;
@@ -346,10 +345,8 @@ fn fmm_spline(x: &[f64], y: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     // 1-based scratch arrays.
     let mut xx = vec![0.0; n + 1];
     let mut yy = vec![0.0; n + 1];
-    for i in 1..=n {
-        xx[i] = x[i - 1];
-        yy[i] = y[i - 1];
-    }
+    xx[1..=n].copy_from_slice(x);
+    yy[1..=n].copy_from_slice(y);
     let mut b = vec![0.0; n + 1];
     let mut c = vec![0.0; n + 1];
     let mut d = vec![0.0; n + 1];
@@ -408,9 +405,9 @@ fn fmm_spline(x: &[f64], y: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     for i in 1..=nm1 {
         b[i] = (yy[i + 1] - yy[i]) / d[i] - d[i] * (c[i + 1] + 2.0 * c[i]);
         d[i] = (c[i + 1] - c[i]) / d[i];
-        c[i] = 3.0 * c[i];
+        c[i] *= 3.0;
     }
-    c[n] = 3.0 * c[n];
+    c[n] *= 3.0;
     d[n] = d[nm1];
 
     (strip1(b), strip1(c), strip1(d))
@@ -434,16 +431,16 @@ fn hyman_filter(x: &[f64], y: &[f64], b: &mut [f64]) {
     let s0 = |k: usize| if k == 0 { ss[0] } else { ss[k - 1] };
     let s1 = |k: usize| if k == n - 1 { ss[n - 2] } else { ss[k] };
 
-    for k in 0..n {
+    for (k, bk) in b.iter_mut().enumerate().take(n) {
         let t1 = s0(k).abs().min(s1(k).abs());
-        let mut sig = b[k];
+        let mut sig = *bk;
         if s0(k) * s1(k) > 0.0 {
             sig = s1(k);
         }
         if sig >= 0.0 {
-            b[k] = b[k].max(0.0).min(3.0 * t1);
+            *bk = (*bk).max(0.0).min(3.0 * t1);
         } else {
-            b[k] = b[k].min(0.0).max(-3.0 * t1);
+            *bk = (*bk).min(0.0).max(-3.0 * t1);
         }
     }
 }

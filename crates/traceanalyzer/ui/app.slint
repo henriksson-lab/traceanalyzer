@@ -1,10 +1,10 @@
-import { ListView, VerticalBox, HorizontalBox, TabWidget, Button, StandardTableView } from "std-widgets.slint";
+import { ListView, VerticalBox, HorizontalBox, TabWidget, Button, StandardTableView, ScrollView } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
     title: "traceanalyzer";
     preferred-width: 1040px;
     preferred-height: 620px;
-    min-width: 760px;
+    min-width: 720px;
     min-height: 440px;
 
     in property <string> assay-title: "No file loaded";
@@ -21,6 +21,8 @@ export component AppWindow inherits Window {
 
     // Overview tab.
     in property <image> overview-image;
+    in property <int> overview-image-width: 1600;
+    in property <int> overview-image-height: 560;
     in property <bool> overview-shared-y: true;
     in property <bool> overview-gel: false;
     // Selected tab index; set from Rust to jump to Detail on an overview click.
@@ -52,6 +54,13 @@ export component AppWindow inherits Window {
     callback cycle-y-mode();
     callback toggle-marker-edit();
     callback reset-markers();
+
+    property <float> plot-chart-left: 78.0 / 1600.0;
+    property <float> plot-chart-right: 1588.0 / 1600.0;
+    property <float> plot-chart-top: 12.0 / 560.0;
+    property <float> plot-chart-bottom: 506.0 / 560.0;
+    property <float> plot-chart-width: root.plot-chart-right - root.plot-chart-left;
+    property <float> plot-chart-height: root.plot-chart-bottom - root.plot-chart-top;
 
     VerticalBox {
         padding: 8px;
@@ -88,11 +97,35 @@ export component AppWindow inherits Window {
 
                     // --- sample list ---
                     Rectangle {
-                        width: 240px;
+                        width: 220px;
                         border-width: 1px;
                         border-color: #cccccc;
                         border-radius: 4px;
                         clip: true;
+                        accessible-role: list;
+                        accessible-label: "Samples";
+                        forward-focus: sample-list-focus;
+                        sample-list-focus := FocusScope {
+                            key-pressed(event) => {
+                                if (event.text == Key.UpArrow && root.current-index > 0) {
+                                    root.select(root.current-index - 1, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
+                                    return accept;
+                                } else if (event.text == Key.DownArrow && root.current-index + 1 < root.sample-names.length) {
+                                    root.select(root.current-index + 1, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
+                                    return accept;
+                                } else if (event.text == Key.Home && root.sample-names.length > 0) {
+                                    root.select(0, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
+                                    return accept;
+                                } else if (event.text == Key.End && root.sample-names.length > 0) {
+                                    root.select(root.sample-names.length - 1, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
+                                    return accept;
+                                } else if (event.text == Key.Return || event.text == Key.Space) {
+                                    root.select(root.current-index, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
+                                    return accept;
+                                }
+                                reject
+                            }
+                        }
                         ListView {
                             for name[i] in root.sample-names: Rectangle {
                                 height: 26px;
@@ -100,11 +133,16 @@ export component AppWindow inherits Window {
                                 // selected rows a lighter tint.
                                 background: i == root.current-index
                                     ? #b7d5ff
-                                    : (root.selected-flags[i] ? #dbeaff : transparent);
+                                    : (i < root.selected-flags.length && root.selected-flags[i] ? #dbeaff : transparent);
+                                border-width: i == root.current-index && sample-list-focus.has-focus ? 1px : 0px;
+                                border-color: #2f68b8;
+                                accessible-role: list-item;
+                                accessible-label: name;
                                 TouchArea {
                                     pointer-event(ev) => {
                                         if (ev.kind == PointerEventKind.up
                                             && ev.button == PointerEventButton.left) {
+                                            sample-list-focus.focus();
                                             root.select(i,
                                                 ev.modifiers.control || ev.modifiers.meta,
                                                 ev.modifiers.shift);
@@ -127,33 +165,41 @@ export component AppWindow inherits Window {
                         spacing: 4px;
 
                         // toolbar
-                        HorizontalLayout {
-                            spacing: 6px;
-                            Button {
-                                text: "Reset view";
-                                clicked => { root.reset-view(); }
+                        ScrollView {
+                            min-height: 36px;
+                            max-height: 42px;
+                            vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                            horizontal-scrollbar-policy: ScrollBarPolicy.as-needed;
+                            viewport-width: toolbar-row.width;
+                            viewport-height: toolbar-row.height;
+                            toolbar-row := HorizontalLayout {
+                                spacing: 6px;
+                                Button {
+                                    text: "Reset view";
+                                    clicked => { root.reset-view(); }
+                                }
+                                Button {
+                                    text: "Y: " + root.y-mode-label;
+                                    clicked => { root.cycle-y-mode(); }
+                                }
+                                Button {
+                                    text: root.normalize-on ? "Normalized ✓" : "Normalize";
+                                    clicked => { root.toggle-normalize(); }
+                                }
+                                Button {
+                                    text: root.marker-edit ? "Markers ✓" : "Markers";
+                                    clicked => { root.toggle-marker-edit(); }
+                                }
+                                if root.marker-edit: Button {
+                                    text: "Reset markers";
+                                    clicked => { root.reset-markers(); }
+                                }
                             }
-                            Button {
-                                text: "Y: " + root.y-mode-label;
-                                clicked => { root.cycle-y-mode(); }
-                            }
-                            Button {
-                                text: root.normalize-on ? "Normalized ✓" : "Normalize";
-                                clicked => { root.toggle-normalize(); }
-                            }
-                            Button {
-                                text: root.marker-edit ? "Markers ✓" : "Markers";
-                                clicked => { root.toggle-marker-edit(); }
-                            }
-                            if root.marker-edit: Button {
-                                text: "Reset markers";
-                                clicked => { root.reset-markers(); }
-                            }
-                            Rectangle {} // spacer
                         }
 
                         // plot image + interaction layer
                         Rectangle {
+                            height: self.width * 560.0 / 1600.0;
                             border-width: 1px;
                             border-color: #cccccc;
                             border-radius: 4px;
@@ -169,34 +215,50 @@ export component AppWindow inherits Window {
                             plot-touch := TouchArea {
                                 property <length> last-x;
                                 property <length> last-y;
+                                property <length> press-x;
+                                property <length> press-y;
                                 // Distinguish a click (select peak) from a pan drag.
                                 property <bool> dragged;
+                                property <bool> left-button-down;
 
                                 pointer-event(ev) => {
-                                    if (ev.kind == PointerEventKind.down) {
+                                    if (ev.kind == PointerEventKind.down
+                                        && ev.button == PointerEventButton.left) {
                                         self.last-x = self.mouse-x;
                                         self.last-y = self.mouse-y;
+                                        self.press-x = self.mouse-x;
+                                        self.press-y = self.mouse-y;
                                         self.dragged = false;
+                                        self.left-button-down = true;
                                         root.plot-press(
                                             self.mouse-x / self.width,
                                             self.mouse-y / self.height);
-                                    } else if (ev.kind == PointerEventKind.up) {
+                                    } else if (ev.kind == PointerEventKind.up && self.left-button-down) {
                                         if (!self.dragged) {
                                             root.plot-click(
                                                 self.mouse-x / self.width,
                                                 self.mouse-y / self.height);
                                         }
                                         root.plot-release();
+                                        self.left-button-down = false;
                                     }
                                 }
                                 moved => {
-                                    if (self.pressed) {
-                                        self.dragged = true;
-                                        root.pan(
-                                            (self.mouse-x - self.last-x) / self.width,
-                                            (self.mouse-y - self.last-y) / self.height);
-                                        self.last-x = self.mouse-x;
-                                        self.last-y = self.mouse-y;
+                                    if (self.left-button-down) {
+                                        if (!self.dragged
+                                            && ((self.mouse-x - self.press-x > 4px)
+                                                || (self.press-x - self.mouse-x > 4px)
+                                                || (self.mouse-y - self.press-y > 4px)
+                                                || (self.press-y - self.mouse-y > 4px))) {
+                                            self.dragged = true;
+                                        }
+                                        if (self.dragged) {
+                                            root.pan(
+                                                (self.mouse-x - self.last-x) / (self.width * root.plot-chart-width),
+                                                (self.mouse-y - self.last-y) / (self.height * root.plot-chart-height));
+                                            self.last-x = self.mouse-x;
+                                            self.last-y = self.mouse-y;
+                                        }
                                     }
                                 }
                                 scroll-event(ev) => {
@@ -212,6 +274,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: root.sample-info;
                             font-size: 12px;
+                            color: #444444;
                             wrap: word-wrap;
                         }
                     }
@@ -237,28 +300,36 @@ export component AppWindow inherits Window {
                             text: root.overview-gel
                                 ? "click a lane to open it in Detail"
                                 : "click a trace to open it in Detail";
-                            color: #888888;
+                            color: #555555;
                             font-size: 11px;
                             vertical-alignment: center;
                         }
                         Rectangle {} // spacer
                     }
-                    Rectangle {
-                        border-width: 1px;
-                        border-color: #cccccc;
-                        border-radius: 4px;
-                        clip: true;
-                        Image {
-                            width: parent.width;
-                            height: parent.height;
-                            image-fit: fill;
-                            source: root.overview-image;
-                        }
-                        TouchArea {
-                            clicked => {
-                                root.overview-click(
-                                    self.mouse-x / self.width,
-                                    self.mouse-y / self.height);
+                    overview-scroll := ScrollView {
+                        vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+                        horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+                        viewport-width: self.visible-width;
+                        viewport-height: overview-frame.height;
+                        overview-frame := Rectangle {
+                            width: overview-scroll.visible-width;
+                            height: overview-scroll.visible-width * root.overview-image-height / root.overview-image-width;
+                            border-width: 1px;
+                            border-color: #cccccc;
+                            border-radius: 4px;
+                            clip: true;
+                            Image {
+                                width: parent.width;
+                                height: parent.height;
+                                image-fit: fill;
+                                source: root.overview-image;
+                            }
+                            TouchArea {
+                                clicked => {
+                                    root.overview-click(
+                                        self.mouse-x / self.width,
+                                        self.mouse-y / self.height);
+                                }
                             }
                         }
                     }
@@ -272,7 +343,7 @@ export component AppWindow inherits Window {
                     Text {
                         text: "peaks for: " + root.assay-title;
                         font-size: 11px;
-                        color: #888888;
+                        color: #555555;
                         overflow: elide;
                     }
                     StandardTableView {

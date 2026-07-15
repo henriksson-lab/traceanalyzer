@@ -116,7 +116,9 @@ pub fn read_xad_raw_channels(path: &std::path::Path) -> Result<Vec<RawChannel>> 
 
 /// Concatenated text of a direct-child element.
 fn child_text(node: roxmltree::Node, tag: &str) -> Option<String> {
-    let c = node.children().find(|n| n.is_element() && n.has_tag_name(tag))?;
+    let c = node
+        .children()
+        .find(|n| n.is_element() && n.has_tag_name(tag))?;
     Some(c.children().filter_map(|t| t.text()).collect())
 }
 
@@ -270,6 +272,8 @@ fn read_u32_le(b: &[u8], off: usize) -> Result<u32> {
 fn raw_inflate(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut decoder = flate2::read::DeflateDecoder::new(data);
-    decoder.read_to_end(&mut out).context("raw DEFLATE decode")?;
+    decoder
+        .read_to_end(&mut out)
+        .context("raw DEFLATE decode")?;
     Ok(out)
 }

@@ -55,11 +55,20 @@ pub fn render(run: &Electrophoresis, w: u32, h: u32) -> Vec<u8> {
     buf
 }
 
-fn draw(buf: &mut [u8], run: &Electrophoresis, w: u32, h: u32) -> Result<(), Box<dyn std::error::Error>> {
+fn draw(
+    buf: &mut [u8],
+    run: &Electrophoresis,
+    w: u32,
+    h: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     ensure_font();
     let text = RGBColor(40, 40, 90);
 
-    let samples: Vec<_> = run.samples.iter().filter(|s| !s.fluorescence.is_empty()).collect();
+    let samples: Vec<_> = run
+        .samples
+        .iter()
+        .filter(|s| !s.fluorescence.is_empty())
+        .collect();
     let n = samples.len();
 
     let root = BitMapBackend::with_buffer(buf, (w, h)).into_drawing_area();
@@ -122,7 +131,11 @@ fn draw(buf: &mut [u8], run: &Electrophoresis, w: u32, h: u32) -> Result<(), Box
             )))?;
         }
         // Lane label (rotated) above the lane.
-        let name = if s.name.is_empty() { format!("Well {}", s.well_number) } else { s.name.clone() };
+        let name = if s.name.is_empty() {
+            format!("Well {}", s.well_number)
+        } else {
+            s.name.clone()
+        };
         let style = ("sans-serif", 12)
             .into_font()
             .color(&text)

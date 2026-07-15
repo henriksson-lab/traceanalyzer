@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 use plotters::prelude::*;
 use plotters::style::register_font;
-use traceio::{Electrophoresis, Sample};
+use traceio::{Electrophoresis, Peak, Sample};
 
 /// Register the vendored font once, so `plotters` text works with the
 /// `ab_glyph` backend (which bundles no system-font access).
@@ -72,6 +72,45 @@ pub struct Viewport {
     pub y_max: f64,
 }
 
+/// Quantity plotted on the x-axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XAxis {
+    Time,
+    Length,
+}
+
+impl XAxis {
+    pub fn label(self, run: &Electrophoresis) -> String {
+        match self {
+            XAxis::Time => "migration time (s)".to_string(),
+            XAxis::Length => format!("size ({})", run.assay.length_unit),
+        }
+    }
+}
+
+/// Accepted x-axis selectors for [`series`]. This keeps the older bool call
+/// sites working: `true` forces time, `false` chooses the sample default.
+pub enum XAxisSelection {
+    Default,
+    Axis(XAxis),
+}
+
+impl From<XAxis> for XAxisSelection {
+    fn from(axis: XAxis) -> Self {
+        XAxisSelection::Axis(axis)
+    }
+}
+
+impl From<bool> for XAxisSelection {
+    fn from(force_time: bool) -> Self {
+        if force_time {
+            XAxisSelection::Axis(XAxis::Time)
+        } else {
+            XAxisSelection::Default
+        }
+    }
+}
+
 /// Extracted plot data for one sample.
 pub struct Series {
     /// Legend label (sample/channel name); shown when overlaying.
@@ -109,21 +148,116 @@ pub fn use_length(s: &Sample) -> bool {
     s.length.iter().filter(|v| v.is_finite()).count() >= 2
 }
 
+pub fn default_x_axis(s: &Sample) -> XAxis {
+    if use_length(s) {
+        XAxis::Length
+    } else {
+        XAxis::Time
+    }
+}
+
+/// Linearly interpolate a per-point trace array at a migration time.
+pub fn value_at_time(times: &[f64], values: &[f64], target: f64) -> Option<f64> {
+    if !target.is_finite() {
+        return None;
+    }
+    let mut prev: Option<(f64, f64)> = None;
+    for (&t, &v) in times.iter().zip(values) {
+        if !t.is_finite() || !v.is_finite() {
+            prev = None;
+            continue;
+        }
+        if (t - target).abs() <= f64::EPSILON {
+            return Some(v);
+        }
+        if let Some((pt, pv)) = prev {
+            let between = (pt <= target && target <= t) || (t <= target && target <= pt);
+            if between {
+                let span = t - pt;
+                if span.abs() <= f64::EPSILON {
+                    return Some(v);
+                }
+                let f = (target - pt) / span;
+                return Some(pv + f * (v - pv));
+            }
+        }
+        prev = Some((t, v));
+    }
+    None
+}
+
+/// Index of the trace point nearest a reported peak/migration time.
+pub fn nearest_time_index(s: &Sample, time: f64) -> Option<usize> {
+    if s.time.is_empty() || !time.is_finite() {
+        return None;
+    }
+    let mut best = None;
+    let mut best_d = f64::INFINITY;
+    for (i, &t) in s.time.iter().enumerate() {
+        let d = (t - time).abs();
+        if d < best_d {
+            best_d = d;
+            best = Some(i);
+        }
+    }
+    best
+}
+
+/// Peak values derived from the calibrated per-point arrays at peak time.
+#[derive(Debug, Clone, Copy)]
+pub struct PeakPointValues {
+    pub time: f64,
+    pub length: f64,
+    pub concentration: f64,
+    pub molarity: f64,
+}
+
+impl PeakPointValues {
+    pub fn x(self, axis: XAxis) -> f64 {
+        match axis {
+            XAxis::Time => self.time,
+            XAxis::Length => self.length,
+        }
+    }
+}
+
+pub fn peak_point_values(s: &Sample, p: &Peak) -> PeakPointValues {
+    let at = |xs: &[f64]| -> f64 { value_at_time(&s.time, xs, p.time).unwrap_or(f64::NAN) };
+    PeakPointValues {
+        time: p.time,
+        length: at(&s.length),
+        concentration: at(&s.concentration),
+        molarity: at(&s.molarity),
+    }
+}
+
 /// Build the (x, y) series for a sample under the given y-mode. When
-/// `force_time` is set the x-axis is raw migration time regardless of
+/// `x_axis` is [`XAxis::Time`] the x-axis is raw migration time regardless of
 /// calibration (used by marker-edit mode).
-pub fn series(run: &Electrophoresis, s: &Sample, y_mode: YMode, force_time: bool) -> Series {
-    let use_len = use_length(s) && !force_time;
+pub fn series(
+    run: &Electrophoresis,
+    s: &Sample,
+    y_mode: YMode,
+    x_axis: impl Into<XAxisSelection>,
+) -> Series {
+    let x_axis = match x_axis.into() {
+        XAxisSelection::Default => default_x_axis(s),
+        XAxisSelection::Axis(axis) => axis,
+    };
     let x_at = |i: usize| -> f64 {
-        if use_len {
-            s.length.get(i).copied().unwrap_or(f64::NAN)
-        } else {
-            s.time.get(i).copied().unwrap_or(f64::NAN)
+        match x_axis {
+            XAxis::Time => s.time.get(i).copied().unwrap_or(f64::NAN),
+            XAxis::Length => s.length.get(i).copied().unwrap_or(f64::NAN),
         }
     };
     let y_at = |i: usize| -> f64 {
         match y_mode {
-            YMode::Fluorescence => s.fluorescence.get(i).copied().map(|v| v as f64).unwrap_or(f64::NAN),
+            YMode::Fluorescence => s
+                .fluorescence
+                .get(i)
+                .copied()
+                .map(|v| v as f64)
+                .unwrap_or(f64::NAN),
             YMode::Concentration => s.concentration.get(i).copied().unwrap_or(f64::NAN),
             YMode::Molarity => s.molarity.get(i).copied().unwrap_or(f64::NAN),
         }
@@ -142,15 +276,10 @@ pub fn series(run: &Electrophoresis, s: &Sample, y_mode: YMode, force_time: bool
     let peaks_x = s
         .peaks
         .iter()
-        .map(|p| if use_len { p.length } else { p.time })
+        .map(|p| peak_point_values(s, p).x(x_axis))
         .filter(|v| v.is_finite())
         .collect();
 
-    let x_label = if use_len {
-        format!("size ({})", run.assay.length_unit)
-    } else {
-        "migration time (s)".to_string()
-    };
     let name = if s.name.is_empty() {
         format!("Well {}", s.well_number)
     } else {
@@ -161,7 +290,7 @@ pub fn series(run: &Electrophoresis, s: &Sample, y_mode: YMode, force_time: bool
         xs,
         ys,
         peaks_x,
-        x_label,
+        x_label: x_axis.label(run),
         y_label: y_mode.label(run),
     }
 }
@@ -191,8 +320,16 @@ pub fn raw_series(ch: &traceio::xad::RawChannel) -> Series {
 /// (peak-height normalization for shape comparison across overlaid traces).
 /// A non-positive or non-finite max leaves the data unchanged.
 pub fn normalized(s: &Series) -> Series {
-    let max = s.ys.iter().copied().filter(|v| v.is_finite()).fold(f64::NEG_INFINITY, f64::max);
-    let scale = if max.is_finite() && max > 0.0 { 1.0 / max } else { 1.0 };
+    let max =
+        s.ys.iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max);
+    let scale = if max.is_finite() && max > 0.0 {
+        1.0 / max
+    } else {
+        1.0
+    };
     Series {
         name: s.name.clone(),
         xs: s.xs.clone(),
@@ -322,14 +459,19 @@ fn draw_into(
 
     // Traces, one palette color each.
     for (i, s) in series.iter().enumerate() {
-        let color = if overlay { palette_color(i) } else { RGBColor(31, 119, 180) };
+        let color = if overlay {
+            palette_color(i)
+        } else {
+            RGBColor(31, 119, 180)
+        };
         let line = chart.draw_series(LineSeries::new(
             s.xs.iter().zip(&s.ys).map(|(&x, &y)| (x, y)),
             color.stroke_width(2),
         ))?;
         if overlay {
-            line.label(&s.name)
-                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 18, y)], color.stroke_width(3)));
+            line.label(&s.name).legend(move |(x, y)| {
+                PathElement::new(vec![(x, y), (x + 18, y)], color.stroke_width(3))
+            });
         }
     }
 
@@ -389,6 +531,10 @@ pub fn data_x_to_frac(data_x: f64, vp: &Viewport) -> f64 {
     let left = (MARGIN + Y_LABEL_AREA) / PLOT_W as f64;
     let right = (PLOT_W as f64 - MARGIN) / PLOT_W as f64;
     let span = vp.x_max - vp.x_min;
-    let tx = if span.abs() > f64::EPSILON { (data_x - vp.x_min) / span } else { 0.0 };
+    let tx = if span.abs() > f64::EPSILON {
+        (data_x - vp.x_min) / span
+    } else {
+        0.0
+    };
     left + tx * (right - left)
 }

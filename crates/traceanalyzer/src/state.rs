@@ -15,6 +15,15 @@ pub enum Marker {
     Upper,
 }
 
+/// Marker drag state, including the override to restore if validation or
+/// recalibration fails.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MarkerDrag {
+    pub sample_idx: usize,
+    pub marker: Marker,
+    pub original_override: Option<MarkerOverride>,
+}
+
 pub struct AppState {
     pub run: Electrophoresis,
     /// Raw detector channels (populated for native `.xad`; see `raw_mode`).
@@ -45,13 +54,13 @@ pub struct AppState {
     /// Manual marker overrides, per sample index (empty = fully automatic).
     pub overrides: HashMap<usize, MarkerOverride>,
     /// Marker currently being dragged, if any (transient).
-    pub grabbed: Option<Marker>,
+    pub grabbed: Option<MarkerDrag>,
     /// Last load error, shown in the UI.
     pub error: Option<String>,
 }
 
 impl AppState {
-    pub fn new(run: Electrophoresis, raw_channels: Vec<RawChannel>) -> Self {
+    pub fn new(run: Electrophoresis, raw_channels: Vec<RawChannel>, error: Option<String>) -> Self {
         AppState {
             run,
             raw_channels,
@@ -67,7 +76,7 @@ impl AppState {
             marker_edit: false,
             overrides: HashMap::new(),
             grabbed: None,
-            error: None,
+            error,
         }
     }
 
@@ -84,7 +93,9 @@ impl AppState {
 
     /// Per-entry selection flags for the list highlight.
     pub fn selection_flags(&self) -> Vec<bool> {
-        (0..self.entry_count()).map(|i| self.is_selected(i)).collect()
+        (0..self.entry_count())
+            .map(|i| self.is_selected(i))
+            .collect()
     }
 
     /// Apply a list click with modifier keys, updating the selection set.
@@ -110,7 +121,11 @@ impl AppState {
             }
             self.anchor = idx;
         } else if shift {
-            let (lo, hi) = if self.anchor <= idx { (self.anchor, idx) } else { (idx, self.anchor) };
+            let (lo, hi) = if self.anchor <= idx {
+                (self.anchor, idx)
+            } else {
+                (idx, self.anchor)
+            };
             self.selection = (lo..=hi).collect();
             // Keep `idx` as primary so the info line follows the click.
             if self.primary() != idx {
@@ -137,7 +152,11 @@ impl AppState {
 
     /// Header summary line for the window.
     pub fn title(&self) -> String {
-        let mode = if self.raw_mode() { "  [raw acquisition]" } else { "" };
+        let mode = if self.raw_mode() {
+            "  [raw acquisition]"
+        } else {
+            ""
+        };
         format!(
             "{}  —  {} ({}),  {} samples{mode}",
             self.run.assay.file_name,

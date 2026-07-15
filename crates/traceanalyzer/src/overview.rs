@@ -48,7 +48,12 @@ pub fn cell_at(layout: &OverviewLayout, fx: f64, fy: f64) -> Option<usize> {
 /// Render the small-multiples grid into an RGB buffer (`w*h*3` bytes). With
 /// `shared_y`, every cell uses the global y-range (comparable heights);
 /// otherwise each cell auto-fits its own trace.
-pub fn render(run: &Electrophoresis, y_mode: YMode, shared_y: bool, layout: &OverviewLayout) -> Vec<u8> {
+pub fn render(
+    run: &Electrophoresis,
+    y_mode: YMode,
+    shared_y: bool,
+    layout: &OverviewLayout,
+) -> Vec<u8> {
     let mut buf = vec![255u8; (layout.w * layout.h * 3) as usize];
     if let Err(e) = draw(&mut buf, run, y_mode, shared_y, layout) {
         eprintln!("(overview render failed: {e})");
@@ -70,7 +75,11 @@ fn draw(
     let text = RGBColor(60, 60, 60);
 
     // Pre-compute each sample's series once.
-    let all: Vec<_> = run.samples.iter().map(|s| series(run, s, y_mode, false)).collect();
+    let all: Vec<_> = run
+        .samples
+        .iter()
+        .map(|s| series(run, s, y_mode, false))
+        .collect();
 
     // Global y-range for shared-scale mode.
     let global_y = {
@@ -82,7 +91,11 @@ fn draw(
                 hi = hi.max(y);
             }
         }
-        if lo.is_finite() { (lo, hi) } else { (0.0, 1.0) }
+        if lo.is_finite() {
+            (lo, hi)
+        } else {
+            (0.0, 1.0)
+        }
     };
 
     let root = BitMapBackend::with_buffer(buf, (layout.w, layout.h)).into_drawing_area();
@@ -90,7 +103,9 @@ fn draw(
     let cells = root.split_evenly((layout.rows, layout.cols));
 
     for (i, cell) in cells.into_iter().enumerate() {
-        let Some(sample) = run.samples.get(i) else { break };
+        let Some(sample) = run.samples.get(i) else {
+            break;
+        };
         let s = &all[i];
 
         // x-range and per-plot y-range.
@@ -112,7 +127,11 @@ fn draw(
                 lo = lo.min(y);
                 hi = hi.max(y);
             }
-            if lo.is_finite() { (lo, hi) } else { (0.0, 1.0) }
+            if lo.is_finite() {
+                (lo, hi)
+            } else {
+                (0.0, 1.0)
+            }
         };
         let pad = ((y1 - y0) * 0.08).max(f64::EPSILON);
         let x1 = x1.max(x0 + f64::EPSILON);

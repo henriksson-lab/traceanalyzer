@@ -11,7 +11,10 @@ use traceio::calibration;
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let path = PathBuf::from(args.next().expect("usage: render_markers <file> [out.ppm] [idx]"));
+    let path = PathBuf::from(
+        args.next()
+            .expect("usage: render_markers <file> [out.ppm] [idx]"),
+    );
     let out = args.next().unwrap_or_else(|| "markers.ppm".into());
     let idx: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
 

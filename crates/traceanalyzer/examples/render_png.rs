@@ -1,11 +1,12 @@
 //! Headless plot render — writes the electropherogram of one or more samples to
-//! a PPM, for display-free visual checking of the plotters rendering (single
-//! trace, or an overlay of several with a legend).
+//! a raw PPM file, for display-free visual checking of the plotters rendering
+//! (single trace, or an overlay of several with a legend).
 //!
-//! Usage: cargo run -p traceanalyzer --example render_png -- <file> [out.ppm] [indices] [y_mode] [normalize]
+//! Usage: cargo run -p traceanalyzer --example render_png -- <file> [out.ppm] [indices] [y_mode] [normalize] [highlight_x]
 //!   indices:   single (e.g. 0) or comma-separated for an overlay (e.g. 0,1,2)
 //!   y_mode:    fluorescence | concentration | molarity
 //!   normalize: "normalize" to peak-height-normalize overlaid traces
+//!   highlight_x: optional data-space x coordinate for a red guide line
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -15,7 +16,10 @@ use traceanalyzer::{loading, plot};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let path = PathBuf::from(args.next().expect("usage: render_png <file> [out.ppm] [indices] [ymode] [normalize]"));
+    let path =
+        PathBuf::from(args.next().expect(
+            "usage: render_png <file> [out.ppm] [indices] [ymode] [normalize] [highlight_x]",
+        ));
     let out = args.next().unwrap_or_else(|| "plot.ppm".into());
     let indices: Vec<usize> = args
         .next()
@@ -35,12 +39,15 @@ fn main() -> anyhow::Result<()> {
     let series: Vec<Series> = indices
         .iter()
         .map(|&idx| {
-            let sample = run
-                .samples
-                .get(idx)
-                .unwrap_or_else(|| panic!("sample {idx} out of range (have {})", run.samples.len()));
+            let sample = run.samples.get(idx).unwrap_or_else(|| {
+                panic!("sample {idx} out of range (have {})", run.samples.len())
+            });
             let s = plot::series(&run, sample, y_mode, false);
-            if overlay && normalize { plot::normalized(&s) } else { s }
+            if overlay && normalize {
+                plot::normalized(&s)
+            } else {
+                s
+            }
         })
         .collect();
     let refs: Vec<&Series> = series.iter().collect();

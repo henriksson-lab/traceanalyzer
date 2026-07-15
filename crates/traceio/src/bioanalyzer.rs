@@ -153,10 +153,19 @@ fn parse_sample(sample: Node) -> Result<Option<Sample>> {
     let well_number = child_text(sample, "WellNumber")
         .and_then(|t| t.trim().parse::<i32>().ok())
         .unwrap_or(-1);
-    let name = child_text(sample, "Name").unwrap_or_default().trim().to_string();
-    let category = child_text(sample, "Category").unwrap_or_default().trim().to_string();
+    let name = child_text(sample, "Name")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let category = child_text(sample, "Category")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let is_ladder = category == "Ladder";
-    let comment = child_text(sample, "Comment").unwrap_or_default().trim().to_string();
+    let comment = child_text(sample, "Comment")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let observations = child_text(sample, "ResultFlagCommonLabel")
         .unwrap_or_default()
         .trim()
@@ -168,7 +177,12 @@ fn parse_sample(sample: Node) -> Result<Option<Sample>> {
 
     let peaks = descend(
         sample,
-        &["DAResultStructures", "DARIntegrator", "Channel", "PeaksMolecular"],
+        &[
+            "DAResultStructures",
+            "DARIntegrator",
+            "Channel",
+            "PeaksMolecular",
+        ],
     )
     .map(parse_peaks)
     .unwrap_or_default();
@@ -196,7 +210,10 @@ fn parse_sample(sample: Node) -> Result<Option<Sample>> {
 fn parse_peaks(peaks_molecular: Node) -> Vec<Peak> {
     children_named(peaks_molecular, "PeakMolecular")
         .map(|p| Peak {
-            observations: child_text(p, "Observations").unwrap_or_default().trim().to_string(),
+            observations: child_text(p, "Observations")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
             length: num(child_text(p, "FragmentSize")),
             time: num(child_text(p, "MigrationTime")),
             aligned_time: num(child_text(p, "AlignedMigrationTime")),

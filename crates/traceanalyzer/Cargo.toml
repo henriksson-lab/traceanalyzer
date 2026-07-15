@@ -7,7 +7,7 @@ authors.workspace = true
 description = "Open-source post-measurement analysis for automated electrophoresis (Bioanalyzer/TapeStation/Fragment Analyzer)"
 
 [dependencies]
-traceio = { path = "../traceio" }
+traceio = { path = "../traceio", version = "0.1.0" }
 flate2.workspace = true
 anyhow.workspace = true
 # unstable-winit-030 = access to the winit window-event hook, used for

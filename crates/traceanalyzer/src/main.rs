@@ -13,27 +13,28 @@ use slint::{
     Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, StandardListViewItem, VecModel,
 };
 
-use traceanalyzer::plot::{self, Series, Viewport};
-use traceanalyzer::state::{AppState, Marker};
+use traceanalyzer::plot::{self, Series, Viewport, XAxis};
+use traceanalyzer::state::{AppState, Marker, MarkerDrag};
 use traceanalyzer::{gel, loading, overview, render, table};
-use traceio::calibration::marker_times;
+use traceio::calibration::{marker_times, MarkerOverride};
 
 slint::include_modules!();
 
 type SharedState = Rc<RefCell<AppState>>;
 
 fn main() -> anyhow::Result<()> {
-    // Select the winit backend explicitly so the external file-drop hook below
-    // (registered via `on_winit_window_event`) is available.
-    if let Err(e) = slint::BackendSelector::new().backend_name("winit".into()).select() {
-        eprintln!("(winit backend unavailable, drag-drop disabled: {e})");
-    }
+    // Let Slint choose the backend. Explicitly probing winit is tempting for
+    // drag-drop, but a stale DISPLAY can leave the event loop half-initialized
+    // and prevent any backend from starting. The winit file-drop hook below is
+    // active when Slint's selected backend is winit.
 
     let path = match std::env::args().nth(1) {
         Some(p) => PathBuf::from(p),
         None => {
-            let demo =
-                PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/demo_dna1000.xml.gz"));
+            let demo = PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../testdata/demo_dna1000.xml.gz"
+            ));
             if !demo.exists() {
                 anyhow::bail!("no file given and demo fixture not found");
             }
@@ -41,10 +42,18 @@ fn main() -> anyhow::Result<()> {
         }
     };
     let loaded = loading::load(&path)?;
-    let state: SharedState = Rc::new(RefCell::new(AppState::new(loaded.run, loaded.raw_channels)));
+    let state: SharedState = Rc::new(RefCell::new(AppState::new(
+        loaded.run,
+        loaded.raw_channels,
+        loaded.warning,
+    )));
 
     let ui = AppWindow::new()?;
-    refresh_all(&ui, &mut state.borrow_mut());
+    let table = {
+        let mut s = state.borrow_mut();
+        refresh_all(&ui, &mut s)
+    };
+    table.apply(&ui);
 
     // Open a different file via native dialog.
     {
@@ -61,8 +70,9 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // External file drag-and-drop: reload on the last dropped file. Falls back
-    // silently to the Open… dialog when the winit backend isn't active.
+    // External file drag-and-drop: reload on the last dropped file when the
+    // selected Slint backend is winit. Otherwise the Open… dialog remains the
+    // portable path.
     {
         let ui_weak = ui.as_weak();
         let st = state.clone();
@@ -83,13 +93,14 @@ fn main() -> anyhow::Result<()> {
         let st = state.clone();
         ui.on_select(move |idx, ctrl, shift| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            {
+            let table = {
                 let mut s = st.borrow_mut();
                 if s.select_click(idx as usize, ctrl, shift) {
                     s.viewport = None; // auto-fit the new selection
                 }
-                refresh_table(&ui, &mut s);
-            }
+                build_table_refresh(&mut s)
+            };
+            table.apply(&ui);
             refresh_selection(&ui, &st.borrow());
             show_selected(&ui, &st.borrow());
         });
@@ -118,7 +129,9 @@ fn main() -> anyhow::Result<()> {
             let Some(ui) = ui_weak.upgrade() else { return };
             {
                 let mut s = st.borrow_mut();
-                s.highlight_x = usize::try_from(row).ok().and_then(|r| s.table_peak_x.get(r).copied().flatten());
+                s.highlight_x = usize::try_from(row)
+                    .ok()
+                    .and_then(|r| s.table_peak_x.get(r).copied().flatten());
             }
             show_selected(&ui, &st.borrow());
         });
@@ -160,21 +173,24 @@ fn main() -> anyhow::Result<()> {
             let Some(ui) = ui_weak.upgrade() else { return };
             let idx = {
                 let s = st.borrow();
-                if s.overview_gel {
+                if s.raw_mode() {
+                    None
+                } else if s.overview_gel {
                     let (w, _) = gel::size(s.run.samples.len());
                     gel::lane_at(&s.run, fx as f64, w)
                 } else {
-                    let layout = overview::layout(s.entry_count());
+                    let layout = overview::layout(s.run.samples.len());
                     overview::cell_at(&layout, fx as f64, fy as f64)
                 }
             };
             if let Some(idx) = idx {
-                {
+                let table = {
                     let mut s = st.borrow_mut();
                     s.select_click(idx, false, false);
                     s.viewport = None;
-                    refresh_table(&ui, &mut s);
-                }
+                    build_table_refresh(&mut s)
+                };
+                table.apply(&ui);
                 refresh_selection(&ui, &st.borrow());
                 show_selected(&ui, &st.borrow());
                 ui.set_active_tab(0); // jump to Detail
@@ -221,8 +237,8 @@ fn main() -> anyhow::Result<()> {
         ui.on_pan(move |dfx, dfy| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let grabbed = st.borrow().grabbed;
-            if let Some(marker) = grabbed {
-                drag_marker(&ui, &st, marker, dfx as f64);
+            if let Some(grabbed) = grabbed {
+                drag_marker(&ui, &st, grabbed, dfx as f64);
             } else {
                 pan(&st, dfx as f64, dfy as f64);
                 show_selected(&ui, &st.borrow());
@@ -252,7 +268,11 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            s.grabbed = best.map(|b| b.0);
+            s.grabbed = best.map(|b| MarkerDrag {
+                sample_idx: idx,
+                marker: b.0,
+                original_override: ov,
+            });
         });
     }
     // Marker-edit: pointer up releases any grabbed marker (and refreshes views).
@@ -261,9 +281,16 @@ fn main() -> anyhow::Result<()> {
         let st = state.clone();
         ui.on_plot_release(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let was = st.borrow().grabbed.is_some();
-            st.borrow_mut().grabbed = None;
-            if was {
+            let table = {
+                let mut s = st.borrow_mut();
+                release_marker_drag(&mut s).map(|()| build_table_refresh(&mut s))
+            };
+            if let Some(table) = table {
+                table.apply(&ui);
+                ui.set_error_text(SharedString::from(
+                    st.borrow().error.clone().unwrap_or_default(),
+                ));
+                show_selected(&ui, &st.borrow());
                 refresh_overview(&ui, &st.borrow());
             }
         });
@@ -274,12 +301,15 @@ fn main() -> anyhow::Result<()> {
         let st = state.clone();
         ui.on_toggle_marker_edit(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            {
+            let table = {
                 let mut s = st.borrow_mut();
                 s.marker_edit ^= true;
                 s.viewport = None; // x-axis space changes
                 s.grabbed = None;
-            }
+                s.highlight_x = None;
+                build_table_refresh(&mut s)
+            };
+            table.apply(&ui);
             show_selected(&ui, &st.borrow());
         });
     }
@@ -289,15 +319,27 @@ fn main() -> anyhow::Result<()> {
         let st = state.clone();
         ui.on_reset_markers(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            {
+            let table = {
                 let mut s = st.borrow_mut();
                 let idx = s.primary();
-                s.overrides.remove(&idx);
-                let ov = s.overrides.clone();
-                loading::recalibrate_with(&mut s.run, &ov);
-                s.viewport = None;
-                refresh_table(&ui, &mut s);
-            }
+                let previous = s.overrides.remove(&idx);
+                s.grabbed = None;
+                match commit_recalibration(&mut s) {
+                    Ok(()) => {
+                        s.error = None;
+                        s.viewport = None;
+                    }
+                    Err(e) => {
+                        restore_override(&mut s, idx, previous);
+                        s.error = Some(format!("Could not reset markers: {e:#}"));
+                    }
+                }
+                build_table_refresh(&mut s)
+            };
+            table.apply(&ui);
+            ui.set_error_text(SharedString::from(
+                st.borrow().error.clone().unwrap_or_default(),
+            ));
             show_selected(&ui, &st.borrow());
             refresh_overview(&ui, &st.borrow());
         });
@@ -337,12 +379,12 @@ fn main() -> anyhow::Result<()> {
 fn reload(ui: &AppWindow, state: &SharedState, path: &std::path::Path) {
     match loading::load(path) {
         Ok(loaded) => {
-            {
+            let table = {
                 let mut s = state.borrow_mut();
-                *s = AppState::new(loaded.run, loaded.raw_channels);
-                refresh_all(ui, &mut s);
-            }
-            ui.set_error_text(SharedString::new());
+                *s = AppState::new(loaded.run, loaded.raw_channels, loaded.warning);
+                refresh_all(ui, &mut s)
+            };
+            table.apply(ui);
             show_selected(ui, &state.borrow());
         }
         Err(e) => {
@@ -354,42 +396,78 @@ fn reload(ui: &AppWindow, state: &SharedState, path: &std::path::Path) {
     }
 }
 
-/// Push run-level data (title, entry list, error, table) into the UI.
-fn refresh_all(ui: &AppWindow, st: &mut AppState) {
+/// Push run-level data (title, entry list, error) into the UI and build a table update.
+fn refresh_all(ui: &AppWindow, st: &mut AppState) -> TableRefresh {
     ui.set_assay_title(SharedString::from(st.title()));
-    let names: Vec<SharedString> = st.entry_labels().into_iter().map(SharedString::from).collect();
+    let names: Vec<SharedString> = st
+        .entry_labels()
+        .into_iter()
+        .map(SharedString::from)
+        .collect();
     ui.set_sample_names(ModelRc::from(Rc::new(VecModel::from(names))));
     ui.set_error_text(SharedString::from(st.error.clone().unwrap_or_default()));
     refresh_selection(ui, st);
     refresh_overview(ui, st);
-    refresh_table(ui, st);
+    build_table_refresh(st)
 }
 
 /// Render the Overview tab (small-multiples grid or virtual gel) into the UI.
 fn refresh_overview(ui: &AppWindow, st: &AppState) {
     ui.set_overview_shared_y(st.overview_shared_y);
     ui.set_overview_gel(st.overview_gel);
-    if st.overview_gel {
+    if st.raw_mode() {
+        let w = plot::PLOT_W;
+        let h = plot::PLOT_H;
+        let series: Vec<Series> = st.raw_channels.iter().map(plot::raw_series).collect();
+        let refs: Vec<&Series> = series.iter().collect();
+        let vp = plot::auto_viewport_multi(&refs);
+        let buf = plot::render_overlay(&refs, &vp, None, &[], w, h);
+        ui.set_overview_image_width(w as i32);
+        ui.set_overview_image_height(h as i32);
+        ui.set_overview_image(rgb_to_image(&buf, w, h));
+    } else if st.overview_gel {
         let (w, h) = gel::size(st.run.samples.len());
         let buf = gel::render(&st.run, w, h);
+        ui.set_overview_image_width(w as i32);
+        ui.set_overview_image_height(h as i32);
         ui.set_overview_image(rgb_to_image(&buf, w, h));
     } else {
         let layout = overview::layout(st.run.samples.len());
         let buf = overview::render(&st.run, st.y_mode, st.overview_shared_y, &layout);
+        ui.set_overview_image_width(layout.w as i32);
+        ui.set_overview_image_height(layout.h as i32);
         ui.set_overview_image(rgb_to_image(&buf, layout.w, layout.h));
     }
 }
 
-/// Build the peak/region table for the focused sample and push it to the UI.
+struct TableRefresh {
+    rows: ModelRc<ModelRc<StandardListViewItem>>,
+    current_row: i32,
+}
+
+impl TableRefresh {
+    fn empty() -> Self {
+        Self {
+            rows: ModelRc::from(Rc::new(VecModel::<ModelRc<StandardListViewItem>>::default())),
+            current_row: -1,
+        }
+    }
+
+    fn apply(self, ui: &AppWindow) {
+        ui.set_table_rows(self.rows);
+        ui.set_table_current_row(self.current_row);
+    }
+}
+
+/// Build the peak/region table for the focused sample.
 /// Also records each row's plot x-position (for cross-highlighting) into `st`.
-fn refresh_table(ui: &AppWindow, st: &mut AppState) {
+fn build_table_refresh(st: &mut AppState) -> TableRefresh {
     if st.raw_mode() || st.run.samples.get(st.primary()).is_none() {
         st.table_peak_x.clear();
-        ui.set_table_rows(ModelRc::from(Rc::new(VecModel::<ModelRc<StandardListViewItem>>::default())));
-        ui.set_table_current_row(-1);
-        return;
+        return TableRefresh::empty();
     }
-    let rows = table::rows(&st.run, &st.run.samples[st.primary()]);
+    let x_axis = table_x_axis(st);
+    let rows = table::rows_with_axis(&st.run, &st.run.samples[st.primary()], x_axis);
     st.table_peak_x = rows.iter().map(|r| r.peak_x).collect();
 
     let model_rows: Vec<ModelRc<StandardListViewItem>> = rows
@@ -403,8 +481,10 @@ fn refresh_table(ui: &AppWindow, st: &mut AppState) {
             ModelRc::from(Rc::new(VecModel::from(cells)))
         })
         .collect();
-    ui.set_table_rows(ModelRc::from(Rc::new(VecModel::from(model_rows))));
-    ui.set_table_current_row(-1);
+    TableRefresh {
+        rows: ModelRc::from(Rc::new(VecModel::from(model_rows))),
+        current_row: -1,
+    }
 }
 
 /// Push the current selection (primary index + per-row flags) into the UI.
@@ -421,13 +501,12 @@ fn selected_series(st: &AppState) -> Vec<Series> {
         return vec![plot::raw_series(&st.raw_channels[st.primary()])];
     }
     let overlay = st.selection.len() > 1;
-    // Marker-edit mode forces the raw-time x-axis (single sample only).
-    let force_time = st.marker_edit && !overlay;
     st.selection
         .iter()
         .filter_map(|&i| st.run.samples.get(i))
         .map(|s| {
-            let series = plot::series(&st.run, s, st.y_mode, force_time);
+            let x_axis = sample_x_axis(st, s, overlay);
+            let series = plot::series(&st.run, s, st.y_mode, x_axis);
             if overlay && st.normalize {
                 plot::normalized(&series)
             } else {
@@ -435,6 +514,19 @@ fn selected_series(st: &AppState) -> Vec<Series> {
             }
         })
         .collect()
+}
+
+fn sample_x_axis(st: &AppState, s: &traceio::Sample, overlay: bool) -> XAxis {
+    if st.marker_edit && !overlay {
+        XAxis::Time
+    } else {
+        plot::default_x_axis(s)
+    }
+}
+
+fn table_x_axis(st: &AppState) -> XAxis {
+    let overlay = st.selection.len() > 1;
+    sample_x_axis(st, &st.run.samples[st.primary()], overlay)
 }
 
 /// Effective marker x-positions (raw times) to draw in marker-edit mode.
@@ -457,9 +549,15 @@ fn show_selected(ui: &AppWindow, st: &AppState) {
 
     let series = selected_series(st);
     let refs: Vec<&Series> = series.iter().collect();
-    let vp = st.viewport.unwrap_or_else(|| plot::auto_viewport_multi(&refs));
+    let vp = st
+        .viewport
+        .unwrap_or_else(|| plot::auto_viewport_multi(&refs));
     // Highlight the selected peak only in the single-sample view.
-    let highlight = if st.selection.len() == 1 { st.highlight_x } else { None };
+    let highlight = if st.selection.len() == 1 {
+        st.highlight_x
+    } else {
+        None
+    };
     let markers = marker_lines(st);
     let buf = plot::render_overlay(&refs, &vp, highlight, &markers, plot::PLOT_W, plot::PLOT_H);
     ui.set_plot_image(rgb_to_image(&buf, plot::PLOT_W, plot::PLOT_H));
@@ -544,34 +642,177 @@ fn pan(state: &SharedState, dfx: f64, dfy: f64) {
     });
 }
 
-/// Move a grabbed marker by a fractional-x drag delta: update the override raw
-/// time, re-run sizing, and refresh the plot + table live. The viewport (in
-/// raw-time space) is kept fixed so the trace does not jump while dragging.
-fn drag_marker(ui: &AppWindow, state: &SharedState, marker: Marker, dfx: f64) {
-    let mut st = state.borrow_mut();
-    if st.primary() >= st.entry_count() {
-        return;
+/// Move a grabbed marker by a fractional-x drag delta, keeping marker overrides,
+/// calibrated trace arrays, table rows, and overview in sync during the drag.
+fn drag_marker(ui: &AppWindow, state: &SharedState, drag: MarkerDrag, dfx: f64) {
+    let table = {
+        let mut st = state.borrow_mut();
+        let idx = drag.sample_idx;
+        if idx >= st.run.samples.len() || st.raw_mode() {
+            return;
+        }
+        let vp = current_viewport(&st);
+        let span = vp.x_max - vp.x_min;
+        let ov = st.overrides.get(&idx).copied();
+        let (lo, up) = marker_times(&st.run, idx, ov.as_ref());
+        let cur = match drag.marker {
+            Marker::Lower => lo,
+            Marker::Upper => up,
+        };
+        let Some(cur) = cur else { return };
+        let requested = cur + dfx * span;
+        let Some(new_time) = valid_marker_time(&st, idx, drag.marker, requested) else {
+            return;
+        };
+
+        let entry = st.overrides.entry(idx).or_default();
+        match drag.marker {
+            Marker::Lower => entry.lower_time = Some(new_time),
+            Marker::Upper => entry.upper_time = Some(new_time),
+        }
+        match validate_marker_state(&st, idx, st.overrides.get(&idx).copied())
+            .and_then(|()| commit_recalibration(&mut st))
+        {
+            Ok(()) => {
+                st.error = None;
+            }
+            Err(e) => {
+                let restore_msg =
+                    restore_override_and_recalibrate(&mut st, idx, drag.original_override);
+                st.error = Some(format!(
+                    "Could not apply marker override: {e:#}{restore_msg}"
+                ));
+            }
+        }
+        build_table_refresh(&mut st)
+    };
+    table.apply(ui);
+    ui.set_error_text(SharedString::from(
+        state.borrow().error.clone().unwrap_or_default(),
+    ));
+    show_selected(ui, &state.borrow());
+    refresh_overview(ui, &state.borrow());
+}
+
+fn release_marker_drag(st: &mut AppState) -> Option<()> {
+    let drag = st.grabbed.take()?;
+    let idx = drag.sample_idx;
+    let current = st.overrides.get(&idx).copied();
+    match validate_marker_state(st, idx, current).and_then(|()| commit_recalibration(st)) {
+        Ok(()) => {
+            st.error = None;
+        }
+        Err(e) => {
+            let restore_msg = restore_override_and_recalibrate(st, idx, drag.original_override);
+            st.error = Some(format!(
+                "Could not apply marker override: {e:#}{restore_msg}"
+            ));
+        }
     }
-    let idx = st.primary();
-    let vp = current_viewport(&st);
-    let span = vp.x_max - vp.x_min;
+    Some(())
+}
+
+fn commit_recalibration(st: &mut AppState) -> anyhow::Result<()> {
+    let mut run = st.run.clone();
+    let ov = st.overrides.clone();
+    loading::recalibrate_with(&mut run, &ov)?;
+    st.run = run;
+    st.highlight_x = None;
+    Ok(())
+}
+
+fn restore_override(st: &mut AppState, idx: usize, previous: Option<MarkerOverride>) {
+    if let Some(previous) = previous.filter(|ov| !ov.is_empty()) {
+        st.overrides.insert(idx, previous);
+    } else {
+        st.overrides.remove(&idx);
+    }
+}
+
+fn restore_override_and_recalibrate(
+    st: &mut AppState,
+    idx: usize,
+    previous: Option<MarkerOverride>,
+) -> String {
+    restore_override(st, idx, previous);
+    commit_recalibration(st)
+        .err()
+        .map(|restore_err| format!("; restoring previous sizing also failed: {restore_err:#}"))
+        .unwrap_or_default()
+}
+
+fn validate_marker_state(
+    st: &AppState,
+    idx: usize,
+    ov: Option<MarkerOverride>,
+) -> anyhow::Result<()> {
+    let (lo, up) = marker_times(&st.run, idx, ov.as_ref());
+    for (name, time) in [("lower", lo), ("upper", up)] {
+        if let Some(time) = time {
+            if !time.is_finite() {
+                anyhow::bail!("{name} marker time is not finite");
+            }
+        }
+    }
+    if let (Some(lo), Some(up)) = (lo, up) {
+        if lo >= up {
+            anyhow::bail!("lower marker must be before upper marker");
+        }
+    }
+
+    let Some(sample) = st.run.samples.get(idx) else {
+        anyhow::bail!("sample {idx} is no longer available");
+    };
+    let mut times = sample.time.iter().copied().filter(|t| t.is_finite());
+    let Some(first) = times.next() else {
+        return Ok(());
+    };
+    let (mut min_t, mut max_t) = (first, first);
+    for t in times {
+        min_t = min_t.min(t);
+        max_t = max_t.max(t);
+    }
+    for (name, time) in [("lower", lo), ("upper", up)] {
+        if let Some(time) = time {
+            if time < min_t || time > max_t {
+                anyhow::bail!("{name} marker must stay within the sample trace");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_marker_time(st: &AppState, idx: usize, marker: Marker, requested: f64) -> Option<f64> {
+    if !requested.is_finite() {
+        return None;
+    }
+    let sample = st.run.samples.get(idx)?;
+    let mut times = sample.time.iter().copied().filter(|t| t.is_finite());
+    let first = times.next()?;
+    let (mut min_t, mut max_t) = (first, first);
+    for t in times {
+        min_t = min_t.min(t);
+        max_t = max_t.max(t);
+    }
+    if max_t <= min_t {
+        return None;
+    }
+
     let ov = st.overrides.get(&idx).copied();
     let (lo, up) = marker_times(&st.run, idx, ov.as_ref());
-    let cur = match marker {
-        Marker::Lower => lo,
-        Marker::Upper => up,
-    };
-    let Some(cur) = cur else { return };
-    let new_time = cur + dfx * span;
-
-    let entry = st.overrides.entry(idx).or_default();
+    let gap = ((max_t - min_t) * 1e-6).max(f64::EPSILON);
+    let mut t = requested.clamp(min_t, max_t);
     match marker {
-        Marker::Lower => entry.lower_time = Some(new_time),
-        Marker::Upper => entry.upper_time = Some(new_time),
+        Marker::Lower => {
+            if let Some(up) = up.filter(|v| v.is_finite()) {
+                t = t.min(up - gap);
+            }
+        }
+        Marker::Upper => {
+            if let Some(lo) = lo.filter(|v| v.is_finite()) {
+                t = t.max(lo + gap);
+            }
+        }
     }
-    let ov = st.overrides.clone();
-    loading::recalibrate_with(&mut st.run, &ov);
-    refresh_table(ui, &mut st);
-    drop(st);
-    show_selected(ui, &state.borrow());
+    (t >= min_t && t <= max_t).then_some(t)
 }

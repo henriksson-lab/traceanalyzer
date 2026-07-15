@@ -13,7 +13,11 @@ fn main() -> anyhow::Result<()> {
 
     let run = loading::load(&path)?.run;
     let sample = &run.samples[idx];
-    println!("sample {idx}: {}  ({} peaks)", sample.name, sample.peaks.len());
+    println!(
+        "sample {idx}: {}  ({} peaks)",
+        sample.name,
+        sample.peaks.len()
+    );
     println!("{}", table::HEADERS.join(" | "));
     for row in table::rows(&run, sample) {
         println!("{}", row.cells.join(" | "));

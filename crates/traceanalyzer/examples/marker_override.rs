@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use anyhow::{bail, ensure};
 use traceio::calibration::{self, MarkerOverride};
 
 fn length_range(s: &traceio::Sample) -> (f64, f64) {
@@ -22,6 +23,16 @@ fn main() -> anyhow::Result<()> {
     let idx: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
 
     let mut run = traceanalyzer::loading::load(&path)?.run;
+    if run.samples.is_empty() {
+        bail!("{} contains no samples", path.display());
+    }
+    ensure!(
+        idx < run.samples.len(),
+        "sample index {idx} out of range; {} has {} samples (valid indices: 0..{})",
+        path.display(),
+        run.samples.len(),
+        run.samples.len() - 1
+    );
 
     let (lo, up) = calibration::marker_times(&run, idx, None);
     println!("sample {idx}: detected markers lower={lo:?} upper={up:?}");
@@ -30,12 +41,21 @@ fn main() -> anyhow::Result<()> {
 
     // Shift the lower marker later by 2 s and recompute.
     let mut overrides = HashMap::new();
-    overrides.insert(idx, MarkerOverride { lower_time: lo.map(|t| t + 2.0), upper_time: None });
-    traceanalyzer::loading::recalibrate_with(&mut run, &overrides);
+    overrides.insert(
+        idx,
+        MarkerOverride {
+            lower_time: lo.map(|t| t + 2.0),
+            upper_time: None,
+        },
+    );
+    traceanalyzer::loading::recalibrate_with(&mut run, &overrides)?;
     let (b0, b1) = length_range(&run.samples[idx]);
     println!("override (+2s) range:    {b0:.1} .. {b1:.1}");
 
-    assert!((a0 - b0).abs() > 1e-6 || (a1 - b1).abs() > 1e-6, "override had no effect");
+    assert!(
+        (a0 - b0).abs() > 1e-6 || (a1 - b1).abs() > 1e-6,
+        "override had no effect"
+    );
     println!("OK: override changed the sizing");
     Ok(())
 }

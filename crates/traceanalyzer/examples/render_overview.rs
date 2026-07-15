@@ -9,7 +9,10 @@ use traceanalyzer::{loading, overview, plot};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let path = PathBuf::from(args.next().expect("usage: render_overview <file> [out.ppm] [shared|per]"));
+    let path = PathBuf::from(
+        args.next()
+            .expect("usage: render_overview <file> [out.ppm] [shared|per]"),
+    );
     let out = args.next().unwrap_or_else(|| "overview.ppm".into());
     let shared = !matches!(args.next().as_deref(), Some("per"));
 

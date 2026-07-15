@@ -78,9 +78,7 @@ pub fn calculate_concentration(run: &mut Electrophoresis) -> Result<()> {
         .collect();
 
     // --- per-sample mass coefficient and concentration ----------------------
-    for si in 0..run.samples.len() {
-        let s = &run.samples[si];
-        let sample_area = &areas[si];
+    for (s, sample_area) in run.samples.iter_mut().zip(&areas) {
         let sample_markers = marker_indices(s, lower_conc, upper_conc);
 
         let mass_coefficient = if sample_markers.is_empty() {
@@ -99,8 +97,7 @@ pub fn calculate_concentration(run: &mut Electrophoresis) -> Result<()> {
             ladder_mass_coefficient * mean_finite(&ratios)
         };
 
-        run.samples[si].concentration =
-            sample_area.iter().map(|&a| mass_coefficient * a).collect();
+        s.concentration = sample_area.iter().map(|&a| mass_coefficient * a).collect();
     }
 
     Ok(())
@@ -138,11 +135,11 @@ fn per_point_area(s: &Sample) -> Vec<f64> {
     if s.aligned_time.len() != n {
         return area; // not calibrated -> all NaN
     }
-    for i in 1..n {
+    for (i, slot) in area.iter_mut().enumerate().take(n).skip(1) {
         let f = s.fluorescence[i] as f64;
         let f_prev = s.fluorescence[i - 1] as f64;
         let dx = s.aligned_time[i] - s.aligned_time[i - 1];
-        area[i] = (f + f_prev) * dx / s.aligned_time[i];
+        *slot = (f + f_prev) * dx / s.aligned_time[i];
     }
     area
 }

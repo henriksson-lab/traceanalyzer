@@ -2,12 +2,14 @@
 
 ## fetch-testdata.sh
 
-Downloads the test fixtures that `cargo test` needs into `testdata/`, so the
-binary blobs don't have to be committed to git.
+Downloads the demo fixtures used by the `traceio` integration tests and
+file-loading examples into `testdata/`, so the binary blobs don't have to be
+committed to git. Headless renderer tests in `traceanalyzer` use synthetic data
+and do not need these downloads.
 
 ```sh
 bash scripts/fetch-testdata.sh
-cargo test
+cargo test -p traceio
 ```
 
 The fixtures are real demo runs (DNA 1000 and Eukaryote Total RNA Nano) from the

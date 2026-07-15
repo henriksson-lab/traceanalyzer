@@ -1,0 +1,108 @@
+import { ListView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+// The plot uses a fixed 1000 x 400 viewbox; Rust pre-scales trace/peak
+// coordinates into that space (y already flipped so up = higher signal).
+export component AppWindow inherits Window {
+    title: "traceanalyzer";
+    preferred-width: 1040px;
+    preferred-height: 580px;
+    min-width: 700px;
+    min-height: 400px;
+
+    in property <string> assay-title: "No file loaded";
+    in property <[string]> sample-names;
+    in property <string> sample-info: "";
+    in property <string> trace-commands: "";
+    in property <string> peak-commands: "";
+    in-out property <int> current-index: 0;
+    callback select(int);
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 6px;
+
+        Text {
+            text: root.assay-title;
+            font-size: 15px;
+            font-weight: 700;
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+
+            // --- sample list ---
+            Rectangle {
+                width: 240px;
+                border-width: 1px;
+                border-color: #cccccc;
+                border-radius: 4px;
+                clip: true;
+                ListView {
+                    for name[i] in root.sample-names: Rectangle {
+                        height: 26px;
+                        background: i == root.current-index ? #d0e4ff : transparent;
+                        TouchArea {
+                            clicked => {
+                                root.current-index = i;
+                                root.select(i);
+                            }
+                        }
+                        Text {
+                            x: 8px;
+                            width: parent.width - 12px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            text: name;
+                        }
+                    }
+                }
+            }
+
+            // --- electropherogram plot ---
+            VerticalLayout {
+                spacing: 4px;
+                Rectangle {
+                    background: white;
+                    border-width: 1px;
+                    border-color: #cccccc;
+                    border-radius: 4px;
+                    clip: true;
+
+                    // peak position ticks (drawn under the trace)
+                    Path {
+                        x: 0; y: 0;
+                        width: parent.width;
+                        height: parent.height;
+                        viewbox-x: 0;
+                        viewbox-y: 0;
+                        viewbox-width: 1000;
+                        viewbox-height: 400;
+                        commands: root.peak-commands;
+                        stroke: #e08214;
+                        stroke-width: 1px;
+                        fill: transparent;
+                    }
+                    // fluorescence trace
+                    Path {
+                        x: 0; y: 0;
+                        width: parent.width;
+                        height: parent.height;
+                        viewbox-x: 0;
+                        viewbox-y: 0;
+                        viewbox-width: 1000;
+                        viewbox-height: 400;
+                        commands: root.trace-commands;
+                        stroke: #1f77b4;
+                        stroke-width: 1.2px;
+                        fill: transparent;
+                    }
+                }
+                Text {
+                    text: root.sample-info;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}

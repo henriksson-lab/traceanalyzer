@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/traceio", "crates/traceanalyzer"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Johan Henriksson"]
+
+[workspace.dependencies]
+roxmltree = "0.20"
+base64 = "0.22"
+flate2 = "1"
+encoding_rs = "0.8"
+anyhow = "1"

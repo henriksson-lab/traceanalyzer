@@ -1,0 +1,16 @@
+[package]
+name = "traceanalyzer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Open-source post-measurement analysis for automated electrophoresis (Bioanalyzer/TapeStation/Fragment Analyzer)"
+
+[dependencies]
+traceio = { path = "../traceio" }
+flate2.workspace = true
+anyhow.workspace = true
+slint = "1"
+
+[build-dependencies]
+slint-build = "1"

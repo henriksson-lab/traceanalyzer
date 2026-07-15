@@ -5,6 +5,8 @@ instruments — a replacement for the vendor software that ships with the Agilen
 **2100 Bioanalyzer**, Agilent **TapeStation**, and (bonus) Agilent/AATI
 **Fragment Analyzer**. No hardware control; this reads and analyses saved runs.
 
+**This software is still under development**
+
 ## Status
 
 | Platform | Native format | Reader status |

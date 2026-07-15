@@ -12,6 +12,7 @@
 
 pub mod bioanalyzer;
 pub mod calibration;
+pub mod concentration;
 pub mod model;
 pub mod xad;
 

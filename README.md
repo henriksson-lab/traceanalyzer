@@ -9,11 +9,18 @@ instruments — a replacement for the vendor software that ships with the Agilen
 
 | Platform | Native format | Reader status |
 |---|---|---|
-| **Bioanalyzer 2100** | `.xad` | inner-XML parser **validated on real data**; native `.xad` container unwrap ported, **awaiting a real `.xad` to validate** |
+| **Bioanalyzer 2100** | `.xad` | native container **decode validated on real files** (Xceed-framed DEFLATE); raw detector signals + metadata + defined ladder extracted. Export-XML parser (processed per-well traces, peaks, sizing) **validated on real data**. |
 | TapeStation | `.D1000`/… (encrypted ZIP) | not started — native is blocked; plan is XML + unaligned-CSV export |
 | Fragment Analyzer | `.raw`/`.db3` (likely SQLite) | not started — plan is ProSize CSV first, then probe the SQLite schema |
 
 This is an early prototype focused on the Bioanalyzer reader.
+
+> **Key finding:** a native `.xad` stores **raw acquisition data + sample
+> metadata only** — 2100 Expert recomputes processed per-well traces, peaks,
+> sizing and RIN when the file is opened (only exports capture those). So
+> reading a `.xad` today yields the raw detector electropherograms + metadata;
+> reproducing the software's numbers needs the processing pipeline. Full
+> details and the container spec: [`docs/xad_format.md`](docs/xad_format.md).
 
 ## Layout
 
@@ -24,6 +31,10 @@ This is an early prototype focused on the Bioanalyzer reader.
   - `xad.rs` — native `.xad` container unwrap (base64 → DEFLATE → UTF-16LE).
   - `calibration.rs` — per-point ladder calibration (marker alignment +
     Hyman-filtered FMM spline) giving a size (bp/nt) for every trace point.
+  - `concentration.rs` — per-point concentration + molarity (trapezoidal area,
+    marker-ratio mass coefficients, molecular weight).
+- `docs/xad_format.md` — reverse-engineered `.xad` container + schema spec.
+- `scripts/fetch-testdata.sh` — download the demo fixtures (they aren't committed).
 - `crates/traceanalyzer` — Slint GUI: sample list + electropherogram plot.
 - `testdata/` — real demo runs (from jwfoley/bioanalyzeR, MIT).
 
@@ -45,26 +56,23 @@ The `inspect`/GUI loaders accept `.xad` (native), `.xml`, and `.xml.gz`.
 
 ## The native `.xad` format
 
-A `.xad` is a line-oriented text/XML wrapper. The analytical payload is one
-section of **base64** text that decodes to a **raw DEFLATE** stream framed by a
-1-byte header and 9-byte trailer; inflating it yields a **UTF-16LE XML**
-document. That inner XML is identical to the *File → Export to XML* output, so
-one parser (`bioanalyzer::parse_xml`) serves both the native and export paths.
+See [`docs/xad_format.md`](docs/xad_format.md) for the full reverse-engineered
+specification. In brief: a `.xad` is a text/XML wrapper whose `<compressed_data>`
+element holds base64 → an **Xceed-framed** blob → a **raw DEFLATE** stream →
+**UTF-16LE XML**. `xad.rs` locates the element by name, parses the Xceed header's
+self-describing lengths, inflates, and validates. A legacy 1-byte/9-byte framing
+(original grimbough `readXAD.R`) is kept as a fallback.
 
-Inside the inner XML:
-- Root `Chipset` → `Chips` → `Chip`.
-- Raw trace: `…/Samples/Sample/DASignals/DetectorChannels/<ch>/SignalData`,
-  with `ProcessedSignal` = base64 of little-endian **float32**, time axis
-  `t_i = XStart + XStep·i`.
-- Peaks: `…/DAResultStructures/DARIntegrator/Channel/PeaksMolecular/PeakMolecular`.
-- RIN (RNA only): `…/DAResultStructures/DARRIN/Channel/RIN`.
-- Ladder: `…/DAAssaySetpoints/DAMAssayInfoMolecular/LadderPeaks/LadderPeak`.
+The inner XML is the **raw acquisition** layout (`Chip/RawSignals/…` +
+per-sample metadata), **not** the processed export — so `read_xad_file` returns
+assay info + defined ladder + sample metadata, and `read_xad_raw_channels`
+returns the raw detector electropherograms (Blue/Red). The
+`bioanalyzer::parse_xml` element paths (`ProcessedSignal`, `PeakMolecular`,
+`DARRIN`, …) apply to the **export** XML, which does contain processed per-well
+results.
 
-The container unwrap in `xad.rs` is a faithful port of grimbough/bioanalyzeR's
-`readXAD.R` and depends on file-position magic constants (documented at the top
-of that file) derived from specific samples. **To validate it, drop a real
-`.xad` at `testdata/sample.xad`** and run `cargo test -p traceio` — the
-`decodes_native_xad_if_present` test will exercise the full path.
+The `decodes_native_xad_if_present` test validates the container decode against
+any real `.xad` under `bioa_examples/` (private, gitignored) or `testdata/sample.xad`.
 
 ## Per-point ladder calibration
 
@@ -86,13 +94,18 @@ this bp/nt axis when a run is calibrated.
 
 ## Next steps
 
-1. Obtain real `.xad` files (several 2100 Expert versions) and validate/robustify
-   the container unwrap.
-2. **Concentration & molarity** per point (bioanalyzeR `calculate.concentration`
-   / `calculate.molarity`: trapezoidal area, marker-ratio mass coefficients).
-3. Gel-like (virtual-gel) rendering.
-4. TapeStation (XML + CSV export) and Fragment Analyzer (ProSize CSV) readers
+1. **`.xad` processing pipeline** — the big one: go from the raw `.xad` detector
+   signal to processed per-well results (split the continuous acquisition into
+   wells, baseline-subtract, detect peaks, align markers, size against the
+   ladder), so `.xad` alone reproduces what the software shows. The sizing
+   ([`calibration`]) and concentration/molarity ([`concentration`]) stages
+   already exist and plug in once per-well traces + peaks are produced.
+2. Gel-like (virtual-gel) rendering.
+3. TapeStation (XML + CSV export) and Fragment Analyzer (ProSize CSV) readers
    into the same `Electrophoresis` model.
+
+[`calibration`]: crates/traceio/src/calibration.rs
+[`concentration`]: crates/traceio/src/concentration.rs
 
 ## Credits
 

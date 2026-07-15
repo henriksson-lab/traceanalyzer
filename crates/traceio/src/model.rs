@@ -62,6 +62,13 @@ pub struct Sample {
     /// Molecular length (bp/nt) per point from the ladder standard curve
     /// (filled by calibration; NaN outside the ladder's interpolation range).
     pub length: Vec<f64>,
+    /// Mass concentration per point (e.g. ng/µl or pg/µl), from
+    /// `concentration::calculate_concentration`. Empty until then; the first
+    /// point of each sample is NaN (no trapezoid to its left).
+    pub concentration: Vec<f64>,
+    /// Molarity per point (nM or pM), from `concentration::calculate_molarity`.
+    /// Empty until then; NaN wherever `length` or `concentration` is NaN.
+    pub molarity: Vec<f64>,
     pub peaks: Vec<Peak>,
 }
 

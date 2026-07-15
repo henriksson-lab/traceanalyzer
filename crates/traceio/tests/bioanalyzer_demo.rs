@@ -107,20 +107,54 @@ fn calibrates_dna1000_to_ladder_range() {
     }
 }
 
-/// End-to-end native `.xad` decode. Runs only when a real sample is dropped in
-/// at `testdata/sample.xad` (none is committed). This is how we will validate
-/// the [`traceio::xad`] container unwrap once a file is available.
+/// Enumerate real `.xad` files to validate against: `testdata/sample.xad` plus
+/// anything under a local `bioa_examples/` dir (private lab data, gitignored).
+fn xad_samples() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    let one = testdata("sample.xad");
+    if one.exists() {
+        v.push(one);
+    }
+    let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bioa_examples");
+    if let Ok(rd) = std::fs::read_dir(&examples) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x == "xad").unwrap_or(false) {
+                v.push(p);
+            }
+        }
+    }
+    v
+}
+
+/// End-to-end native `.xad` decode. Runs only when real `.xad` files are present
+/// locally (none are committed). Validates the [`traceio::xad`] container unwrap.
+///
+/// Current `.xad` files carry raw acquisition + metadata, so we assert the
+/// container decodes and yields assay info, the defined ladder, and sample
+/// metadata — plus non-empty raw detector channels — rather than processed
+/// per-well traces (see docs/xad_format.md §5).
 #[test]
 fn decodes_native_xad_if_present() {
-    let path = testdata("sample.xad");
-    if !path.exists() {
-        eprintln!("skipping: no {} present", path.display());
+    let samples = xad_samples();
+    if samples.is_empty() {
+        eprintln!("skipping: no real .xad files present");
         return;
     }
-    let run = traceio::xad::read_xad_file(&path).expect("decode native .xad");
-    assert!(!run.samples.is_empty(), "native .xad produced no samples");
-    assert!(
-        run.samples.iter().any(|s| !s.fluorescence.is_empty()),
-        "native .xad produced no traces"
-    );
+    for path in samples {
+        let run = traceio::xad::read_xad_file(&path)
+            .unwrap_or_else(|e| panic!("decode {}: {e}", path.display()));
+        assert!(!run.samples.is_empty(), "no sample metadata in {}", path.display());
+        assert!(!run.assay.length_unit.is_empty(), "no assay info in {}", path.display());
+        assert!(!run.ladder_peaks.is_empty(), "no defined ladder in {}", path.display());
+
+        // Raw detector channels must be present and populated.
+        let channels = traceio::xad::read_xad_raw_channels(&path).expect("raw channels");
+        assert!(!channels.is_empty(), "no raw detector channels in {}", path.display());
+        assert!(
+            channels.iter().any(|c| c.signal.len() > 1000),
+            "raw detector channels are empty in {}",
+            path.display()
+        );
+    }
 }

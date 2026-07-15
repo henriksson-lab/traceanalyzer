@@ -43,6 +43,24 @@ fn main() -> anyhow::Result<()> {
             if s.is_ladder { "yes" } else { "" },
         );
     }
+
+    // For native .xad, also show the raw detector channels (the actual signal;
+    // per-well processed traces are recomputed by 2100 Expert, see docs).
+    if path.ends_with(".xad") {
+        match traceio::xad::read_xad_raw_channels(std::path::Path::new(&path)) {
+            Ok(chs) if !chs.is_empty() => {
+                println!("\nRaw detector channels (whole-chip acquisition):");
+                for c in &chs {
+                    let secs = c.x_step * c.signal.len() as f64;
+                    println!(
+                        "  {:<18} {:>7} samples  @ {}s step  (~{:.0}s run)",
+                        c.channel_id, c.signal.len(), c.x_step, secs
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 

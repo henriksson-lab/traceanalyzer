@@ -187,6 +187,8 @@ fn parse_sample(sample: Node) -> Result<Option<Sample>> {
         fluorescence,
         aligned_time: Vec::new(),
         length: Vec::new(),
+        concentration: Vec::new(),
+        molarity: Vec::new(),
         peaks,
     }))
 }

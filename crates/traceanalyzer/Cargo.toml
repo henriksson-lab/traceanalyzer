@@ -11,6 +11,9 @@ traceio = { path = "../traceio" }
 flate2.workspace = true
 anyhow.workspace = true
 slint = "1"
+# ab_glyph = bundled font (no system-font dependency; works headless/portable).
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series", "area_series", "ab_glyph"] }
+rfd = "0.15"
 
 [build-dependencies]
 slint-build = "1"

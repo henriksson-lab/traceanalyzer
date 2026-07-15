@@ -1,106 +1,180 @@
-import { ListView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+import { ListView, VerticalBox, HorizontalBox, TabWidget, Button } from "std-widgets.slint";
 
-// The plot uses a fixed 1000 x 400 viewbox; Rust pre-scales trace/peak
-// coordinates into that space (y already flipped so up = higher signal).
 export component AppWindow inherits Window {
     title: "traceanalyzer";
     preferred-width: 1040px;
-    preferred-height: 580px;
-    min-width: 700px;
-    min-height: 400px;
+    preferred-height: 620px;
+    min-width: 760px;
+    min-height: 440px;
 
     in property <string> assay-title: "No file loaded";
     in property <[string]> sample-names;
     in property <string> sample-info: "";
-    in property <string> trace-commands: "";
-    in property <string> peak-commands: "";
+    in property <string> y-mode-label: "fluorescence";
+    in property <string> error-text: "";
+    in property <image> plot-image;
     in-out property <int> current-index: 0;
+
     callback select(int);
+    callback open-file();
+    // fractional-anchor x, y in 0..1; factor <1 zooms in, >1 zooms out
+    callback zoom(float, float, float);
+    // fractional pan delta (dx, dy) across the plot area
+    callback pan(float, float);
+    callback reset-view();
+    callback cycle-y-mode();
 
     VerticalBox {
         padding: 8px;
         spacing: 6px;
 
-        Text {
-            text: root.assay-title;
-            font-size: 15px;
-            font-weight: 700;
+        HorizontalLayout {
+            spacing: 8px;
+            Button {
+                text: "Open…";
+                clicked => { root.open-file(); }
+            }
+            Text {
+                text: root.assay-title;
+                font-size: 15px;
+                font-weight: 700;
+                vertical-alignment: center;
+                overflow: elide;
+            }
         }
 
-        HorizontalBox {
-            spacing: 8px;
+        if root.error-text != "": Text {
+            text: root.error-text;
+            color: #c0392b;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
 
-            // --- sample list ---
-            Rectangle {
-                width: 240px;
-                border-width: 1px;
-                border-color: #cccccc;
-                border-radius: 4px;
-                clip: true;
-                ListView {
-                    for name[i] in root.sample-names: Rectangle {
-                        height: 26px;
-                        background: i == root.current-index ? #d0e4ff : transparent;
-                        TouchArea {
-                            clicked => {
-                                root.current-index = i;
-                                root.select(i);
+        TabWidget {
+            Tab {
+                title: "Detail";
+                HorizontalBox {
+                    spacing: 8px;
+
+                    // --- sample list ---
+                    Rectangle {
+                        width: 240px;
+                        border-width: 1px;
+                        border-color: #cccccc;
+                        border-radius: 4px;
+                        clip: true;
+                        ListView {
+                            for name[i] in root.sample-names: Rectangle {
+                                height: 26px;
+                                background: i == root.current-index ? #d0e4ff : transparent;
+                                TouchArea {
+                                    clicked => {
+                                        root.current-index = i;
+                                        root.select(i);
+                                    }
+                                }
+                                Text {
+                                    x: 8px;
+                                    width: parent.width - 12px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    text: name;
+                                }
                             }
                         }
+                    }
+
+                    // --- plot column ---
+                    VerticalLayout {
+                        spacing: 4px;
+
+                        // toolbar
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Button {
+                                text: "Reset view";
+                                clicked => { root.reset-view(); }
+                            }
+                            Button {
+                                text: "Y: " + root.y-mode-label;
+                                clicked => { root.cycle-y-mode(); }
+                            }
+                            Rectangle {} // spacer
+                        }
+
+                        // plot image + interaction layer
+                        Rectangle {
+                            border-width: 1px;
+                            border-color: #cccccc;
+                            border-radius: 4px;
+                            clip: true;
+
+                            Image {
+                                width: parent.width;
+                                height: parent.height;
+                                image-fit: fill;
+                                source: root.plot-image;
+                            }
+
+                            plot-touch := TouchArea {
+                                property <length> last-x;
+                                property <length> last-y;
+
+                                pointer-event(ev) => {
+                                    if (ev.kind == PointerEventKind.down) {
+                                        self.last-x = self.mouse-x;
+                                        self.last-y = self.mouse-y;
+                                    }
+                                }
+                                moved => {
+                                    if (self.pressed) {
+                                        root.pan(
+                                            (self.mouse-x - self.last-x) / self.width,
+                                            (self.mouse-y - self.last-y) / self.height);
+                                        self.last-x = self.mouse-x;
+                                        self.last-y = self.mouse-y;
+                                    }
+                                }
+                                scroll-event(ev) => {
+                                    root.zoom(
+                                        self.mouse-x / self.width,
+                                        self.mouse-y / self.height,
+                                        ev.delta-y > 0 ? 0.85 : 1.18);
+                                    accept
+                                }
+                            }
+                        }
+
                         Text {
-                            x: 8px;
-                            width: parent.width - 12px;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            text: name;
+                            text: root.sample-info;
+                            font-size: 12px;
+                            wrap: word-wrap;
                         }
                     }
                 }
             }
 
-            // --- electropherogram plot ---
-            VerticalLayout {
-                spacing: 4px;
+            Tab {
+                title: "Overview";
                 Rectangle {
-                    background: white;
-                    border-width: 1px;
-                    border-color: #cccccc;
-                    border-radius: 4px;
-                    clip: true;
-
-                    // peak position ticks (drawn under the trace)
-                    Path {
-                        x: 0; y: 0;
-                        width: parent.width;
-                        height: parent.height;
-                        viewbox-x: 0;
-                        viewbox-y: 0;
-                        viewbox-width: 1000;
-                        viewbox-height: 400;
-                        commands: root.peak-commands;
-                        stroke: #e08214;
-                        stroke-width: 1px;
-                        fill: transparent;
-                    }
-                    // fluorescence trace
-                    Path {
-                        x: 0; y: 0;
-                        width: parent.width;
-                        height: parent.height;
-                        viewbox-x: 0;
-                        viewbox-y: 0;
-                        viewbox-width: 1000;
-                        viewbox-height: 400;
-                        commands: root.trace-commands;
-                        stroke: #1f77b4;
-                        stroke-width: 1.2px;
-                        fill: transparent;
+                    Text {
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        color: #888888;
+                        text: "Overview — all traces (coming in Phase E)";
                     }
                 }
-                Text {
-                    text: root.sample-info;
-                    font-size: 12px;
-                    wrap: word-wrap;
+            }
+
+            Tab {
+                title: "Table";
+                Rectangle {
+                    Text {
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        color: #888888;
+                        text: "Peak / region table (coming in Phase F)";
+                    }
                 }
             }
         }

@@ -2,10 +2,12 @@
 //! analysis pipeline (sizing → concentration → molarity), and — for native
 //! `.xad` files — the raw detector channels.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
 use anyhow::Result;
+use traceio::calibration::MarkerOverride;
 use traceio::xad::RawChannel;
 use traceio::Electrophoresis;
 
@@ -33,8 +35,14 @@ pub fn load(path: &Path) -> Result<Loaded> {
 /// Run per-point sizing, concentration and molarity. Failures are reported but
 /// non-fatal (e.g. a native `.xad` has no per-well peaks to calibrate from).
 pub fn calibrate(run: &mut Electrophoresis) {
+    recalibrate_with(run, &HashMap::new());
+}
+
+/// Re-run the full pipeline (sizing → concentration → molarity) applying manual
+/// marker overrides. Used for live recompute when the user drags a marker.
+pub fn recalibrate_with(run: &mut Electrophoresis, overrides: &HashMap<usize, MarkerOverride>) {
     use traceio::{calibration, concentration};
-    if let Err(e) = calibration::calculate_length(run, calibration::Method::Hyman) {
+    if let Err(e) = calibration::calculate_length_with(run, calibration::Method::Hyman, overrides) {
         eprintln!("(sizing skipped: {e})");
         return;
     }

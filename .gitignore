@@ -1,0 +1,9 @@
+target/
+
+# Downloaded test fixtures (see scripts/fetch-testdata.sh) — not committed.
+testdata/*.xml.gz
+testdata/*.xad
+testdata/*.xml
+
+# Private real instrument data — must never be committed.
+bioa_examples/

@@ -10,7 +10,9 @@ description = "Open-source post-measurement analysis for automated electrophores
 traceio = { path = "../traceio" }
 flate2.workspace = true
 anyhow.workspace = true
-slint = "1"
+# unstable-winit-030 = access to the winit window-event hook, used for
+# external file drag-and-drop (see main.rs).
+slint = { version = "1", features = ["unstable-winit-030"] }
 # ab_glyph = bundled font (no system-font dependency; works headless/portable).
 plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series", "area_series", "ab_glyph"] }
 rfd = "0.15"

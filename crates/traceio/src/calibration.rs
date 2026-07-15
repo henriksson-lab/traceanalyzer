@@ -14,8 +14,27 @@
 //! (a linear map from raw `MigrationTime` to `AlignedMigrationTime`), matching
 //! `read.bioanalyzer`.
 
+use std::collections::HashMap;
+
 use crate::model::{Electrophoresis, Sample};
 use anyhow::{anyhow, Result};
+
+/// Manual override of a sample's marker raw migration times, for when automatic
+/// marker detection is wrong or missing. Each field, when `Some`, replaces the
+/// detected marker's raw time; the marker's canonical *aligned* time is kept
+/// (taken from the ladder), so sizing re-derives from the user-placed markers.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MarkerOverride {
+    pub lower_time: Option<f64>,
+    pub upper_time: Option<f64>,
+}
+
+impl MarkerOverride {
+    /// True if neither marker is overridden (equivalent to fully automatic).
+    pub fn is_empty(&self) -> bool {
+        self.lower_time.is_none() && self.upper_time.is_none()
+    }
+}
 
 /// Marker peak observation labels (from bioanalyzeR `electrophoresis.R`).
 const LOWER_MARKER_NAMES: [&str; 2] = ["Lower Marker", "edited Lower Marker"];
@@ -41,6 +60,18 @@ impl Default for Method {
 /// Requires exactly one ladder well. Samples whose markers cannot be located
 /// keep empty/NaN calibration but do not abort the run.
 pub fn calculate_length(run: &mut Electrophoresis, method: Method) -> Result<()> {
+    calculate_length_with(run, method, &HashMap::new())
+}
+
+/// Like [`calculate_length`], but with per-sample manual marker overrides
+/// (keyed by sample index). Overridden samples re-derive their alignment — and
+/// hence sizing — from the supplied raw marker times instead of the detected
+/// marker peaks. Samples absent from `overrides` behave exactly as automatic.
+pub fn calculate_length_with(
+    run: &mut Electrophoresis,
+    method: Method,
+    overrides: &HashMap<usize, MarkerOverride>,
+) -> Result<()> {
     let ladder_idx = run
         .ladder_index()
         .ok_or_else(|| anyhow!("need exactly one ladder well to calibrate"))?;
@@ -60,11 +91,26 @@ pub fn calculate_length(run: &mut Electrophoresis, method: Method) -> Result<()>
 
     let has_upper = run.assay.has_upper_marker;
 
-    for s in &mut run.samples {
+    // Canonical marker aligned times (from the ladder), used as the fixed
+    // targets when a sample's markers are overridden or undetected.
+    let ladder = &run.samples[ladder_idx];
+    let ref_lower_aligned =
+        find_marker(ladder, &LOWER_MARKER_NAMES, lower_conc).map(|i| ladder.peaks[i].aligned_time);
+    let ref_upper_aligned =
+        find_marker(ladder, &UPPER_MARKER_NAMES, upper_conc).map(|i| ladder.peaks[i].aligned_time);
+
+    for (idx, s) in run.samples.iter_mut().enumerate() {
+        let ov = overrides.get(&idx);
         // 1. Marker-based linear map: raw time -> aligned time, per point.
-        let Some((coef, offset)) =
-            alignment(s, has_upper, lower_conc, upper_conc)
-        else {
+        let Some((coef, offset)) = alignment(
+            s,
+            has_upper,
+            lower_conc,
+            upper_conc,
+            ov,
+            ref_lower_aligned,
+            ref_upper_aligned,
+        ) else {
             s.aligned_time = Vec::new();
             s.length = Vec::new();
             continue;
@@ -82,30 +128,69 @@ pub fn calculate_length(run: &mut Electrophoresis, method: Method) -> Result<()>
     Ok(())
 }
 
+/// Effective raw marker migration times for a sample: the override value when
+/// present, otherwise the detected marker peak's time. `upper` is `None` for
+/// assays without an upper marker. Used by the GUI to position marker lines.
+pub fn marker_times(
+    run: &Electrophoresis,
+    sample_idx: usize,
+    ov: Option<&MarkerOverride>,
+) -> (Option<f64>, Option<f64>) {
+    let lower_conc = run.ladder_peaks.first().map(|p| p.concentration);
+    let upper_conc = run.ladder_peaks.last().map(|p| p.concentration);
+    let Some(s) = run.samples.get(sample_idx) else {
+        return (None, None);
+    };
+    let lower = ov
+        .and_then(|o| o.lower_time)
+        .or_else(|| find_marker(s, &LOWER_MARKER_NAMES, lower_conc).map(|i| s.peaks[i].time));
+    let upper = if run.assay.has_upper_marker {
+        ov.and_then(|o| o.upper_time)
+            .or_else(|| find_marker(s, &UPPER_MARKER_NAMES, upper_conc).map(|i| s.peaks[i].time))
+    } else {
+        None
+    };
+    (lower, upper)
+}
+
 /// Compute a sample's (coefficient, offset) mapping raw time -> aligned time
-/// from its lower (and, if the assay has one, upper) marker peaks.
+/// from its lower (and, if the assay has one, upper) marker peaks. `ov` may
+/// override the raw marker times; `ref_*_aligned` supply the canonical aligned
+/// targets when a marker is overridden or was not detected.
 fn alignment(
     s: &Sample,
     has_upper: bool,
     lower_conc: Option<f64>,
     upper_conc: Option<f64>,
+    ov: Option<&MarkerOverride>,
+    ref_lower_aligned: Option<f64>,
+    ref_upper_aligned: Option<f64>,
 ) -> Option<(f64, f64)> {
-    let lower = find_marker(s, &LOWER_MARKER_NAMES, lower_conc)?;
+    let det_lower = find_marker(s, &LOWER_MARKER_NAMES, lower_conc);
+    let lower_time = ov
+        .and_then(|o| o.lower_time)
+        .or_else(|| det_lower.map(|i| s.peaks[i].time))?;
+    let lower_aligned = det_lower.map(|i| s.peaks[i].aligned_time).or(ref_lower_aligned)?;
+
     if has_upper {
-        let upper = find_marker(s, &UPPER_MARKER_NAMES, upper_conc)?;
-        let dt = s.peaks[upper].time - s.peaks[lower].time;
+        let det_upper = find_marker(s, &UPPER_MARKER_NAMES, upper_conc);
+        let upper_time = ov
+            .and_then(|o| o.upper_time)
+            .or_else(|| det_upper.map(|i| s.peaks[i].time))?;
+        let upper_aligned = det_upper.map(|i| s.peaks[i].aligned_time).or(ref_upper_aligned)?;
+        let dt = upper_time - lower_time;
         if dt == 0.0 {
             return None;
         }
-        let coef = (s.peaks[upper].aligned_time - s.peaks[lower].aligned_time) / dt;
-        let offset = s.peaks[lower].aligned_time - coef * s.peaks[lower].time;
+        let coef = (upper_aligned - lower_aligned) / dt;
+        let offset = lower_aligned - coef * lower_time;
         Some((coef, offset))
     } else {
         // Only a lower marker: scale through the origin.
-        if s.peaks[lower].time == 0.0 {
+        if lower_time == 0.0 {
             return None;
         }
-        let coef = s.peaks[lower].aligned_time / s.peaks[lower].time;
+        let coef = lower_aligned / lower_time;
         Some((coef, 0.0))
     }
 }

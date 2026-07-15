@@ -1,4 +1,4 @@
-import { ListView, VerticalBox, HorizontalBox, TabWidget, Button } from "std-widgets.slint";
+import { ListView, VerticalBox, HorizontalBox, TabWidget, Button, StandardTableView } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
     title: "traceanalyzer";
@@ -9,20 +9,49 @@ export component AppWindow inherits Window {
 
     in property <string> assay-title: "No file loaded";
     in property <[string]> sample-names;
+    // Per-row selection flags, parallel to sample-names (multi-select overlay).
+    in property <[bool]> selected-flags;
     in property <string> sample-info: "";
     in property <string> y-mode-label: "fluorescence";
+    in property <bool> normalize-on: false;
+    in property <bool> marker-edit: false;
     in property <string> error-text: "";
     in property <image> plot-image;
     in-out property <int> current-index: 0;
 
-    callback select(int);
+    // Overview tab.
+    in property <image> overview-image;
+    in property <bool> overview-shared-y: true;
+    in property <bool> overview-gel: false;
+    // Selected tab index; set from Rust to jump to Detail on an overview click.
+    in-out property <int> active-tab: 0;
+
+    // Table tab: peak/region rows for the focused sample.
+    in property <[[StandardListViewItem]]> table-rows;
+    in-out property <int> table-current-row: -1;
+    callback table-row-changed(int);
+
+    // idx, ctrl-held, shift-held (for multi-select).
+    callback select(int, bool, bool);
+    callback toggle-normalize();
     callback open-file();
+    // fractional (0..1) click position on the overview image.
+    callback overview-click(float, float);
+    callback toggle-overview-yscale();
+    callback toggle-overview-gel();
     // fractional-anchor x, y in 0..1; factor <1 zooms in, >1 zooms out
     callback zoom(float, float, float);
     // fractional pan delta (dx, dy) across the plot area
     callback pan(float, float);
+    // fractional click position on the plot (select nearest peak)
+    callback plot-click(float, float);
+    // fractional pointer-down / pointer-up on the plot (marker grab/release)
+    callback plot-press(float, float);
+    callback plot-release();
     callback reset-view();
     callback cycle-y-mode();
+    callback toggle-marker-edit();
+    callback reset-markers();
 
     VerticalBox {
         padding: 8px;
@@ -51,6 +80,7 @@ export component AppWindow inherits Window {
         }
 
         TabWidget {
+            current-index <=> root.active-tab;
             Tab {
                 title: "Detail";
                 HorizontalBox {
@@ -66,11 +96,19 @@ export component AppWindow inherits Window {
                         ListView {
                             for name[i] in root.sample-names: Rectangle {
                                 height: 26px;
-                                background: i == root.current-index ? #d0e4ff : transparent;
+                                // Primary (focused) row is the strongest; other
+                                // selected rows a lighter tint.
+                                background: i == root.current-index
+                                    ? #b7d5ff
+                                    : (root.selected-flags[i] ? #dbeaff : transparent);
                                 TouchArea {
-                                    clicked => {
-                                        root.current-index = i;
-                                        root.select(i);
+                                    pointer-event(ev) => {
+                                        if (ev.kind == PointerEventKind.up
+                                            && ev.button == PointerEventButton.left) {
+                                            root.select(i,
+                                                ev.modifiers.control || ev.modifiers.meta,
+                                                ev.modifiers.shift);
+                                        }
                                     }
                                 }
                                 Text {
@@ -99,6 +137,18 @@ export component AppWindow inherits Window {
                                 text: "Y: " + root.y-mode-label;
                                 clicked => { root.cycle-y-mode(); }
                             }
+                            Button {
+                                text: root.normalize-on ? "Normalized ✓" : "Normalize";
+                                clicked => { root.toggle-normalize(); }
+                            }
+                            Button {
+                                text: root.marker-edit ? "Markers ✓" : "Markers";
+                                clicked => { root.toggle-marker-edit(); }
+                            }
+                            if root.marker-edit: Button {
+                                text: "Reset markers";
+                                clicked => { root.reset-markers(); }
+                            }
                             Rectangle {} // spacer
                         }
 
@@ -119,15 +169,29 @@ export component AppWindow inherits Window {
                             plot-touch := TouchArea {
                                 property <length> last-x;
                                 property <length> last-y;
+                                // Distinguish a click (select peak) from a pan drag.
+                                property <bool> dragged;
 
                                 pointer-event(ev) => {
                                     if (ev.kind == PointerEventKind.down) {
                                         self.last-x = self.mouse-x;
                                         self.last-y = self.mouse-y;
+                                        self.dragged = false;
+                                        root.plot-press(
+                                            self.mouse-x / self.width,
+                                            self.mouse-y / self.height);
+                                    } else if (ev.kind == PointerEventKind.up) {
+                                        if (!self.dragged) {
+                                            root.plot-click(
+                                                self.mouse-x / self.width,
+                                                self.mouse-y / self.height);
+                                        }
+                                        root.plot-release();
                                     }
                                 }
                                 moved => {
                                     if (self.pressed) {
+                                        self.dragged = true;
                                         root.pan(
                                             (self.mouse-x - self.last-x) / self.width,
                                             (self.mouse-y - self.last-y) / self.height);
@@ -156,24 +220,76 @@ export component AppWindow inherits Window {
 
             Tab {
                 title: "Overview";
-                Rectangle {
-                    Text {
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        color: #888888;
-                        text: "Overview — all traces (coming in Phase E)";
+                VerticalLayout {
+                    spacing: 4px;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Button {
+                            text: root.overview-gel ? "View: gel" : "View: traces";
+                            clicked => { root.toggle-overview-gel(); }
+                        }
+                        Button {
+                            text: root.overview-shared-y ? "Y-scale: shared" : "Y-scale: per-plot";
+                            enabled: !root.overview-gel;
+                            clicked => { root.toggle-overview-yscale(); }
+                        }
+                        Text {
+                            text: root.overview-gel
+                                ? "click a lane to open it in Detail"
+                                : "click a trace to open it in Detail";
+                            color: #888888;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {} // spacer
+                    }
+                    Rectangle {
+                        border-width: 1px;
+                        border-color: #cccccc;
+                        border-radius: 4px;
+                        clip: true;
+                        Image {
+                            width: parent.width;
+                            height: parent.height;
+                            image-fit: fill;
+                            source: root.overview-image;
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.overview-click(
+                                    self.mouse-x / self.width,
+                                    self.mouse-y / self.height);
+                            }
+                        }
                     }
                 }
             }
 
             Tab {
                 title: "Table";
-                Rectangle {
+                VerticalLayout {
+                    spacing: 4px;
                     Text {
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
+                        text: "peaks for: " + root.assay-title;
+                        font-size: 11px;
                         color: #888888;
-                        text: "Peak / region table (coming in Phase F)";
+                        overflow: elide;
+                    }
+                    StandardTableView {
+                        columns: [
+                            { title: "#", min-width: 40px },
+                            { title: "size", min-width: 70px },
+                            { title: "time (s)", min-width: 70px },
+                            { title: "area", min-width: 70px },
+                            { title: "height", min-width: 70px },
+                            { title: "% total", min-width: 60px },
+                            { title: "conc", min-width: 70px },
+                            { title: "molarity", min-width: 70px },
+                            { title: "note", min-width: 120px },
+                        ];
+                        rows: root.table-rows;
+                        current-row <=> root.table-current-row;
+                        current-row-changed(r) => { root.table-row-changed(r); }
                     }
                 }
             }

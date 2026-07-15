@@ -14,7 +14,7 @@ use traceio::{Electrophoresis, Sample};
 
 /// Register the vendored font once, so `plotters` text works with the
 /// `ab_glyph` backend (which bundles no system-font access).
-fn ensure_font() {
+pub(crate) fn ensure_font() {
     static FONT: OnceLock<()> = OnceLock::new();
     FONT.get_or_init(|| {
         let _ = register_font(
@@ -74,6 +74,8 @@ pub struct Viewport {
 
 /// Extracted plot data for one sample.
 pub struct Series {
+    /// Legend label (sample/channel name); shown when overlaying.
+    pub name: String,
     pub xs: Vec<f64>,
     pub ys: Vec<f64>,
     pub peaks_x: Vec<f64>,
@@ -81,14 +83,37 @@ pub struct Series {
     pub y_label: String,
 }
 
+/// Okabe–Ito colorblind-safe qualitative palette (yellow last: it is the
+/// weakest as a thin line on white, so it is only reached when overlaying many
+/// traces). Used to color overlaid samples and their legend entries.
+pub const PALETTE: [(u8, u8, u8); 8] = [
+    (0, 114, 178),   // blue
+    (213, 94, 0),    // vermillion
+    (0, 158, 115),   // bluish green
+    (204, 121, 167), // reddish purple
+    (86, 180, 233),  // sky blue
+    (230, 159, 0),   // orange
+    (0, 0, 0),       // black
+    (204, 187, 0),   // dark yellow
+];
+
+/// Color for the i-th overlaid series.
+pub fn palette_color(i: usize) -> RGBColor {
+    let (r, g, b) = PALETTE[i % PALETTE.len()];
+    RGBColor(r, g, b)
+}
+
 /// Whether a sample should be plotted against calibrated length (bp/nt).
-fn use_length(s: &Sample) -> bool {
+/// Public so the table can label peak positions with the same x quantity.
+pub fn use_length(s: &Sample) -> bool {
     s.length.iter().filter(|v| v.is_finite()).count() >= 2
 }
 
-/// Build the (x, y) series for a sample under the given y-mode.
-pub fn series(run: &Electrophoresis, s: &Sample, y_mode: YMode) -> Series {
-    let use_len = use_length(s);
+/// Build the (x, y) series for a sample under the given y-mode. When
+/// `force_time` is set the x-axis is raw migration time regardless of
+/// calibration (used by marker-edit mode).
+pub fn series(run: &Electrophoresis, s: &Sample, y_mode: YMode, force_time: bool) -> Series {
+    let use_len = use_length(s) && !force_time;
     let x_at = |i: usize| -> f64 {
         if use_len {
             s.length.get(i).copied().unwrap_or(f64::NAN)
@@ -126,7 +151,13 @@ pub fn series(run: &Electrophoresis, s: &Sample, y_mode: YMode) -> Series {
     } else {
         "migration time (s)".to_string()
     };
+    let name = if s.name.is_empty() {
+        format!("Well {}", s.well_number)
+    } else {
+        s.name.clone()
+    };
     Series {
+        name,
         xs,
         ys,
         peaks_x,
@@ -147,6 +178,7 @@ pub fn raw_series(ch: &traceio::xad::RawChannel) -> Series {
         }
     }
     Series {
+        name: format!("{} (raw)", ch.channel_id),
         xs,
         ys,
         peaks_x: Vec::new(),
@@ -155,17 +187,40 @@ pub fn raw_series(ch: &traceio::xad::RawChannel) -> Series {
     }
 }
 
+/// Return a copy of `s` with y-values scaled so its finite maximum is 1.0
+/// (peak-height normalization for shape comparison across overlaid traces).
+/// A non-positive or non-finite max leaves the data unchanged.
+pub fn normalized(s: &Series) -> Series {
+    let max = s.ys.iter().copied().filter(|v| v.is_finite()).fold(f64::NEG_INFINITY, f64::max);
+    let scale = if max.is_finite() && max > 0.0 { 1.0 / max } else { 1.0 };
+    Series {
+        name: s.name.clone(),
+        xs: s.xs.clone(),
+        ys: s.ys.iter().map(|v| v * scale).collect(),
+        peaks_x: s.peaks_x.clone(),
+        x_label: s.x_label.clone(),
+        y_label: "normalized".to_string(),
+    }
+}
+
 /// Auto-fit viewport around a series (with a little y-headroom).
 pub fn auto_viewport(series: &Series) -> Viewport {
+    auto_viewport_multi(&[series])
+}
+
+/// Auto-fit viewport covering the union of several series' extents.
+pub fn auto_viewport_multi(series: &[&Series]) -> Viewport {
     let (mut x_min, mut x_max) = (f64::INFINITY, f64::NEG_INFINITY);
     let (mut y_min, mut y_max) = (f64::INFINITY, f64::NEG_INFINITY);
-    for &x in &series.xs {
-        x_min = x_min.min(x);
-        x_max = x_max.max(x);
-    }
-    for &y in &series.ys {
-        y_min = y_min.min(y);
-        y_max = y_max.max(y);
+    for s in series {
+        for &x in &s.xs {
+            x_min = x_min.min(x);
+            x_max = x_max.max(x);
+        }
+        for &y in &s.ys {
+            y_min = y_min.min(y);
+            y_max = y_max.max(y);
+        }
     }
     if !x_min.is_finite() {
         x_min = 0.0;
@@ -186,8 +241,24 @@ pub fn auto_viewport(series: &Series) -> Viewport {
 
 /// Render one series into an RGB buffer (`w*h*3` bytes).
 pub fn render_rgb(series: &Series, vp: &Viewport, w: u32, h: u32) -> Vec<u8> {
+    render_overlay(&[series], vp, None, &[], w, h)
+}
+
+/// Render one or more series into an RGB buffer (`w*h*3` bytes). A single series
+/// is drawn in the primary color with its peak markers; multiple series are
+/// overlaid in distinct palette colors with a legend and no peak markers.
+/// `highlight_x`, if set, draws a bold marker at that x (table→plot highlight).
+/// `marker_xs` draws draggable marker guide lines (marker-edit mode).
+pub fn render_overlay(
+    series: &[&Series],
+    vp: &Viewport,
+    highlight_x: Option<f64>,
+    marker_xs: &[f64],
+    w: u32,
+    h: u32,
+) -> Vec<u8> {
     let mut buf = vec![255u8; (w * h * 3) as usize];
-    if let Err(e) = draw_into(&mut buf, series, vp, w, h) {
+    if let Err(e) = draw_into(&mut buf, series, vp, highlight_x, marker_xs, w, h) {
         eprintln!("(plot render failed: {e})");
     }
     buf
@@ -195,22 +266,30 @@ pub fn render_rgb(series: &Series, vp: &Viewport, w: u32, h: u32) -> Vec<u8> {
 
 fn draw_into(
     buf: &mut [u8],
-    series: &Series,
+    series: &[&Series],
     vp: &Viewport,
+    highlight_x: Option<f64>,
+    marker_xs: &[f64],
     w: u32,
     h: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_font();
-    let trace = RGBColor(31, 119, 180);
     let peak = RGBColor(224, 130, 20);
     let grid = RGBColor(232, 232, 232);
     let text = RGBColor(60, 60, 60);
+    let overlay = series.len() > 1;
 
     let root = BitMapBackend::with_buffer(buf, (w, h)).into_drawing_area();
     root.fill(&WHITE)?;
     // Guard against a degenerate range.
     let (x0, x1) = (vp.x_min, vp.x_max.max(vp.x_min + f64::EPSILON));
     let (y0, y1) = (vp.y_min, vp.y_max.max(vp.y_min + f64::EPSILON));
+
+    // Axis labels come from the first series (all overlaid series share units).
+    let (x_label, y_label) = match series.first() {
+        Some(s) => (s.x_label.as_str(), s.y_label.as_str()),
+        None => ("", ""),
+    };
 
     let mut chart = ChartBuilder::on(&root)
         .margin(MARGIN as i32)
@@ -220,27 +299,71 @@ fn draw_into(
 
     chart
         .configure_mesh()
-        .x_desc(&series.x_label)
-        .y_desc(&series.y_label)
+        .x_desc(x_label)
+        .y_desc(y_label)
         .axis_desc_style(("sans-serif", 16).into_font().color(&text))
         .label_style(("sans-serif", 13).into_font().color(&text))
         .light_line_style(grid)
         .draw()?;
 
-    // Peak markers (behind the trace).
-    for &px in &series.peaks_x {
-        if px >= x0 && px <= x1 {
+    // Peak markers (behind the trace); only for a single-sample view.
+    if !overlay {
+        for s in series {
+            for &px in &s.peaks_x {
+                if px >= x0 && px <= x1 {
+                    chart.draw_series(std::iter::once(PathElement::new(
+                        vec![(px, y0), (px, y1)],
+                        peak.mix(0.45),
+                    )))?;
+                }
+            }
+        }
+    }
+
+    // Traces, one palette color each.
+    for (i, s) in series.iter().enumerate() {
+        let color = if overlay { palette_color(i) } else { RGBColor(31, 119, 180) };
+        let line = chart.draw_series(LineSeries::new(
+            s.xs.iter().zip(&s.ys).map(|(&x, &y)| (x, y)),
+            color.stroke_width(2),
+        ))?;
+        if overlay {
+            line.label(&s.name)
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 18, y)], color.stroke_width(3)));
+        }
+    }
+
+    // Cross-highlight marker for a selected table row.
+    if let Some(hx) = highlight_x {
+        if hx >= x0 && hx <= x1 {
+            let hl = RGBColor(214, 39, 40);
             chart.draw_series(std::iter::once(PathElement::new(
-                vec![(px, y0), (px, y1)],
-                peak.mix(0.45),
+                vec![(hx, y0), (hx, y1)],
+                hl.stroke_width(2),
             )))?;
         }
     }
-    // Trace.
-    chart.draw_series(LineSeries::new(
-        series.xs.iter().zip(&series.ys).map(|(&x, &y)| (x, y)),
-        trace.stroke_width(2),
-    ))?;
+
+    // Draggable marker guide lines (marker-edit mode), in green.
+    for &mx in marker_xs {
+        if mx >= x0 && mx <= x1 {
+            let mc = RGBColor(0, 158, 115);
+            chart.draw_series(std::iter::once(PathElement::new(
+                vec![(mx, y0), (mx, y1)],
+                mc.stroke_width(2),
+            )))?;
+        }
+    }
+
+    if overlay {
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperRight)
+            .background_style(WHITE.mix(0.85))
+            .border_style(RGBColor(200, 200, 200))
+            .label_font(("sans-serif", 14).into_font().color(&text))
+            .draw()?;
+    }
     root.present()?;
     Ok(())
 }
@@ -258,4 +381,14 @@ pub fn frac_to_data(fx: f64, fy: f64, vp: &Viewport) -> (f64, f64) {
     let data_x = vp.x_min + tx * (vp.x_max - vp.x_min);
     let data_y = vp.y_max - ty * (vp.y_max - vp.y_min); // y inverted
     (data_x, data_y)
+}
+
+/// Inverse of [`frac_to_data`] on the x-axis: map a data x to a fractional
+/// widget x (0..1). Used to hit-test draggable marker lines.
+pub fn data_x_to_frac(data_x: f64, vp: &Viewport) -> f64 {
+    let left = (MARGIN + Y_LABEL_AREA) / PLOT_W as f64;
+    let right = (PLOT_W as f64 - MARGIN) / PLOT_W as f64;
+    let span = vp.x_max - vp.x_min;
+    let tx = if span.abs() > f64::EPSILON { (data_x - vp.x_min) / span } else { 0.0 };
+    left + tx * (right - left)
 }

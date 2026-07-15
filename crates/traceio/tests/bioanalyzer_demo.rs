@@ -107,6 +107,53 @@ fn calibrates_dna1000_to_ladder_range() {
     }
 }
 
+#[test]
+fn marker_override_shifts_sizing() {
+    use std::collections::HashMap;
+    use traceio::calibration::{self, MarkerOverride, Method};
+
+    let xml = load_gz_xml("demo_dna1000.xml.gz");
+    let base = traceio::bioanalyzer::parse_xml(&xml).expect("parse");
+
+    // Pick a non-ladder sample and read its detected lower marker time.
+    let idx = base
+        .samples
+        .iter()
+        .position(|s| !s.is_ladder && !s.peaks.is_empty())
+        .expect("a non-ladder sample with peaks");
+    let (lower, _upper) = calibration::marker_times(&base, idx, None);
+    let lower = lower.expect("detected lower marker");
+
+    // Overriding with the *detected* time reproduces the automatic sizing.
+    let mut same = base.clone();
+    let mut ov_same = HashMap::new();
+    ov_same.insert(idx, MarkerOverride { lower_time: Some(lower), upper_time: None });
+    calibration::calculate_length_with(&mut same, Method::Hyman, &ov_same).expect("recalc");
+    let mut auto = base.clone();
+    calibration::calculate_length(&mut auto, Method::Hyman).expect("auto");
+    let a: Vec<f64> = auto.samples[idx].length.iter().copied().filter(|v| v.is_finite()).collect();
+    let b: Vec<f64> = same.samples[idx].length.iter().copied().filter(|v| v.is_finite()).collect();
+    assert_eq!(a.len(), b.len(), "override-with-detected changed the calibrated span");
+
+    // Shifting the lower marker later must change the sizing measurably.
+    let mut shifted = base.clone();
+    let mut ov = HashMap::new();
+    ov.insert(idx, MarkerOverride { lower_time: Some(lower + 3.0), upper_time: None });
+    calibration::calculate_length_with(&mut shifted, Method::Hyman, &ov).expect("recalc shifted");
+    let c: Vec<f64> = shifted.samples[idx].length.iter().copied().filter(|v| v.is_finite()).collect();
+    let hi_auto = a.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let hi_shift = c.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    assert!((hi_auto - hi_shift).abs() > 1e-6, "marker shift did not change sizing");
+
+    // Other samples (no override) are unaffected by the per-sample override.
+    let other = (0..base.samples.len()).find(|&i| i != idx && !base.samples[i].peaks.is_empty());
+    if let Some(o) = other {
+        let auto_o: Vec<f64> = auto.samples[o].length.iter().copied().filter(|v| v.is_finite()).collect();
+        let shift_o: Vec<f64> = shifted.samples[o].length.iter().copied().filter(|v| v.is_finite()).collect();
+        assert_eq!(auto_o.len(), shift_o.len(), "unrelated sample changed");
+    }
+}
+
 /// Enumerate real `.xad` files to validate against: `testdata/sample.xad` plus
 /// anything under a local `bioa_examples/` dir (private lab data, gitignored).
 fn xad_samples() -> Vec<PathBuf> {

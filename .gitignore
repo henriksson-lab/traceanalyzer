@@ -1,5 +1,8 @@
 target/
 
+# Packaged macOS app/dmg output (see scripts/build-macos-app.sh) — not committed.
+dist/
+
 # Downloaded test fixtures (see scripts/fetch-testdata.sh) — not committed.
 testdata/*.xml.gz
 testdata/*.xad

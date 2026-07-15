@@ -45,6 +45,7 @@ fn main() -> anyhow::Result<()> {
     let state: SharedState = Rc::new(RefCell::new(AppState::new(
         loaded.run,
         loaded.raw_channels,
+        Some(path.clone()),
         loaded.warning,
     )));
 
@@ -103,6 +104,75 @@ fn main() -> anyhow::Result<()> {
             table.apply(&ui);
             refresh_selection(&ui, &st.borrow());
             show_selected(&ui, &st.borrow());
+        });
+    }
+
+    // File → Quit.
+    ui.on_quit(|| {
+        let _ = slint::quit_event_loop();
+    });
+
+    // Help → About.
+    ui.on_about(|| {
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Info)
+            .set_title("About traceanalyzer")
+            .set_description(about_text())
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    });
+
+    // File → Save (write edits back to the source file).
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_save_file(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let dst = st.borrow().source_path.clone();
+            match dst {
+                // A native .xad cannot be rewritten in place; offer Save As.
+                Some(p) if p.extension().and_then(|e| e.to_str()) == Some("xad") => {
+                    save_as_dialog(&ui, &st)
+                }
+                Some(p) => do_save(&ui, &st, p),
+                None => save_as_dialog(&ui, &st),
+            }
+        });
+    }
+
+    // File → Save As….
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_save_file_as(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            save_as_dialog(&ui, &st);
+        });
+    }
+
+    // Expand/collapse the file node in the well tree.
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_toggle_file_expand(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            st.borrow_mut().expanded ^= true;
+            refresh_tree(&ui, &st.borrow());
+        });
+    }
+
+    // Rename the selected well in memory (persist later via File → Save).
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_rename_well(move |name| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let changed = st.borrow_mut().rename_primary(name.as_str());
+            if changed {
+                let s = st.borrow();
+                refresh_tree(&ui, &s);
+                ui.set_window_title(SharedString::from(window_title(&s)));
+            }
         });
     }
 
@@ -381,7 +451,12 @@ fn reload(ui: &AppWindow, state: &SharedState, path: &std::path::Path) {
         Ok(loaded) => {
             let table = {
                 let mut s = state.borrow_mut();
-                *s = AppState::new(loaded.run, loaded.raw_channels, loaded.warning);
+                *s = AppState::new(
+                    loaded.run,
+                    loaded.raw_channels,
+                    Some(path.to_path_buf()),
+                    loaded.warning,
+                );
                 refresh_all(ui, &mut s)
             };
             table.apply(ui);
@@ -399,16 +474,44 @@ fn reload(ui: &AppWindow, state: &SharedState, path: &std::path::Path) {
 /// Push run-level data (title, entry list, error) into the UI and build a table update.
 fn refresh_all(ui: &AppWindow, st: &mut AppState) -> TableRefresh {
     ui.set_assay_title(SharedString::from(st.title()));
-    let names: Vec<SharedString> = st
-        .entry_labels()
-        .into_iter()
-        .map(SharedString::from)
-        .collect();
-    ui.set_sample_names(ModelRc::from(Rc::new(VecModel::from(names))));
+    ui.set_window_title(SharedString::from(window_title(st)));
     ui.set_error_text(SharedString::from(st.error.clone().unwrap_or_default()));
-    refresh_selection(ui, st);
+    refresh_tree(ui, st);
     refresh_overview(ui, st);
     build_table_refresh(st)
+}
+
+/// Native-window title: app name plus the loaded file, with a `*` when there are
+/// unsaved edits.
+fn window_title(st: &AppState) -> String {
+    let base = if st.run.assay.file_name.is_empty() {
+        "traceanalyzer".to_string()
+    } else {
+        format!("traceanalyzer — {}", st.run.assay.file_name)
+    };
+    if st.dirty {
+        format!("{base} *")
+    } else {
+        base
+    }
+}
+
+/// Push the well tree (rows, selection, expansion) and the rename/save enable
+/// state into the UI. Also sets the rename field to the selected well's name.
+fn refresh_tree(ui: &AppWindow, st: &AppState) {
+    let t = st.tree_rows();
+    let labels: Vec<SharedString> = t.labels.into_iter().map(SharedString::from).collect();
+    ui.set_tree_labels(ModelRc::from(Rc::new(VecModel::from(labels))));
+    ui.set_tree_is_file(ModelRc::from(Rc::new(VecModel::from(t.is_file))));
+    ui.set_tree_well_index(ModelRc::from(Rc::new(VecModel::from(t.well_index))));
+    ui.set_tree_selected(ModelRc::from(Rc::new(VecModel::from(t.selected))));
+    ui.set_tree_primary_row(t.primary_row);
+    ui.set_tree_expanded(st.expanded);
+    ui.set_entry_count(st.entry_count() as i32);
+    ui.set_current_index(st.primary() as i32);
+    ui.set_can_rename(st.can_rename());
+    ui.set_can_save(st.can_save());
+    ui.set_rename_text(SharedString::from(st.primary_name()));
 }
 
 /// Render the Overview tab (small-multiples grid or virtual gel) into the UI.
@@ -487,11 +590,10 @@ fn build_table_refresh(st: &mut AppState) -> TableRefresh {
     }
 }
 
-/// Push the current selection (primary index + per-row flags) into the UI.
+/// Push the current selection (tree highlight, primary index, rename field) into
+/// the UI.
 fn refresh_selection(ui: &AppWindow, st: &AppState) {
-    ui.set_current_index(st.primary() as i32);
-    let flags: Vec<bool> = st.selection_flags();
-    ui.set_selected_flags(ModelRc::from(Rc::new(VecModel::from(flags))));
+    refresh_tree(ui, st);
 }
 
 /// Build the plot series for the current selection (raw channel, single sample,
@@ -573,6 +675,63 @@ fn show_selected(ui: &AppWindow, st: &AppState) {
     ui.set_y_mode_label(SharedString::from(st.y_mode.label(&st.run)));
     ui.set_normalize_on(st.normalize);
     ui.set_marker_edit(st.marker_edit);
+}
+
+/// Text shown in the Help → About dialog.
+fn about_text() -> String {
+    format!(
+        "traceanalyzer {}\n\nOpen-source post-measurement analysis for automated-electrophoresis runs (Agilent Bioanalyzer, TapeStation, Fragment Analyzer).\n\n© {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("CARGO_PKG_AUTHORS"),
+    )
+}
+
+/// Prompt for a destination and save the run there (used by Save As, and by Save
+/// when there is no writable source path — e.g. a native `.xad`).
+fn save_as_dialog(ui: &AppWindow, st: &SharedState) {
+    let start_name = st
+        .borrow()
+        .source_path
+        .as_ref()
+        .and_then(|p| p.file_stem())
+        .and_then(|n| n.to_str())
+        .map(|n| format!("{n}.xml"))
+        .unwrap_or_else(|| "run.xml".to_string());
+
+    if let Some(dst) = rfd::FileDialog::new()
+        .add_filter("Bioanalyzer XML", &["xml"])
+        .add_filter("Bioanalyzer XML (gzip)", &["gz"])
+        .set_file_name(start_name)
+        .save_file()
+    {
+        do_save(ui, st, dst);
+    }
+}
+
+/// Write the current run to `dst`, using the loaded source file as the template,
+/// then adopt `dst` as the new source and clear the dirty flag.
+fn do_save(ui: &AppWindow, st: &SharedState, dst: std::path::PathBuf) {
+    let result = {
+        let s = st.borrow();
+        match s.source_path.clone() {
+            Some(src) => traceio::save::save_run(&s.run, &src, &dst),
+            None => Err(anyhow::anyhow!("no source file to save from")),
+        }
+    };
+    match result {
+        Ok(()) => {
+            {
+                let mut s = st.borrow_mut();
+                s.dirty = false;
+                s.source_path = Some(dst);
+            }
+            let s = st.borrow();
+            ui.set_can_save(s.can_save());
+            ui.set_window_title(SharedString::from(window_title(&s)));
+            ui.set_error_text(SharedString::default());
+        }
+        Err(e) => ui.set_error_text(SharedString::from(format!("Save failed: {e:#}"))),
+    }
 }
 
 fn rgb_to_image(buf: &[u8], w: u32, h: u32) -> Image {

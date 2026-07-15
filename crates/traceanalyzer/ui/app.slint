@@ -1,16 +1,28 @@
-import { ListView, VerticalBox, HorizontalBox, TabWidget, Button, StandardTableView, ScrollView } from "std-widgets.slint";
+import { ListView, VerticalBox, HorizontalBox, TabWidget, Button, StandardTableView, ScrollView, LineEdit } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
-    title: "traceanalyzer";
+    title: root.window-title;
+    in property <string> window-title: "traceanalyzer";
     preferred-width: 1040px;
     preferred-height: 620px;
     min-width: 720px;
     min-height: 440px;
 
     in property <string> assay-title: "No file loaded";
-    in property <[string]> sample-names;
-    // Per-row selection flags, parallel to sample-names (multi-select overlay).
-    in property <[bool]> selected-flags;
+    // Well list is a tree: row 0 is the file, rows 1.. are its wells. These
+    // arrays are parallel over the *visible* rows (children are omitted when the
+    // file node is collapsed).
+    in property <[string]> tree-labels;
+    in property <[bool]> tree-is-file;
+    in property <[int]> tree-well-index;    // -1 for the file row, else sample index
+    in property <[bool]> tree-selected;     // any-selected highlight, parallel to tree-labels
+    in property <int> tree-primary-row: -1; // visible-row index of the primary well
+    in property <bool> tree-expanded: true;
+    in property <int> entry-count;          // number of wells (keyboard-nav bound)
+    // Rename: bound to the selected well's name; edited in the field, applied on Rename.
+    in-out property <string> rename-text;
+    in property <bool> can-rename: false;
+    in property <bool> can-save: false;
     in property <string> sample-info: "";
     in property <string> y-mode-label: "fluorescence";
     in property <bool> normalize-on: false;
@@ -37,6 +49,14 @@ export component AppWindow inherits Window {
     callback select(int, bool, bool);
     callback toggle-normalize();
     callback open-file();
+    callback save-file();
+    callback save-file-as();
+    callback quit();
+    callback about();
+    // Expand/collapse the file node in the well tree.
+    callback toggle-file-expand();
+    // Rename the primary-selected well to the given text (in-memory only).
+    callback rename-well(string);
     // fractional (0..1) click position on the overview image.
     callback overview-click(float, float);
     callback toggle-overview-yscale();
@@ -62,24 +82,45 @@ export component AppWindow inherits Window {
     property <float> plot-chart-width: root.plot-chart-right - root.plot-chart-left;
     property <float> plot-chart-height: root.plot-chart-bottom - root.plot-chart-top;
 
+    MenuBar {
+        Menu {
+            title: "File";
+            MenuItem {
+                title: "Open…";
+                shortcut: @keys(Control + O);
+                activated => { root.open-file(); }
+            }
+            MenuItem {
+                title: "Save";
+                enabled: root.can-save;
+                shortcut: @keys(Control + S);
+                activated => { root.save-file(); }
+            }
+            MenuItem {
+                title: "Save As…";
+                enabled: root.can-save;
+                shortcut: @keys(Control + Shift + S);
+                activated => { root.save-file-as(); }
+            }
+            MenuSeparator {}
+            MenuItem {
+                title: "Quit";
+                shortcut: @keys(Control + Q);
+                activated => { root.quit(); }
+            }
+        }
+        Menu {
+            title: "Help";
+            MenuItem {
+                title: "About traceanalyzer";
+                activated => { root.about(); }
+            }
+        }
+    }
+
     VerticalBox {
         padding: 8px;
         spacing: 6px;
-
-        HorizontalLayout {
-            spacing: 8px;
-            Button {
-                text: "Open…";
-                clicked => { root.open-file(); }
-            }
-            Text {
-                text: root.assay-title;
-                font-size: 15px;
-                font-weight: 700;
-                vertical-alignment: center;
-                overflow: elide;
-            }
-        }
 
         if root.error-text != "": Text {
             text: root.error-text;
@@ -95,67 +136,103 @@ export component AppWindow inherits Window {
                 HorizontalBox {
                     spacing: 8px;
 
-                    // --- sample list ---
-                    Rectangle {
-                        width: 220px;
-                        border-width: 1px;
-                        border-color: #cccccc;
-                        border-radius: 4px;
-                        clip: true;
-                        accessible-role: list;
-                        accessible-label: "Samples";
-                        forward-focus: sample-list-focus;
-                        sample-list-focus := FocusScope {
-                            key-pressed(event) => {
-                                if (event.text == Key.UpArrow && root.current-index > 0) {
-                                    root.select(root.current-index - 1, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
-                                    return accept;
-                                } else if (event.text == Key.DownArrow && root.current-index + 1 < root.sample-names.length) {
-                                    root.select(root.current-index + 1, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
-                                    return accept;
-                                } else if (event.text == Key.Home && root.sample-names.length > 0) {
-                                    root.select(0, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
-                                    return accept;
-                                } else if (event.text == Key.End && root.sample-names.length > 0) {
-                                    root.select(root.sample-names.length - 1, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
-                                    return accept;
-                                } else if (event.text == Key.Return || event.text == Key.Space) {
-                                    root.select(root.current-index, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
-                                    return accept;
+                    // --- well tree + rename ---
+                    VerticalLayout {
+                        width: 240px;
+                        spacing: 4px;
+
+                        Rectangle {
+                            border-width: 1px;
+                            border-color: #cccccc;
+                            border-radius: 4px;
+                            clip: true;
+                            accessible-role: list;
+                            accessible-label: "Wells";
+                            forward-focus: well-list-focus;
+                            well-list-focus := FocusScope {
+                                key-pressed(event) => {
+                                    if (event.text == Key.UpArrow && root.current-index > 0) {
+                                        root.select(root.current-index - 1, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
+                                        return accept;
+                                    } else if (event.text == Key.DownArrow && root.current-index + 1 < root.entry-count) {
+                                        root.select(root.current-index + 1, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
+                                        return accept;
+                                    } else if (event.text == Key.Home && root.entry-count > 0) {
+                                        root.select(0, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
+                                        return accept;
+                                    } else if (event.text == Key.End && root.entry-count > 0) {
+                                        root.select(root.entry-count - 1, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
+                                        return accept;
+                                    } else if (event.text == Key.Return || event.text == Key.Space) {
+                                        root.select(root.current-index, event.modifiers.control || event.modifiers.meta, event.modifiers.shift);
+                                        return accept;
+                                    }
+                                    reject
                                 }
-                                reject
                             }
-                        }
-                        ListView {
-                            for name[i] in root.sample-names: Rectangle {
-                                height: 26px;
-                                // Primary (focused) row is the strongest; other
-                                // selected rows a lighter tint.
-                                background: i == root.current-index
-                                    ? #b7d5ff
-                                    : (i < root.selected-flags.length && root.selected-flags[i] ? #dbeaff : transparent);
-                                border-width: i == root.current-index && sample-list-focus.has-focus ? 1px : 0px;
-                                border-color: #2f68b8;
-                                accessible-role: list-item;
-                                accessible-label: name;
-                                TouchArea {
-                                    pointer-event(ev) => {
-                                        if (ev.kind == PointerEventKind.up
-                                            && ev.button == PointerEventButton.left) {
-                                            sample-list-focus.focus();
-                                            root.select(i,
-                                                ev.modifiers.control || ev.modifiers.meta,
-                                                ev.modifiers.shift);
+                            ListView {
+                                for row[i] in root.tree-labels: Rectangle {
+                                    height: 26px;
+                                    // File row: no highlight. Well rows: primary is the
+                                    // strongest, other selected rows a lighter tint.
+                                    background: (i < root.tree-is-file.length && root.tree-is-file[i])
+                                        ? transparent
+                                        : (i == root.tree-primary-row
+                                            ? #b7d5ff
+                                            : (i < root.tree-selected.length && root.tree-selected[i] ? #dbeaff : transparent));
+                                    accessible-role: list-item;
+                                    accessible-label: row;
+                                    TouchArea {
+                                        pointer-event(ev) => {
+                                            if (ev.kind == PointerEventKind.up
+                                                && ev.button == PointerEventButton.left) {
+                                                well-list-focus.focus();
+                                                if (i < root.tree-is-file.length && root.tree-is-file[i]) {
+                                                    root.toggle-file-expand();
+                                                } else {
+                                                    root.select(root.tree-well-index[i],
+                                                        ev.modifiers.control || ev.modifiers.meta,
+                                                        ev.modifiers.shift);
+                                                }
+                                            }
                                         }
                                     }
+                                    // Disclosure triangle (file row only).
+                                    Text {
+                                        x: 6px;
+                                        width: 14px;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: center;
+                                        color: #666666;
+                                        visible: i < root.tree-is-file.length && root.tree-is-file[i];
+                                        text: root.tree-expanded ? "▾" : "▸";
+                                    }
+                                    // Label; wells are indented past the triangle column.
+                                    Text {
+                                        x: (i < root.tree-is-file.length && root.tree-is-file[i]) ? 22px : 34px;
+                                        width: parent.width - self.x - 6px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        font-weight: (i < root.tree-is-file.length && root.tree-is-file[i]) ? 700 : 400;
+                                        text: row;
+                                    }
                                 }
-                                Text {
-                                    x: 8px;
-                                    width: parent.width - 12px;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                    text: name;
-                                }
+                            }
+                        }
+
+                        // Rename the selected well (in-memory; persist via File → Save).
+                        HorizontalLayout {
+                            spacing: 4px;
+                            rename-field := LineEdit {
+                                enabled: root.can-rename;
+                                placeholder-text: "well name";
+                                text <=> root.rename-text;
+                                accepted => { if (root.can-rename) { root.rename-well(self.text); } }
+                            }
+                            Button {
+                                text: "Rename";
+                                enabled: root.can-rename;
+                                clicked => { root.rename-well(rename-field.text); }
                             }
                         }
                     }
@@ -170,8 +247,13 @@ export component AppWindow inherits Window {
                             max-height: 42px;
                             vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                             horizontal-scrollbar-policy: ScrollBarPolicy.as-needed;
-                            viewport-width: toolbar-row.width;
-                            viewport-height: toolbar-row.height;
+                            // Use the content's *preferred* size, not its actual
+                            // width/height: toolbar-row fills the Flickable viewport,
+                            // so binding to `.width`/`.height` here would make
+                            // viewport-width depend on itself (Slint "Recursion
+                            // detected" panic at startup). preferred-* is intrinsic.
+                            viewport-width: toolbar-row.preferred-width;
+                            viewport-height: toolbar-row.preferred-height;
                             toolbar-row := HorizontalLayout {
                                 spacing: 6px;
                                 Button {
@@ -277,6 +359,26 @@ export component AppWindow inherits Window {
                             color: #444444;
                             wrap: word-wrap;
                         }
+
+                        // Peak/region table for the focused sample, below the plot.
+                        StandardTableView {
+                            vertical-stretch: 1;
+                            min-height: 120px;
+                            columns: [
+                                { title: "#", min-width: 40px },
+                                { title: "size", min-width: 70px },
+                                { title: "time (s)", min-width: 70px },
+                                { title: "area", min-width: 70px },
+                                { title: "height", min-width: 70px },
+                                { title: "% total", min-width: 60px },
+                                { title: "conc", min-width: 70px },
+                                { title: "molarity", min-width: 70px },
+                                { title: "note", min-width: 120px },
+                            ];
+                            rows: root.table-rows;
+                            current-row <=> root.table-current-row;
+                            current-row-changed(r) => { root.table-row-changed(r); }
+                        }
                     }
                 }
             }
@@ -336,34 +438,6 @@ export component AppWindow inherits Window {
                 }
             }
 
-            Tab {
-                title: "Table";
-                VerticalLayout {
-                    spacing: 4px;
-                    Text {
-                        text: "peaks for: " + root.assay-title;
-                        font-size: 11px;
-                        color: #555555;
-                        overflow: elide;
-                    }
-                    StandardTableView {
-                        columns: [
-                            { title: "#", min-width: 40px },
-                            { title: "size", min-width: 70px },
-                            { title: "time (s)", min-width: 70px },
-                            { title: "area", min-width: 70px },
-                            { title: "height", min-width: 70px },
-                            { title: "% total", min-width: 60px },
-                            { title: "conc", min-width: 70px },
-                            { title: "molarity", min-width: 70px },
-                            { title: "note", min-width: 120px },
-                        ];
-                        rows: root.table-rows;
-                        current-row <=> root.table-current-row;
-                        current-row-changed(r) => { root.table-row-changed(r); }
-                    }
-                }
-            }
         }
     }
 }

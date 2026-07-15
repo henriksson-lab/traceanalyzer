@@ -1,12 +1,26 @@
 //! Application state shared across Slint callbacks.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use traceio::calibration::MarkerOverride;
 use traceio::xad::RawChannel;
 use traceio::Electrophoresis;
 
 use crate::plot::{Viewport, YMode};
+
+/// Parallel columns describing the visible rows of the well tree: row 0 is the
+/// file, rows 1.. are its wells (omitted when the file node is collapsed). All
+/// vectors have the same length.
+pub struct TreeRows {
+    pub labels: Vec<String>,
+    pub is_file: Vec<bool>,
+    /// Sample index for well rows; `-1` for the file row.
+    pub well_index: Vec<i32>,
+    pub selected: Vec<bool>,
+    /// Visible-row index of the primary well, or `-1`.
+    pub primary_row: i32,
+}
 
 /// Which marker line is being dragged in marker-edit mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,12 +69,23 @@ pub struct AppState {
     pub overrides: HashMap<usize, MarkerOverride>,
     /// Marker currently being dragged, if any (transient).
     pub grabbed: Option<MarkerDrag>,
+    /// Whether the file node in the well tree is expanded.
+    pub expanded: bool,
+    /// Path the run was loaded from (target for File → Save).
+    pub source_path: Option<PathBuf>,
+    /// True when the run has in-memory edits (e.g. renamed wells) not yet saved.
+    pub dirty: bool,
     /// Last load error, shown in the UI.
     pub error: Option<String>,
 }
 
 impl AppState {
-    pub fn new(run: Electrophoresis, raw_channels: Vec<RawChannel>, error: Option<String>) -> Self {
+    pub fn new(
+        run: Electrophoresis,
+        raw_channels: Vec<RawChannel>,
+        source_path: Option<PathBuf>,
+        error: Option<String>,
+    ) -> Self {
         AppState {
             run,
             raw_channels,
@@ -76,8 +101,79 @@ impl AppState {
             marker_edit: false,
             overrides: HashMap::new(),
             grabbed: None,
+            expanded: true,
+            source_path,
+            dirty: false,
             error,
         }
+    }
+
+    /// Visible rows of the well tree (see [`TreeRows`]).
+    pub fn tree_rows(&self) -> TreeRows {
+        let file_label = if self.run.assay.file_name.is_empty() {
+            "run".to_string()
+        } else {
+            self.run.assay.file_name.clone()
+        };
+        let mut t = TreeRows {
+            labels: vec![file_label],
+            is_file: vec![true],
+            well_index: vec![-1],
+            selected: vec![false],
+            primary_row: -1,
+        };
+        if self.expanded {
+            for (i, label) in self.entry_labels().into_iter().enumerate() {
+                t.labels.push(label);
+                t.is_file.push(false);
+                t.well_index.push(i as i32);
+                t.selected.push(self.is_selected(i));
+                if i == self.primary() {
+                    t.primary_row = (t.labels.len() - 1) as i32;
+                }
+            }
+        }
+        t
+    }
+
+    /// Whether the primary-selected entry is a renameable well (not a raw channel).
+    pub fn can_rename(&self) -> bool {
+        !self.raw_mode() && self.primary() < self.run.samples.len()
+    }
+
+    /// Current name of the primary-selected well (empty in raw mode).
+    pub fn primary_name(&self) -> String {
+        if self.raw_mode() {
+            return String::new();
+        }
+        self.run
+            .samples
+            .get(self.primary())
+            .map(|s| s.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// Rename the primary-selected well in memory; marks the run dirty.
+    /// Returns true if the name actually changed.
+    pub fn rename_primary(&mut self, name: &str) -> bool {
+        if self.raw_mode() {
+            return false;
+        }
+        let idx = self.primary();
+        if let Some(s) = self.run.samples.get_mut(idx) {
+            let name = name.trim();
+            if !name.is_empty() && s.name != name {
+                s.name = name.to_string();
+                self.dirty = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether there is a loaded file that File → Save can write to.
+    pub fn can_save(&self) -> bool {
+        self.source_path.is_some()
     }
 
     /// The primary (focused) entry index: drives the info line, viewport

@@ -1,16 +1,10 @@
 # <img src="assets/icon.svg" alt="Trace analyzer logo" width="60" height="60" align="middle"> Trace analyzer
 
-Open-source, **post-measurement analysis** for automated-electrophoresis
-instruments — a replacement for the vendor software that ships with the Agilent
-**2100 Bioanalyzer**, Agilent **TapeStation**, and (bonus) Agilent/AATI
-**Fragment Analyzer**. No hardware control; this reads and analyses saved runs.
+Open-source analysis tool for data from Agilent DNA/RNA analysis instruments
 
-It opens a run, plots the electropherograms, and computes per-point sizing,
-concentration, and molarity against the ladder — all from the files the
-instrument already saved.
+No hardware control yet; this sofware only reads and analyses saved runs.
 
-> **This software is still under development.** It is an early prototype focused
-> on the Bioanalyzer reader.
+> **This software needs testing. Tape station support needs work. Please report other issues** 
 
 ![Trace analyzer showing a DNA 1000 ladder run — well tree, electropherogram, and per-peak sizing/concentration/molarity table](docs/screenshot.png)
 
@@ -18,9 +12,9 @@ instrument already saved.
 
 | Platform | Native format | Status |
 |---|---|---|
-| **Bioanalyzer 2100** | `.xad` | Native `.xad` and exported `.xml` both read; sizing/concentration/molarity validated on real demo data. |
-| TapeStation | `.D1000`/… (encrypted ZIP) | Not started. Planned via XML + unaligned-CSV export. |
-| Fragment Analyzer | `.raw` + `.PKS` sidecars | Partial native reader: `.raw` CCD traces, `.txt` well/sample names, `.PKS` size anchors and peak tables. Concentration/molarity are not yet decoded from `.PKS`. |
+| **Bioanalyzer 2100** | `.xad` | Native `.xad` opens as raw detector channels + metadata; exported `.xml`/`.xml.gz` opens with processed traces, peaks, sizing, concentration, molarity, and RIN. |
+| **TapeStation** | `.D1000`/… (encrypted ZIP) | Not started. Planned via XML + unaligned-CSV export. |
+| **Fragment Analyzer** | `.raw` + `.PKS` sidecars | Partial native reader: `.raw` CCD traces, `.txt` well/sample names, `.PKS` size anchors and peak tables. Concentration/molarity are not yet decoded from `.PKS`. |
 
 **A note on Bioanalyzer `.xad` files:** a native `.xad` stores the **raw
 detector signal and sample metadata only**. 2100 Expert recomputes the processed
@@ -35,7 +29,7 @@ raw `.xad` is [on the roadmap](docs/architecture.md#roadmap).
 Requires a [Rust toolchain](https://rustup.rs). Build and open a file with:
 
 ```sh
-# GUI viewer — accepts .xad (native), .xml, and .xml.gz:
+# GUI viewer — accepts .xad (native raw channels), .xml, and .xml.gz:
 cargo run -p traceanalyzer -- path/to/run.xad
 ```
 
@@ -51,6 +45,10 @@ and GTK development packages; see [docs/development.md](docs/development.md) for
 prerequisites, headless use, and the command-line `inspect` tool.
 
 ## Installing
+
+CI builds downloadable artifacts for Windows and macOS on pushes, pull requests,
+tags, and manual workflow runs. Windows is packaged as a single `.exe`; macOS is
+packaged as a `.app` bundle.
 
 **Linux** — install the release binary, a `.desktop` launcher entry, and the app
 icons into a standard [freedesktop](https://specifications.freedesktop.org)

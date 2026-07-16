@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Trace analyzer
+GenericName=Electrophoresis analyzer
+Comment=Post-measurement analysis for automated electrophoresis (Bioanalyzer, TapeStation, Fragment Analyzer)
+Exec=traceanalyzer %f
+Icon=traceanalyzer
+Terminal=false
+Categories=Science;Biology;Education;
+Keywords=electrophoresis;bioanalyzer;tapestation;fragment analyzer;DNA;RNA;gel;
+MimeType=application/xml;
+# Must match the window's Wayland app_id / X11 WM_CLASS so the running window
+# associates with this launcher entry (and picks up its icon on Wayland).
+StartupWMClass=traceanalyzer

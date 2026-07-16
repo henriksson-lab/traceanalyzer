@@ -10,3 +10,4 @@ testdata/*.xml
 
 # Private real instrument data — must never be committed.
 bioa_examples/
+fa_examples/

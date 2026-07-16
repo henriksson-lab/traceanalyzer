@@ -21,6 +21,13 @@ pub struct Loaded {
 /// Load a run from `.xad` / `.xml` / `.xml.gz`, calibrate it, and (for `.xad`)
 /// read the raw detector channels.
 pub fn load(path: &Path) -> Result<Loaded> {
+    // Fragment Analyzer runs arrive already size-calibrated (the reader fills
+    // per-point length itself), so they skip the marker-based `calibrate`.
+    if traceio::fa::is_fa_path(path) {
+        let run = traceio::fa::read_fa_run(path)?;
+        return Ok(Loaded { run, raw_channels: Vec::new(), warning: None });
+    }
+
     let mut run = parse(path)?;
     calibrate(&mut run);
 

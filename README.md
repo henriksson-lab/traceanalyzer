@@ -1,8 +1,4 @@
-<p align="center">
-  <img src="assets/icon.svg" alt="Trace analyzer logo" width="120" height="120">
-</p>
-
-# Trace analyzer
+# <img src="assets/icon.svg" alt="Trace analyzer logo" width="60" height="60" align="middle"> Trace analyzer
 
 Open-source, **post-measurement analysis** for automated-electrophoresis
 instruments — a replacement for the vendor software that ships with the Agilent

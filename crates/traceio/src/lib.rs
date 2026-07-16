@@ -11,8 +11,9 @@
 //!   from a real run directory (see `docs/fa_format.md`). Reads the `.raw` CCD
 //!   acquisition into 12 per-capillary electropherograms, plus the `.PKS`
 //!   size-calibration anchors and per-well peak table (sizes, areas, lower/upper
-//!   markers, ladder detection). Validated against the ProSize CSV export.
-//!   Per-peak concentration/molarity are not yet located in `.PKS`.
+//!   markers, ladder detection). Computes concentration/molarity from the
+//!   standard FA ladder setpoints and marker-area scaling. Validated against the
+//!   ProSize CSV export.
 
 pub mod bioanalyzer;
 pub mod calibration;

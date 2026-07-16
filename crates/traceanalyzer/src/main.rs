@@ -84,9 +84,21 @@ fn main() -> anyhow::Result<()> {
         ui.on_open_file(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Electrophoresis", &["xad", "xml", "gz", "raw"])
+                .add_filter("Electrophoresis", &["xad", "xml", "gz", "zip"])
                 .pick_file()
             {
+                open_added_file(&ui, &st, &path);
+            }
+        });
+    }
+
+    // Open an unzipped Fragment Analyzer run folder directly.
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_open_folder(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if let Some(path) = rfd::FileDialog::new().pick_folder() {
                 open_added_file(&ui, &st, &path);
             }
         });
@@ -347,6 +359,7 @@ fn main() -> anyhow::Result<()> {
                 let table = {
                     let mut s = st.borrow_mut();
                     s.activate_and_select(file_idx, well_idx);
+                    ensure_y_mode_available(&mut s);
                     build_table_refresh(&mut s)
                 };
                 table.apply(&ui);
@@ -535,7 +548,7 @@ fn main() -> anyhow::Result<()> {
             let Some(ui) = ui_weak.upgrade() else { return };
             {
                 let mut s = st.borrow_mut();
-                s.y_mode = YMode::from_index(idx as usize);
+                s.y_mode = YMode::from_available_index(s.run(), idx as usize);
                 s.set_viewport(None); // y-range changes with the quantity
                 refresh_overview(&ui, &s);
             }
@@ -551,11 +564,33 @@ fn main() -> anyhow::Result<()> {
 /// Open a file as a new entry in the multi-file list, make it active, and
 /// refresh the whole UI. Existing open files are kept.
 fn open_added_file(ui: &AppWindow, state: &SharedState, path: &std::path::Path) {
+    // Canonical run identity: for a Fragment Analyzer run every entry point (the
+    // `.zip`, the `.raw`, the folder, or a sibling like `.PKS`/`.txt`) maps to
+    // one identity, so a multi-file drop opens the run just once. Also drives
+    // save targeting and the tree tooltip path.
+    let source = if traceio::fa::is_fa_path(path) {
+        traceio::fa::run_identity(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    // Already open? Re-activate it instead of loading a duplicate.
+    if let Some(idx) = state.borrow().find_file_by_source(&source) {
+        let table = {
+            let mut s = state.borrow_mut();
+            s.activate_file(idx);
+            refresh_all(ui, &mut s)
+        };
+        table.apply(ui);
+        show_selected(ui, &state.borrow());
+        return;
+    }
+
     match loading::load(path) {
         Ok(loaded) => {
             let table = {
                 let mut s = state.borrow_mut();
-                s.add_file(loaded.run, loaded.raw_channels, Some(path.to_path_buf()));
+                s.add_file(loaded.run, loaded.raw_channels, Some(source));
                 s.error = loaded.warning;
                 refresh_all(ui, &mut s)
             };
@@ -573,6 +608,7 @@ fn open_added_file(ui: &AppWindow, state: &SharedState, path: &std::path::Path) 
 
 /// Push run-level data (title, entry list, error) into the UI and build a table update.
 fn refresh_all(ui: &AppWindow, st: &mut AppState) -> TableRefresh {
+    ensure_y_mode_available(st);
     ui.set_assay_title(SharedString::from(st.title()));
     ui.set_error_text(SharedString::from(st.error.clone().unwrap_or_default()));
     refresh_tree(ui, st);
@@ -580,6 +616,14 @@ fn refresh_all(ui: &AppWindow, st: &mut AppState) -> TableRefresh {
     build_table_refresh(st)
 }
 
+/// Clamp global y-mode state after switching files or loading data whose
+/// derived arrays are absent (for example some Fragment Analyzer imports).
+fn ensure_y_mode_available(st: &mut AppState) {
+    if st.active_file().is_some() && !st.y_mode.is_available(st.run()) {
+        st.y_mode = YMode::Fluorescence;
+        st.set_viewport(None);
+    }
+}
 
 /// Push the well tree (rows, selection, expansion) and the rename/save enable
 /// state into the UI. Also sets the rename field to the selected well's name.
@@ -695,8 +739,7 @@ impl TableRefresh {
 /// Build the peak/region table for the focused sample.
 /// Also records each row's plot x-position (for cross-highlighting) into `st`.
 fn build_table_refresh(st: &mut AppState) -> TableRefresh {
-    if st.active_file().is_none() || st.raw_mode() || st.run().samples.get(st.primary()).is_none()
-    {
+    if st.active_file().is_none() || st.raw_mode() || st.run().samples.get(st.primary()).is_none() {
         st.table_peak_x.clear();
         return TableRefresh::empty();
     }
@@ -787,7 +830,9 @@ fn show_selected(ui: &AppWindow, st: &AppState) {
 
     let series = selected_series(st);
     let refs: Vec<&Series> = series.iter().collect();
-    let vp = st.viewport().unwrap_or_else(|| auto_fit_viewport(st, &refs));
+    let vp = st
+        .viewport()
+        .unwrap_or_else(|| auto_fit_viewport(st, &refs));
     // Highlight the selected peak only in the single-sample view.
     let highlight = if st.selection().len() == 1 {
         st.highlight_x
@@ -807,11 +852,12 @@ fn show_selected(ui: &AppWindow, st: &AppState) {
     };
     ui.set_sample_info(SharedString::from(info));
     let y_options: Vec<SharedString> = YMode::ALL
-        .iter()
+        .into_iter()
+        .filter(|m| m.is_available(st.run()))
         .map(|m| SharedString::from(m.label(st.run())))
         .collect();
     ui.set_y_mode_options(ModelRc::from(Rc::new(VecModel::from(y_options))));
-    ui.set_y_mode_index(st.y_mode.index() as i32);
+    ui.set_y_mode_index(st.y_mode.available_index(st.run()) as i32);
     ui.set_normalize_on(st.normalize);
     ui.set_marker_edit(st.marker_edit);
 }
@@ -834,9 +880,7 @@ fn save_current(ui: &AppWindow, st: &SharedState) {
     let dst = st.borrow().source_path();
     match dst {
         // A native .xad cannot be rewritten in place; offer Save As.
-        Some(p) if p.extension().and_then(|e| e.to_str()) == Some("xad") => {
-            save_as_dialog(ui, st)
-        }
+        Some(p) if p.extension().and_then(|e| e.to_str()) == Some("xad") => save_as_dialog(ui, st),
         Some(p) => do_save(ui, st, p),
         None => save_as_dialog(ui, st),
     }
@@ -917,6 +961,13 @@ fn file_base_name(path: &str) -> String {
 }
 
 fn save_as_dialog(ui: &AppWindow, st: &SharedState) {
+    if st.borrow().fragment_analyzer_mode() {
+        ui.set_error_text(SharedString::from(
+            "Fragment Analyzer runs can only be saved in place by updating the .txt sidecar",
+        ));
+        return;
+    }
+
     let start_name = st
         .borrow()
         .source_path()

@@ -38,7 +38,7 @@ pub struct TreeRows {
 /// (`\`) or Unix (`/`) separators, so split on both; falls back to the whole
 /// string when there is no separator.
 fn file_base_name(path: &str) -> String {
-    path.rsplit(|c| c == '\\' || c == '/')
+    path.rsplit(['\\', '/'])
         .next()
         .unwrap_or(path)
         .to_string()
@@ -106,6 +106,18 @@ impl OpenFile {
     fn raw_mode(&self) -> bool {
         let no_processed = self.run.samples.iter().all(|s| s.fluorescence.is_empty());
         no_processed && !self.raw_channels.is_empty()
+    }
+
+    /// True for native Fragment Analyzer runs. FA saves are in-place `.txt`
+    /// sidecar patches next to the immutable `.raw` acquisition file.
+    fn fragment_analyzer_mode(&self) -> bool {
+        self.run.assay.assay_name == "Fragment Analyzer"
+            || self
+                .source_path
+                .as_ref()
+                .and_then(|p| p.extension())
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("raw"))
     }
 
     /// Number of selectable entries in the current mode.
@@ -252,9 +264,28 @@ impl AppState {
         raw_channels: Vec<RawChannel>,
         source_path: Option<PathBuf>,
     ) {
-        self.files.push(OpenFile::new(run, raw_channels, source_path));
+        self.files
+            .push(OpenFile::new(run, raw_channels, source_path));
         self.active = Some(self.files.len() - 1);
         self.reset_transient();
+    }
+
+    /// Index of an already-open file whose source matches `path` (compared
+    /// canonically), if any — so re-opening a run just re-activates it.
+    pub fn find_file_by_source(&self, path: &std::path::Path) -> Option<usize> {
+        let target = canonical(path);
+        self.files
+            .iter()
+            .position(|f| f.source_path.as_deref().map(canonical).as_ref() == Some(&target))
+    }
+
+    /// Make `idx` the active file (no-op if out of range), preserving that
+    /// file's own selection/viewport.
+    pub fn activate_file(&mut self, idx: usize) {
+        if idx < self.files.len() {
+            self.active = Some(idx);
+            self.reset_transient();
+        }
     }
 
     /// Remove a file, fixing up the active index (⇒ `None` when the list empties).
@@ -293,10 +324,14 @@ impl AppState {
         }
     }
     pub fn raw_channels(&self) -> &[RawChannel] {
-        self.active_file().map(|f| f.raw_channels.as_slice()).unwrap_or(&[])
+        self.active_file()
+            .map(|f| f.raw_channels.as_slice())
+            .unwrap_or(&[])
     }
     pub fn selection(&self) -> &[usize] {
-        self.active_file().map(|f| f.selection.as_slice()).unwrap_or(&[])
+        self.active_file()
+            .map(|f| f.selection.as_slice())
+            .unwrap_or(&[])
     }
     pub fn viewport(&self) -> Option<Viewport> {
         self.active_file().and_then(|f| f.viewport)
@@ -458,7 +493,7 @@ impl AppState {
 
     // ---- active-file queries (empty-safe) ----------------------------------
 
-    /// Whether the primary-selected entry is a renameable well (not a raw channel).
+    /// Whether the primary-selected entry is a renameable well.
     pub fn can_rename(&self) -> bool {
         self.active_file()
             .is_some_and(|f| !f.raw_mode() && f.primary() < f.run.samples.len())
@@ -507,6 +542,12 @@ impl AppState {
         self.active_file().is_some_and(|f| f.source_path.is_some())
     }
 
+    /// True when the active file is a native Fragment Analyzer run.
+    pub fn fragment_analyzer_mode(&self) -> bool {
+        self.active_file()
+            .is_some_and(|f| f.fragment_analyzer_mode())
+    }
+
     /// The active file's primary (focused) entry index; 0 when no file is open.
     pub fn primary(&self) -> usize {
         self.active_file().map_or(0, |f| f.primary())
@@ -519,7 +560,9 @@ impl AppState {
 
     /// Per-entry selection flags for the list highlight.
     pub fn selection_flags(&self) -> Vec<bool> {
-        (0..self.entry_count()).map(|i| self.is_selected(i)).collect()
+        (0..self.entry_count())
+            .map(|i| self.is_selected(i))
+            .collect()
     }
 
     /// Apply a list click with modifier keys to the active file, updating its
@@ -606,8 +649,16 @@ impl AppState {
 
     /// Display labels for the active file's entry list.
     pub fn entry_labels(&self) -> Vec<String> {
-        self.active_file().map(|f| f.entry_labels()).unwrap_or_default()
+        self.active_file()
+            .map(|f| f.entry_labels())
+            .unwrap_or_default()
     }
+}
+
+/// Canonicalize a path for identity comparison, falling back to the path as-is
+/// when it cannot be resolved (e.g. it no longer exists).
+fn canonical(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -648,6 +699,12 @@ mod tests {
 
     fn state_with_file(name: &str) -> AppState {
         AppState::new(run_named(name, 0), Vec::new(), None, None)
+    }
+
+    fn fa_state_with_source(source: &str) -> AppState {
+        let mut run = run_named(source, 1);
+        run.assay.assay_name = "Fragment Analyzer".to_string();
+        AppState::new(run, Vec::new(), Some(PathBuf::from(source)), None)
     }
 
     #[test]
@@ -708,5 +765,63 @@ mod tests {
         st.close_file(0); // last one gone → no active file
         assert_eq!(st.active, None);
         assert!(st.files.is_empty());
+    }
+
+    #[test]
+    fn bioanalyzer_wells_can_be_renamed_and_saved() {
+        let mut st = AppState::new(
+            run_named("run.xml", 1),
+            Vec::new(),
+            Some(PathBuf::from("run.xml")),
+            None,
+        );
+
+        assert!(st.can_rename());
+        assert!(st.can_save());
+        assert!(st.rename_primary("A1"));
+        assert!(st.is_dirty());
+        assert_eq!(st.primary_name(), "A1");
+    }
+
+    #[test]
+    fn fragment_analyzer_runs_can_be_renamed_and_saved_in_place() {
+        let mut st = fa_state_with_source("run.raw");
+
+        assert!(st.fragment_analyzer_mode());
+        assert!(st.can_rename());
+        assert!(st.can_save());
+        assert!(st.rename_primary("A1"));
+        assert!(st.is_dirty());
+        assert_eq!(st.run().samples[0].name, "A1");
+    }
+
+    #[test]
+    fn raw_extension_source_is_treated_as_fragment_analyzer_saveable() {
+        let mut st = AppState::new(
+            run_named("run.raw", 1),
+            Vec::new(),
+            Some(PathBuf::from("run.RAW")),
+            None,
+        );
+
+        assert!(st.fragment_analyzer_mode());
+        assert!(st.can_rename());
+        assert!(st.can_save());
+        assert!(st.rename_primary("A1"));
+        assert!(st.is_dirty());
+    }
+
+    #[test]
+    fn find_file_by_source_dedups_and_activates() {
+        let mut st = AppState::empty();
+        st.add_file(run_named("a", 1), Vec::new(), Some(PathBuf::from("/runs/a.raw")));
+        st.add_file(run_named("b", 1), Vec::new(), Some(PathBuf::from("/runs/b.raw")));
+
+        assert_eq!(st.find_file_by_source(std::path::Path::new("/runs/a.raw")), Some(0));
+        assert_eq!(st.find_file_by_source(std::path::Path::new("/runs/b.raw")), Some(1));
+        assert_eq!(st.find_file_by_source(std::path::Path::new("/runs/c.raw")), None);
+
+        st.activate_file(0);
+        assert_eq!(st.active, Some(0));
     }
 }

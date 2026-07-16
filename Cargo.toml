@@ -14,3 +14,5 @@ base64 = "0.22"
 flate2 = "1"
 encoding_rs = "0.8"
 anyhow = "1"
+# Lean zip support (STORE + DEFLATE only) for single-file Fragment Analyzer runs.
+zip = { version = "2", default-features = false, features = ["deflate"] }

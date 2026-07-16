@@ -1,4 +1,4 @@
-//! Writer for user edits back to Agilent Bioanalyzer files.
+//! Writer for user edits back to instrument files.
 //!
 //! The reader side ([`crate::bioanalyzer`], [`crate::xad`]) is feature-rich; this
 //! module does the inverse for the one edit the GUI currently supports: renaming
@@ -7,10 +7,12 @@
 //! `<WellNumber>` and rewrite only the inner text of its direct-child `<Name>`,
 //! leaving every other byte untouched.
 //!
-//! Supported source encodings (by extension): `.xml` (UTF-8), `.xml.gz` (gzip)
-//! and native `.xad` (UTF-16LE inner XML via [`crate::xad::extract_inner_xml`]).
-//! Output encoding follows the `dst` extension (`.xml` or `.xml.gz`); writing a
-//! real `.xad` container back is out of scope.
+//! Bioanalyzer source encodings (by extension): `.xml` (UTF-8), `.xml.gz`
+//! (gzip) and native `.xad` (UTF-16LE inner XML via
+//! [`crate::xad::extract_inner_xml`]). Output encoding follows the `dst`
+//! extension (`.xml` or `.xml.gz`); writing a real `.xad` container back is out
+//! of scope. Fragment Analyzer `.raw` runs save in place by patching the `.txt`
+//! sidecar's `Sample ID:` values.
 
 use crate::model::Electrophoresis;
 use anyhow::{anyhow, Context, Result};
@@ -36,6 +38,15 @@ enum Kind {
 /// matching `<Sample>` (matched by `<WellNumber>`) is rewritten to
 /// `run.samples[i].name`.
 pub fn save_run(run: &Electrophoresis, src: &Path, dst: &Path) -> Result<()> {
+    if crate::fa::is_fa_path(src) {
+        if src != dst {
+            return Err(anyhow!(
+                "Fragment Analyzer runs can only be saved in place by updating the .txt sidecar"
+            ));
+        }
+        return crate::fa::save_txt_names(src, run);
+    }
+
     let dst_kind = classify(dst)
         .ok_or_else(|| anyhow!("unsupported output extension for {}", dst.display()))?;
     if dst_kind == Kind::Xad {
@@ -83,8 +94,8 @@ fn write_xml(dst: &Path, kind: Kind, xml: &str) -> Result<()> {
                 .with_context(|| format!("writing {}", dst.display()))?;
         }
         Kind::XmlGz => {
-            let file =
-                std::fs::File::create(dst).with_context(|| format!("creating {}", dst.display()))?;
+            let file = std::fs::File::create(dst)
+                .with_context(|| format!("creating {}", dst.display()))?;
             let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
             enc.write_all(xml.as_bytes())
                 .with_context(|| format!("gzip-writing {}", dst.display()))?;
@@ -153,10 +164,12 @@ fn collect_name_edits(doc: &Document, wanted: &HashMap<i32, &str>) -> Vec<Edit> 
     // detector channels also carry `<Name>`, but they are nested deeper).
     for sample in doc.descendants().filter(|n| {
         n.has_tag_name("Sample")
-            && n.parent().map(|p| p.has_tag_name("Samples")).unwrap_or(false)
+            && n.parent()
+                .map(|p| p.has_tag_name("Samples"))
+                .unwrap_or(false)
     }) {
-        let Some(well) = child_text(sample, "WellNumber")
-            .and_then(|t| t.trim().parse::<i32>().ok())
+        let Some(well) =
+            child_text(sample, "WellNumber").and_then(|t| t.trim().parse::<i32>().ok())
         else {
             continue;
         };
@@ -284,6 +297,42 @@ mod tests {
         };
         let out = patch_names(xml, &run).unwrap();
         assert!(out.contains("<Name>filled</Name>"), "got: {out}");
+    }
+
+    #[test]
+    fn fa_raw_save_patches_txt_sidecar_in_place() {
+        let dir = std::env::temp_dir().join(format!(
+            "traceio_fa_save_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("run.raw");
+        let txt = dir.join("run.txt");
+        std::fs::write(&raw, b"FA\0\0").unwrap();
+        std::fs::write(
+            &txt,
+            "Capillary #: 1\nWell: D1\nSample ID: old\nCapillary #: 2\nWell: D2\nSample ID: old2\n",
+        )
+        .unwrap();
+
+        let run = Electrophoresis {
+            assay: Default::default(),
+            ladder_peaks: vec![],
+            regions: vec![],
+            samples: vec![make_sample(1, "D1: renamed"), make_sample(2, "plain")],
+        };
+
+        save_run(&run, &raw, &raw).unwrap();
+
+        let patched = std::fs::read_to_string(&txt).unwrap();
+        assert!(patched.contains("Sample ID: renamed"));
+        assert!(patched.contains("Sample ID: plain"));
+        assert!(!patched.contains("Sample ID: old\n"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn make_sample(well: i32, name: &str) -> crate::model::Sample {

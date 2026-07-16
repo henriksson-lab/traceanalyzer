@@ -25,7 +25,11 @@ pub fn load(path: &Path) -> Result<Loaded> {
     // per-point length itself), so they skip the marker-based `calibrate`.
     if traceio::fa::is_fa_path(path) {
         let run = traceio::fa::read_fa_run(path)?;
-        return Ok(Loaded { run, raw_channels: Vec::new(), warning: None });
+        return Ok(Loaded {
+            run,
+            raw_channels: Vec::new(),
+            warning: None,
+        });
     }
 
     let mut run = parse(path)?;

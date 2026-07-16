@@ -59,6 +59,7 @@ export component AppWindow inherits Window {
     callback close-file(int);
     callback toggle-normalize();
     callback open-file();
+    callback open-folder();
     callback save-file();
     callback save-file-as();
     callback quit();
@@ -103,6 +104,10 @@ export component AppWindow inherits Window {
                 activated => { root.open-file(); }
             }
             MenuItem {
+                title: "Open Folder…";
+                activated => { root.open-folder(); }
+            }
+            MenuItem {
                 title: "Save";
                 enabled: root.can-save;
                 shortcut: @keys(Control + S);
@@ -139,6 +144,34 @@ export component AppWindow inherits Window {
             color: #c0392b;
             font-size: 12px;
             wrap: word-wrap;
+        }
+
+        // Empty-state guidance: shown until the first file is opened.
+        if root.tree-labels.length == 0: Rectangle {
+            background: #eef4fb;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: #cfe0f2;
+            VerticalLayout {
+                padding: 14px;
+                spacing: 4px;
+                Text {
+                    text: "Open a file to get started";
+                    font-size: 15px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "Use File → Open… (Ctrl+O) or drag a file onto the window.";
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "• Bioanalyzer: a .xad, .xml, or .xml.gz file.\n• Fragment Analyzer: zip the whole run folder into one .zip and open that.";
+                    font-size: 12px;
+                    color: #4a5b6b;
+                    wrap: word-wrap;
+                }
+            }
         }
 
         TabWidget {

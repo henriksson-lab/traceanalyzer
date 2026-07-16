@@ -68,6 +68,35 @@ impl YMode {
     pub fn from_index(i: usize) -> YMode {
         YMode::ALL.get(i).copied().unwrap_or(YMode::Fluorescence)
     }
+    /// True when the active run has data that can produce non-empty series for
+    /// this mode. Fluorescence is the fallback because every supported run can
+    /// render it; derived arrays are optional in some native formats.
+    pub fn is_available(self, run: &Electrophoresis) -> bool {
+        match self {
+            YMode::Fluorescence => true,
+            YMode::Concentration => has_finite_values(run, |s| &s.concentration),
+            YMode::Molarity => has_finite_values(run, |s| &s.molarity),
+        }
+    }
+    pub fn available_for(run: &Electrophoresis) -> Vec<YMode> {
+        YMode::ALL
+            .iter()
+            .copied()
+            .filter(|m| m.is_available(run))
+            .collect()
+    }
+    pub fn from_available_index(run: &Electrophoresis, i: usize) -> YMode {
+        YMode::available_for(run)
+            .get(i)
+            .copied()
+            .unwrap_or(YMode::Fluorescence)
+    }
+    pub fn available_index(self, run: &Electrophoresis) -> usize {
+        YMode::available_for(run)
+            .iter()
+            .position(|m| *m == self)
+            .unwrap_or(0)
+    }
     pub fn label(self, run: &Electrophoresis) -> String {
         match self {
             YMode::Fluorescence => "fluorescence".into(),
@@ -78,6 +107,12 @@ impl YMode {
             ),
         }
     }
+}
+
+fn has_finite_values(run: &Electrophoresis, values: impl Fn(&Sample) -> &[f64]) -> bool {
+    run.samples
+        .iter()
+        .any(|s| values(s).iter().any(|v| v.is_finite()))
 }
 
 /// A data window in (x, y) space.
@@ -603,6 +638,7 @@ pub fn data_x_to_frac(data_x: f64, vp: &Viewport) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use traceio::{AssayInfo, Electrophoresis, Sample};
 
     fn series_with_ys(ys: Vec<f64>) -> Series {
         let xs: Vec<f64> = (0..ys.len()).map(|i| i as f64).collect();
@@ -616,6 +652,59 @@ mod tests {
         }
     }
 
+    fn sample_with_derived(concentration: Vec<f64>, molarity: Vec<f64>) -> Sample {
+        Sample {
+            well_number: 1,
+            name: "A1".to_string(),
+            category: String::new(),
+            is_ladder: false,
+            comment: String::new(),
+            observations: String::new(),
+            rin: None,
+            time: vec![1.0],
+            fluorescence: vec![1.0],
+            aligned_time: Vec::new(),
+            length: vec![100.0],
+            concentration,
+            molarity,
+            peaks: Vec::new(),
+        }
+    }
+
+    fn run_with_sample(sample: Sample) -> Electrophoresis {
+        Electrophoresis {
+            assay: AssayInfo {
+                concentration_unit: "ng/ul".to_string(),
+                molarity_unit: Some("nM".to_string()),
+                ..Default::default()
+            },
+            ladder_peaks: Vec::new(),
+            regions: Vec::new(),
+            samples: vec![sample],
+        }
+    }
+
+    #[test]
+    fn y_mode_availability_omits_empty_derived_arrays() {
+        let run = run_with_sample(sample_with_derived(Vec::new(), Vec::new()));
+
+        assert_eq!(YMode::available_for(&run), vec![YMode::Fluorescence]);
+        assert_eq!(YMode::from_available_index(&run, 1), YMode::Fluorescence);
+        assert_eq!(YMode::Molarity.available_index(&run), 0);
+    }
+
+    #[test]
+    fn y_mode_availability_preserves_present_derived_arrays() {
+        let run = run_with_sample(sample_with_derived(vec![0.0], vec![f64::NAN, 2.0]));
+
+        assert_eq!(
+            YMode::available_for(&run),
+            vec![YMode::Fluorescence, YMode::Concentration, YMode::Molarity]
+        );
+        assert_eq!(YMode::from_available_index(&run, 2), YMode::Molarity);
+        assert_eq!(YMode::Molarity.available_index(&run), 2);
+    }
+
     #[test]
     fn robust_viewport_clips_a_narrow_spike() {
         // 200 points near ~1.0, plus one huge spike: the marker-molarity case.
@@ -624,7 +713,11 @@ mod tests {
         let s = series_with_ys(ys);
         let robust = auto_viewport_multi_robust(&[&s]);
         let plain = auto_viewport_multi(&[&s]);
-        assert!(plain.y_max > 400.0, "plain keeps the spike: {}", plain.y_max);
+        assert!(
+            plain.y_max > 400.0,
+            "plain keeps the spike: {}",
+            plain.y_max
+        );
         assert!(
             robust.y_max < 10.0,
             "robust drops the spike so the bulk fills the plot: {}",
@@ -642,11 +735,7 @@ mod tests {
         }
         let s = series_with_ys(ys);
         let robust = auto_viewport_multi_robust(&[&s]);
-        assert!(
-            robust.y_max >= 100.0,
-            "broad peak kept: {}",
-            robust.y_max
-        );
+        assert!(robust.y_max >= 100.0, "broad peak kept: {}", robust.y_max);
     }
 
     #[test]

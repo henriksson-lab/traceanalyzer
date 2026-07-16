@@ -20,7 +20,7 @@ instrument already saved.
 |---|---|---|
 | **Bioanalyzer 2100** | `.xad` | Native `.xad` and exported `.xml` both read; sizing/concentration/molarity validated on real demo data. |
 | TapeStation | `.D1000`/… (encrypted ZIP) | Not started. Planned via XML + unaligned-CSV export. |
-| Fragment Analyzer | `.raw`/`.db3` (SQLite) | Not started. Planned via ProSize CSV first. |
+| Fragment Analyzer | `.raw` + `.PKS` sidecars | Partial native reader: `.raw` CCD traces, `.txt` well/sample names, `.PKS` size anchors and peak tables. Concentration/molarity are not yet decoded from `.PKS`. |
 
 **A note on Bioanalyzer `.xad` files:** a native `.xad` stores the **raw
 detector signal and sample metadata only**. 2100 Expert recomputes the processed
@@ -77,6 +77,8 @@ make osx-app                     # → target/osx/Trace analyzer.app
   and how calibration works.
 - [docs/xad_format.md](docs/xad_format.md) — reverse-engineered `.xad` container
   and schema specification.
+- [docs/fa_format.md](docs/fa_format.md) — reverse-engineered Fragment Analyzer
+  `.raw`/`.PKS` notes and current reader limitations.
 - [docs/development.md](docs/development.md) — building, testing, fixtures, and
   packaging.
 

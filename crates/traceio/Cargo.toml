@@ -12,3 +12,7 @@ base64.workspace = true
 flate2.workspace = true
 encoding_rs.workspace = true
 anyhow.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+zip.workspace = true

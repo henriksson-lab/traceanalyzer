@@ -12,14 +12,17 @@ export component AppWindow inherits Window {
     // Well list is a tree: row 0 is the file, rows 1.. are its wells. These
     // arrays are parallel over the *visible* rows (children are omitted when the
     // file node is collapsed).
+    // Multi-file tree: rows span every open file (a file node followed by its
+    // wells when expanded). All arrays are parallel over the visible rows.
     in property <[string]> tree-labels;
     in property <[bool]> tree-is-file;
-    in property <[int]> tree-well-index;    // -1 for the file row, else sample index
+    in property <[int]> tree-file-index;    // which file each row belongs to
+    in property <[int]> tree-well-index;    // -1 for file rows, else well index in its file
+    in property <[bool]> tree-file-expanded; // per-row: owning file's expanded state
+    in property <[string]> tree-file-path;  // per-row: full path (file rows; "" on wells) for tooltip
     in property <[bool]> tree-selected;     // any-selected highlight, parallel to tree-labels
-    in property <int> tree-primary-row: -1; // visible-row index of the primary well
-    in property <bool> tree-expanded: true;
-    in property <int> entry-count;          // number of wells (keyboard-nav bound)
-    in property <string> file-path;         // full path of the loaded file (tree tooltip)
+    in property <int> tree-primary-row: -1; // visible-row index of the active primary well
+    in property <int> entry-count;          // active file's well count (keyboard-nav bound)
     // Rename: bound to the selected well's name; edited in the field, applied on Rename.
     in-out property <string> rename-text;
     in property <bool> can-rename: false;
@@ -49,16 +52,20 @@ export component AppWindow inherits Window {
     in-out property <int> table-current-row: -1;
     callback table-row-changed(int);
 
-    // idx, ctrl-held, shift-held (for multi-select).
+    // Keyboard selection within the active file: well index, ctrl-held, shift-held.
     callback select(int, bool, bool);
+    // Mouse click on a visible tree row: row index, ctrl-held, shift-held.
+    callback select-row(int, bool, bool);
+    // Close the file owning a visible row (its [x] button).
+    callback close-file(int);
     callback toggle-normalize();
     callback open-file();
     callback save-file();
     callback save-file-as();
     callback quit();
     callback about();
-    // Expand/collapse the file node in the well tree.
-    callback toggle-file-expand();
+    // Expand/collapse the file node owning a visible row.
+    callback toggle-file-expand(int);
     // Rename the primary-selected well to the given text (in-memory only).
     callback rename-well(string);
     // fractional (0..1) click position on the overview image.
@@ -178,10 +185,11 @@ export component AppWindow inherits Window {
                             }
                             ListView {
                                 for row[i] in root.tree-labels: Rectangle {
+                                    property <bool> is-file: i < root.tree-is-file.length && root.tree-is-file[i];
                                     height: 26px;
                                     // File row: no highlight. Well rows: primary is the
                                     // strongest, other selected rows a lighter tint.
-                                    background: (i < root.tree-is-file.length && root.tree-is-file[i])
+                                    background: self.is-file
                                         ? transparent
                                         : (i == root.tree-primary-row
                                             ? #b7d5ff
@@ -190,53 +198,76 @@ export component AppWindow inherits Window {
                                     accessible-label: row;
                                     // File row: hovering shows the full path verbatim
                                     // (custom content avoids markdown escaping the path).
-                                    if (i < root.tree-is-file.length && root.tree-is-file[i] && root.file-path != ""): Tooltip {
+                                    if (i < root.tree-is-file.length && root.tree-is-file[i] && i < root.tree-file-path.length && root.tree-file-path[i] != ""): Tooltip {
                                         Rectangle {
                                             background: #2b2b2b;
                                             border-radius: 4px;
                                             HorizontalLayout {
                                                 padding: 6px;
                                                 Text {
-                                                    text: root.file-path;
+                                                    text: root.tree-file-path[i];
                                                     color: #ffffff;
                                                     font-size: 12px;
                                                 }
                                             }
                                         }
                                     }
-                                    TouchArea {
+                                    row-touch := TouchArea {
                                         pointer-event(ev) => {
                                             if (ev.kind == PointerEventKind.up
                                                 && ev.button == PointerEventButton.left) {
                                                 well-list-focus.focus();
-                                                if (i < root.tree-is-file.length && root.tree-is-file[i]) {
-                                                    root.toggle-file-expand();
+                                                if (parent.is-file) {
+                                                    root.toggle-file-expand(i);
                                                 } else {
-                                                    root.select(root.tree-well-index[i],
+                                                    root.select-row(i,
                                                         ev.modifiers.control || ev.modifiers.meta,
                                                         ev.modifiers.shift);
                                                 }
                                             }
                                         }
                                     }
-                                    // Disclosure triangle (file row only).
+                                    // Disclosure triangle (file rows), reflecting that file's state.
                                     Text {
                                         x: 6px;
                                         width: 14px;
                                         vertical-alignment: center;
                                         horizontal-alignment: center;
                                         color: #666666;
-                                        visible: i < root.tree-is-file.length && root.tree-is-file[i];
-                                        text: root.tree-expanded ? "▾" : "▸";
+                                        visible: parent.is-file;
+                                        text: (i < root.tree-file-expanded.length && root.tree-file-expanded[i]) ? "▾" : "▸";
                                     }
                                     // Label; wells are indented past the triangle column.
                                     Text {
-                                        x: (i < root.tree-is-file.length && root.tree-is-file[i]) ? 22px : 34px;
-                                        width: parent.width - self.x - 6px;
+                                        x: parent.is-file ? 22px : 34px;
+                                        width: parent.width - self.x - (parent.is-file ? 28px : 6px);
                                         vertical-alignment: center;
                                         overflow: elide;
-                                        font-weight: (i < root.tree-is-file.length && root.tree-is-file[i]) ? 700 : 400;
+                                        font-weight: parent.is-file ? 700 : 400;
                                         text: row;
+                                    }
+                                    // Close [x] on file rows, revealed on hover.
+                                    if (i < root.tree-is-file.length && root.tree-is-file[i]): Rectangle {
+                                        width: 20px;
+                                        height: 20px;
+                                        x: parent.width - self.width - 4px;
+                                        y: (parent.height - self.height) / 2;
+                                        border-radius: 4px;
+                                        visible: row-touch.has-hover || close-touch.has-hover;
+                                        background: close-touch.has-hover ? #d64545 : transparent;
+                                        accessible-role: button;
+                                        accessible-label: "Close file";
+                                        Text {
+                                            text: "✕";
+                                            font-size: 12px;
+                                            color: close-touch.has-hover ? #ffffff : #555555;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        close-touch := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.close-file(i); }
+                                        }
                                     }
                                 }
                             }

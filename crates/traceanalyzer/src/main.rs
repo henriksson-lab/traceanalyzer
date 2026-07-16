@@ -67,7 +67,7 @@ fn main() -> anyhow::Result<()> {
                 .add_filter("Electrophoresis", &["xad", "xml", "gz"])
                 .pick_file()
             {
-                reload(&ui, &st, &path);
+                open_added_file(&ui, &st, &path);
             }
         });
     }
@@ -81,15 +81,14 @@ fn main() -> anyhow::Result<()> {
         ui.window().on_winit_window_event(move |_win, ev| {
             if let WindowEvent::DroppedFile(path) = ev {
                 if let Some(ui) = ui_weak.upgrade() {
-                    reload(&ui, &st, path);
+                    open_added_file(&ui, &st, path);
                 }
             }
             EventResult::Propagate
         });
     }
 
-    // Selection (with ctrl/shift modifiers) -> update selection set, reset
-    // viewport to auto-fit, and re-render.
+    // Keyboard selection within the active file (well index + ctrl/shift).
     {
         let ui_weak = ui.as_weak();
         let st = state.clone();
@@ -98,12 +97,53 @@ fn main() -> anyhow::Result<()> {
             let table = {
                 let mut s = st.borrow_mut();
                 if s.select_click(idx as usize, ctrl, shift) {
-                    s.viewport = None; // auto-fit the new selection
+                    s.set_viewport(None); // auto-fit the new selection
                 }
                 build_table_refresh(&mut s)
             };
             table.apply(&ui);
             refresh_selection(&ui, &st.borrow());
+            show_selected(&ui, &st.borrow());
+        });
+    }
+
+    // Mouse click on a visible tree row (row index): activates its file and, for
+    // a well row, selects the well. A file switch refreshes the whole UI.
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_select_row(move |row, ctrl, shift| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let table = {
+                let mut s = st.borrow_mut();
+                s.select_row(row as usize, ctrl, shift);
+                refresh_all(&ui, &mut s)
+            };
+            table.apply(&ui);
+            show_selected(&ui, &st.borrow());
+        });
+    }
+
+    // Close the file owning a visible row (its [x] button). Prompts to save that
+    // file's unsaved edits first; Cancel keeps it open.
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_close_file(move |row| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let Some(file_idx) = st.borrow().row_file(row as usize) else {
+                return;
+            };
+            if confirm_close_file(&ui, &st, file_idx) {
+                st.borrow_mut().close_file(file_idx);
+            }
+            // Refresh regardless: the confirm step may have switched the active
+            // file, and a close changes the tree/overview/detail.
+            let table = {
+                let mut s = st.borrow_mut();
+                refresh_all(&ui, &mut s)
+            };
+            table.apply(&ui);
             show_selected(&ui, &st.borrow());
         });
     }
@@ -167,13 +207,13 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Expand/collapse the file node in the well tree.
+    // Expand/collapse a file node in the well tree (by visible row index).
     {
         let ui_weak = ui.as_weak();
         let st = state.clone();
-        ui.on_toggle_file_expand(move || {
+        ui.on_toggle_file_expand(move |row| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            st.borrow_mut().expanded ^= true;
+            st.borrow_mut().toggle_expand_row(row as usize);
             refresh_tree(&ui, &st.borrow());
         });
     }
@@ -191,7 +231,7 @@ fn main() -> anyhow::Result<()> {
                 let next = s.primary() + 1;
                 if next < s.entry_count() {
                     s.select_click(next, false, false);
-                    s.viewport = None; // auto-fit the newly focused well
+                    s.set_viewport(None); // auto-fit the newly focused well
                 }
                 build_table_refresh(&mut s)
             };
@@ -211,7 +251,7 @@ fn main() -> anyhow::Result<()> {
             {
                 let mut s = st.borrow_mut();
                 s.normalize = !s.normalize;
-                s.viewport = None; // y-range changes with normalization
+                s.set_viewport(None); // y-range changes with normalization
             }
             show_selected(&ui, &st.borrow());
         });
@@ -269,11 +309,11 @@ fn main() -> anyhow::Result<()> {
             let Some(ui) = ui_weak.upgrade() else { return };
             let idx = {
                 let s = st.borrow();
-                if s.raw_mode() {
+                if s.active_file().is_none() || s.raw_mode() {
                     None
                 } else if s.overview_gel {
                     let indices = overview_sample_indices(&s);
-                    let filtered = filtered_run(&s.run, &indices);
+                    let filtered = filtered_run(s.run(), &indices);
                     let (w, _) = gel::size(filtered.samples.len());
                     gel::lane_at(&filtered, fx as f64, w).and_then(|i| indices.get(i).copied())
                 } else {
@@ -287,7 +327,7 @@ fn main() -> anyhow::Result<()> {
                 let table = {
                     let mut s = st.borrow_mut();
                     s.select_click(idx, false, false);
-                    s.viewport = None;
+                    s.set_viewport(None);
                     build_table_refresh(&mut s)
                 };
                 table.apply(&ui);
@@ -362,13 +402,13 @@ fn main() -> anyhow::Result<()> {
         ui.on_plot_press(move |fx, _fy| {
             let mut s = st.borrow_mut();
             s.grabbed = None;
-            if !s.marker_edit || s.raw_mode() || s.selection.len() != 1 {
+            if !s.marker_edit || s.raw_mode() || s.selection().len() != 1 {
                 return;
             }
             let vp = current_viewport(&s);
             let idx = s.primary();
-            let ov = s.overrides.get(&idx).copied();
-            let (lo, up) = marker_times(&s.run, idx, ov.as_ref());
+            let ov = s.overrides().get(&idx).copied();
+            let (lo, up) = marker_times(s.run(), idx, ov.as_ref());
             let tol = 0.02_f64; // fractional grab tolerance
             let mut best: Option<(Marker, f64)> = None;
             for (m, t) in [(Marker::Lower, lo), (Marker::Upper, up)] {
@@ -415,7 +455,7 @@ fn main() -> anyhow::Result<()> {
             let table = {
                 let mut s = st.borrow_mut();
                 s.marker_edit ^= true;
-                s.viewport = None; // x-axis space changes
+                s.set_viewport(None); // x-axis space changes
                 s.grabbed = None;
                 s.highlight_x = None;
                 build_table_refresh(&mut s)
@@ -430,15 +470,18 @@ fn main() -> anyhow::Result<()> {
         let st = state.clone();
         ui.on_reset_markers(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
+            if st.borrow().active_file().is_none() {
+                return;
+            }
             let table = {
                 let mut s = st.borrow_mut();
                 let idx = s.primary();
-                let previous = s.overrides.remove(&idx);
+                let previous = s.overrides_mut().remove(&idx);
                 s.grabbed = None;
                 match commit_recalibration(&mut s) {
                     Ok(()) => {
                         s.error = None;
-                        s.viewport = None;
+                        s.set_viewport(None);
                     }
                     Err(e) => {
                         restore_override(&mut s, idx, previous);
@@ -461,7 +504,7 @@ fn main() -> anyhow::Result<()> {
         let st = state.clone();
         ui.on_reset_view(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            st.borrow_mut().viewport = None;
+            st.borrow_mut().set_viewport(None);
             show_selected(&ui, &st.borrow());
         });
     }
@@ -474,7 +517,7 @@ fn main() -> anyhow::Result<()> {
             {
                 let mut s = st.borrow_mut();
                 s.y_mode = YMode::from_index(idx as usize);
-                s.viewport = None; // y-range changes with the quantity
+                s.set_viewport(None); // y-range changes with the quantity
                 refresh_overview(&ui, &s);
             }
             show_selected(&ui, &st.borrow());
@@ -486,18 +529,15 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load a new file into the shared state and refresh the whole UI.
-fn reload(ui: &AppWindow, state: &SharedState, path: &std::path::Path) {
+/// Open a file as a new entry in the multi-file list, make it active, and
+/// refresh the whole UI. Existing open files are kept.
+fn open_added_file(ui: &AppWindow, state: &SharedState, path: &std::path::Path) {
     match loading::load(path) {
         Ok(loaded) => {
             let table = {
                 let mut s = state.borrow_mut();
-                *s = AppState::new(
-                    loaded.run,
-                    loaded.raw_channels,
-                    Some(path.to_path_buf()),
-                    loaded.warning,
-                );
+                s.add_file(loaded.run, loaded.raw_channels, Some(path.to_path_buf()));
+                s.error = loaded.warning;
                 refresh_all(ui, &mut s)
             };
             table.apply(ui);
@@ -527,13 +567,15 @@ fn refresh_all(ui: &AppWindow, st: &mut AppState) -> TableRefresh {
 fn refresh_tree(ui: &AppWindow, st: &AppState) {
     let t = st.tree_rows();
     let labels: Vec<SharedString> = t.labels.into_iter().map(SharedString::from).collect();
+    let file_path: Vec<SharedString> = t.file_path.into_iter().map(SharedString::from).collect();
     ui.set_tree_labels(ModelRc::from(Rc::new(VecModel::from(labels))));
     ui.set_tree_is_file(ModelRc::from(Rc::new(VecModel::from(t.is_file))));
+    ui.set_tree_file_index(ModelRc::from(Rc::new(VecModel::from(t.file_index))));
     ui.set_tree_well_index(ModelRc::from(Rc::new(VecModel::from(t.well_index))));
+    ui.set_tree_file_expanded(ModelRc::from(Rc::new(VecModel::from(t.file_expanded))));
+    ui.set_tree_file_path(ModelRc::from(Rc::new(VecModel::from(file_path))));
     ui.set_tree_selected(ModelRc::from(Rc::new(VecModel::from(t.selected))));
     ui.set_tree_primary_row(t.primary_row);
-    ui.set_tree_expanded(st.expanded);
-    ui.set_file_path(SharedString::from(st.file_path()));
     ui.set_entry_count(st.entry_count() as i32);
     ui.set_current_index(st.primary() as i32);
     ui.set_can_rename(st.can_rename());
@@ -546,10 +588,16 @@ fn refresh_overview(ui: &AppWindow, st: &AppState) {
     ui.set_overview_shared_y(st.overview_shared_y);
     ui.set_overview_gel(st.overview_gel);
     ui.set_overview_show_ladders(st.overview_show_ladders);
+    if st.active_file().is_none() {
+        ui.set_overview_image_width(plot::PLOT_W as i32);
+        ui.set_overview_image_height(plot::PLOT_H as i32);
+        ui.set_overview_image(blank_plot_image());
+        return;
+    }
     if st.raw_mode() {
         let w = plot::PLOT_W;
         let h = plot::PLOT_H;
-        let series: Vec<Series> = st.raw_channels.iter().map(plot::raw_series).collect();
+        let series: Vec<Series> = st.raw_channels().iter().map(plot::raw_series).collect();
         let refs: Vec<&Series> = series.iter().collect();
         let vp = plot::auto_viewport_multi(&refs);
         let buf = plot::render_overlay(&refs, &vp, None, &[], w, h);
@@ -558,7 +606,7 @@ fn refresh_overview(ui: &AppWindow, st: &AppState) {
         ui.set_overview_image(rgb_to_image(&buf, w, h));
     } else if st.overview_gel {
         let indices = overview_sample_indices(st);
-        let run = filtered_run(&st.run, &indices);
+        let run = filtered_run(st.run(), &indices);
         let (w, h) = gel::size(run.samples.len());
         let buf = gel::render(&run, w, h);
         ui.set_overview_image_width(w as i32);
@@ -566,7 +614,7 @@ fn refresh_overview(ui: &AppWindow, st: &AppState) {
         ui.set_overview_image(rgb_to_image(&buf, w, h));
     } else {
         let indices = overview_sample_indices(st);
-        let run = filtered_run(&st.run, &indices);
+        let run = filtered_run(st.run(), &indices);
         let layout = overview::layout(run.samples.len());
         let buf = overview::render(&run, st.y_mode, st.overview_shared_y, &layout);
         ui.set_overview_image_width(layout.w as i32);
@@ -577,7 +625,7 @@ fn refresh_overview(ui: &AppWindow, st: &AppState) {
 
 /// Sample indices shown in the Overview tab (optionally excluding ladder wells).
 fn overview_sample_indices(st: &AppState) -> Vec<usize> {
-    st.run
+    st.run()
         .samples
         .iter()
         .enumerate()
@@ -617,12 +665,13 @@ impl TableRefresh {
 /// Build the peak/region table for the focused sample.
 /// Also records each row's plot x-position (for cross-highlighting) into `st`.
 fn build_table_refresh(st: &mut AppState) -> TableRefresh {
-    if st.raw_mode() || st.run.samples.get(st.primary()).is_none() {
+    if st.active_file().is_none() || st.raw_mode() || st.run().samples.get(st.primary()).is_none()
+    {
         st.table_peak_x.clear();
         return TableRefresh::empty();
     }
     let x_axis = table_x_axis(st);
-    let rows = table::rows_with_axis(&st.run, &st.run.samples[st.primary()], x_axis);
+    let rows = table::rows_with_axis(st.run(), &st.run().samples[st.primary()], x_axis);
     st.table_peak_x = rows.iter().map(|r| r.peak_x).collect();
 
     let model_rows: Vec<ModelRc<StandardListViewItem>> = rows
@@ -652,15 +701,15 @@ fn refresh_selection(ui: &AppWindow, st: &AppState) {
 /// or several overlaid samples), applying normalization when requested.
 fn selected_series(st: &AppState) -> Vec<Series> {
     if st.raw_mode() {
-        return vec![plot::raw_series(&st.raw_channels[st.primary()])];
+        return vec![plot::raw_series(&st.raw_channels()[st.primary()])];
     }
-    let overlay = st.selection.len() > 1;
-    st.selection
+    let overlay = st.selection().len() > 1;
+    st.selection()
         .iter()
-        .filter_map(|&i| st.run.samples.get(i))
+        .filter_map(|&i| st.run().samples.get(i))
         .map(|s| {
             let x_axis = sample_x_axis(st, s, overlay);
-            let series = plot::series(&st.run, s, st.y_mode, x_axis);
+            let series = plot::series(st.run(), s, st.y_mode, x_axis);
             if overlay && st.normalize {
                 plot::normalized(&series)
             } else {
@@ -679,23 +728,28 @@ fn sample_x_axis(st: &AppState, s: &traceio::Sample, overlay: bool) -> XAxis {
 }
 
 fn table_x_axis(st: &AppState) -> XAxis {
-    let overlay = st.selection.len() > 1;
-    sample_x_axis(st, &st.run.samples[st.primary()], overlay)
+    let overlay = st.selection().len() > 1;
+    sample_x_axis(st, &st.run().samples[st.primary()], overlay)
 }
 
 /// Effective marker x-positions (raw times) to draw in marker-edit mode.
 fn marker_lines(st: &AppState) -> Vec<f64> {
-    if !st.marker_edit || st.raw_mode() || st.selection.len() != 1 {
+    if !st.marker_edit || st.raw_mode() || st.selection().len() != 1 {
         return Vec::new();
     }
     let idx = st.primary();
-    let ov = st.overrides.get(&idx);
-    let (lo, up) = traceio::calibration::marker_times(&st.run, idx, ov);
+    let ov = st.overrides().get(&idx);
+    let (lo, up) = traceio::calibration::marker_times(st.run(), idx, ov);
     lo.into_iter().chain(up).collect()
 }
 
 /// Render the current selection into the plot.
 fn show_selected(ui: &AppWindow, st: &AppState) {
+    if st.active_file().is_none() {
+        ui.set_plot_image(blank_plot_image());
+        ui.set_sample_info(SharedString::default());
+        return;
+    }
     if st.primary() >= st.entry_count() {
         return;
     }
@@ -703,9 +757,9 @@ fn show_selected(ui: &AppWindow, st: &AppState) {
 
     let series = selected_series(st);
     let refs: Vec<&Series> = series.iter().collect();
-    let vp = st.viewport.unwrap_or_else(|| auto_fit_viewport(st, &refs));
+    let vp = st.viewport().unwrap_or_else(|| auto_fit_viewport(st, &refs));
     // Highlight the selected peak only in the single-sample view.
-    let highlight = if st.selection.len() == 1 {
+    let highlight = if st.selection().len() == 1 {
         st.highlight_x
     } else {
         None
@@ -715,16 +769,16 @@ fn show_selected(ui: &AppWindow, st: &AppState) {
     ui.set_plot_image(rgb_to_image(&buf, plot::PLOT_W, plot::PLOT_H));
 
     let info = if st.raw_mode() {
-        render::raw_info_line(&st.raw_channels[st.primary()])
-    } else if st.selection.len() > 1 {
-        format!("{} samples overlaid", st.selection.len())
+        render::raw_info_line(&st.raw_channels()[st.primary()])
+    } else if st.selection().len() > 1 {
+        format!("{} samples overlaid", st.selection().len())
     } else {
-        render::info_line(&st.run, &st.run.samples[st.primary()])
+        render::info_line(st.run(), &st.run().samples[st.primary()])
     };
     ui.set_sample_info(SharedString::from(info));
     let y_options: Vec<SharedString> = YMode::ALL
         .iter()
-        .map(|m| SharedString::from(m.label(&st.run)))
+        .map(|m| SharedString::from(m.label(st.run())))
         .collect();
     ui.set_y_mode_options(ModelRc::from(Rc::new(VecModel::from(y_options))));
     ui.set_y_mode_index(st.y_mode.index() as i32);
@@ -747,7 +801,7 @@ fn about_text() -> String {
 /// file in place when possible, otherwise (no source, or a native `.xad` that
 /// can't be rewritten) prompt with Save As. Clears `dirty` on success.
 fn save_current(ui: &AppWindow, st: &SharedState) {
-    let dst = st.borrow().source_path.clone();
+    let dst = st.borrow().source_path();
     match dst {
         // A native .xad cannot be rewritten in place; offer Save As.
         Some(p) if p.extension().and_then(|e| e.to_str()) == Some("xad") => {
@@ -758,14 +812,11 @@ fn save_current(ui: &AppWindow, st: &SharedState) {
     }
 }
 
-/// When there are unsaved edits, ask Save / Don't Save / Cancel before exiting.
-/// Returns `true` if the app may close (edits saved or explicitly discarded),
-/// `false` to keep the window open (Cancel, dialog dismissed, or a failed/aborted
-/// save). No borrow of `st` is held across the blocking dialog.
-fn confirm_exit(ui: &AppWindow, st: &SharedState) -> bool {
-    if !st.borrow().dirty {
-        return true;
-    }
+/// Ask Save / Don't Save / Cancel for the ACTIVE file's unsaved edits. Returns
+/// `true` if it is OK to proceed (edits saved or explicitly discarded), `false`
+/// to abort (Cancel, dismissed, or a failed/aborted save). Assumes the caller
+/// has made the file in question active. No borrow held across the dialog.
+fn prompt_unsaved_active(ui: &AppWindow, st: &SharedState) -> bool {
     let description = {
         let s = st.borrow();
         let name = file_base_name(&s.file_path());
@@ -783,14 +834,51 @@ fn confirm_exit(ui: &AppWindow, st: &SharedState) -> bool {
         .show();
     match choice {
         rfd::MessageDialogResult::Yes => {
-            // Attempt the save; only allow exit if it actually cleared `dirty`
+            // Attempt the save; only proceed if it actually cleared `dirty`
             // (a failed write or a cancelled Save-As dialog leaves it set).
             save_current(ui, st);
-            !st.borrow().dirty
+            !st.borrow().is_dirty()
         }
-        rfd::MessageDialogResult::No => true, // discard edits and exit
-        _ => false,                           // Cancel / dismissed: stay open
+        rfd::MessageDialogResult::No => true, // discard edits
+        _ => false,                           // Cancel / dismissed
     }
+}
+
+/// Before closing one file, prompt to save its unsaved edits. Makes that file
+/// active (so Save / Save-As target it) and returns whether it may be closed.
+fn confirm_close_file(ui: &AppWindow, st: &SharedState, file_idx: usize) -> bool {
+    {
+        let mut s = st.borrow_mut();
+        if file_idx < s.files.len() {
+            s.active = Some(file_idx);
+        }
+    }
+    if !st.borrow().is_dirty() {
+        return true;
+    }
+    prompt_unsaved_active(ui, st)
+}
+
+/// On exit, prompt per dirty file (Save / Don't Save / Cancel). Any Cancel or a
+/// failed save aborts the whole quit and keeps the window open.
+fn confirm_exit(ui: &AppWindow, st: &SharedState) -> bool {
+    let dirty: Vec<usize> = {
+        let s = st.borrow();
+        (0..s.files.len()).filter(|&i| s.files[i].dirty).collect()
+    };
+    for idx in dirty {
+        {
+            let mut s = st.borrow_mut();
+            if idx >= s.files.len() || !s.files[idx].dirty {
+                continue; // already saved, or vanished
+            }
+            s.active = Some(idx); // target this file for the prompt/save
+        }
+        if !prompt_unsaved_active(ui, st) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Last path component of an instrument file path (Windows `\` or Unix `/`).
@@ -801,7 +889,7 @@ fn file_base_name(path: &str) -> String {
 fn save_as_dialog(ui: &AppWindow, st: &SharedState) {
     let start_name = st
         .borrow()
-        .source_path
+        .source_path()
         .as_ref()
         .and_then(|p| p.file_stem())
         .and_then(|n| n.to_str())
@@ -823,8 +911,8 @@ fn save_as_dialog(ui: &AppWindow, st: &SharedState) {
 fn do_save(ui: &AppWindow, st: &SharedState, dst: std::path::PathBuf) {
     let result = {
         let s = st.borrow();
-        match s.source_path.clone() {
-            Some(src) => traceio::save::save_run(&s.run, &src, &dst),
+        match s.source_path() {
+            Some(src) => traceio::save::save_run(s.run(), &src, &dst),
             None => Err(anyhow::anyhow!("no source file to save from")),
         }
     };
@@ -832,8 +920,8 @@ fn do_save(ui: &AppWindow, st: &SharedState, dst: std::path::PathBuf) {
         Ok(()) => {
             {
                 let mut s = st.borrow_mut();
-                s.dirty = false;
-                s.source_path = Some(dst);
+                s.set_dirty(false);
+                s.set_source_path(Some(dst));
             }
             let s = st.borrow();
             ui.set_can_save(s.can_save());
@@ -849,9 +937,21 @@ fn rgb_to_image(buf: &[u8], w: u32, h: u32) -> Image {
     Image::from_rgb8(pixbuf)
 }
 
+/// A plot-sized image with just empty axes, shown when no file is open.
+fn blank_plot_image() -> Image {
+    let refs: Vec<&Series> = Vec::new();
+    let vp = plot::auto_viewport_multi(&refs);
+    let buf = plot::render_overlay(&refs, &vp, None, &[], plot::PLOT_W, plot::PLOT_H);
+    rgb_to_image(&buf, plot::PLOT_W, plot::PLOT_H)
+}
+
 /// Ensure a concrete viewport exists (materializing the auto-fit), returning it.
 fn current_viewport(st: &AppState) -> Viewport {
-    if let Some(vp) = st.viewport {
+    if st.active_file().is_none() {
+        let refs: Vec<&Series> = Vec::new();
+        return plot::auto_viewport_multi(&refs);
+    }
+    if let Some(vp) = st.viewport() {
         return vp;
     }
     let series = selected_series(st);
@@ -897,12 +997,12 @@ fn zoom(state: &SharedState, fx: f64, fy: f64, factor: f64) {
     let nx1 = ax + (vp.x_max - ax) * factor;
     let ny0 = ay - (ay - vp.y_min) * factor;
     let ny1 = ay + (vp.y_max - ay) * factor;
-    st.viewport = Some(Viewport {
+    st.set_viewport(Some(Viewport {
         x_min: nx0,
         x_max: nx1,
         y_min: ny0,
         y_max: ny1,
-    });
+    }));
 }
 
 fn pan(state: &SharedState, dfx: f64, dfy: f64) {
@@ -914,12 +1014,12 @@ fn pan(state: &SharedState, dfx: f64, dfy: f64) {
     // Fractional drag across the plot area translates to a data shift.
     let dx = -dfx * (vp.x_max - vp.x_min);
     let dy = dfy * (vp.y_max - vp.y_min); // screen-down is data-up
-    st.viewport = Some(Viewport {
+    st.set_viewport(Some(Viewport {
         x_min: vp.x_min + dx,
         x_max: vp.x_max + dx,
         y_min: vp.y_min + dy,
         y_max: vp.y_max + dy,
-    });
+    }));
 }
 
 /// Move a grabbed marker by a fractional-x drag delta, keeping marker overrides,
@@ -927,14 +1027,17 @@ fn pan(state: &SharedState, dfx: f64, dfy: f64) {
 fn drag_marker(ui: &AppWindow, state: &SharedState, drag: MarkerDrag, dfx: f64) {
     let table = {
         let mut st = state.borrow_mut();
+        if st.active_file().is_none() {
+            return;
+        }
         let idx = drag.sample_idx;
-        if idx >= st.run.samples.len() || st.raw_mode() {
+        if idx >= st.run().samples.len() || st.raw_mode() {
             return;
         }
         let vp = current_viewport(&st);
         let span = vp.x_max - vp.x_min;
-        let ov = st.overrides.get(&idx).copied();
-        let (lo, up) = marker_times(&st.run, idx, ov.as_ref());
+        let ov = st.overrides().get(&idx).copied();
+        let (lo, up) = marker_times(st.run(), idx, ov.as_ref());
         let cur = match drag.marker {
             Marker::Lower => lo,
             Marker::Upper => up,
@@ -945,12 +1048,12 @@ fn drag_marker(ui: &AppWindow, state: &SharedState, drag: MarkerDrag, dfx: f64) 
             return;
         };
 
-        let entry = st.overrides.entry(idx).or_default();
+        let entry = st.overrides_mut().entry(idx).or_default();
         match drag.marker {
             Marker::Lower => entry.lower_time = Some(new_time),
             Marker::Upper => entry.upper_time = Some(new_time),
         }
-        match validate_marker_state(&st, idx, st.overrides.get(&idx).copied())
+        match validate_marker_state(&st, idx, st.overrides().get(&idx).copied())
             .and_then(|()| commit_recalibration(&mut st))
         {
             Ok(()) => {
@@ -977,7 +1080,7 @@ fn drag_marker(ui: &AppWindow, state: &SharedState, drag: MarkerDrag, dfx: f64) 
 fn release_marker_drag(st: &mut AppState) -> Option<()> {
     let drag = st.grabbed.take()?;
     let idx = drag.sample_idx;
-    let current = st.overrides.get(&idx).copied();
+    let current = st.overrides().get(&idx).copied();
     match validate_marker_state(st, idx, current).and_then(|()| commit_recalibration(st)) {
         Ok(()) => {
             st.error = None;
@@ -993,19 +1096,19 @@ fn release_marker_drag(st: &mut AppState) -> Option<()> {
 }
 
 fn commit_recalibration(st: &mut AppState) -> anyhow::Result<()> {
-    let mut run = st.run.clone();
-    let ov = st.overrides.clone();
+    let mut run = st.run().clone();
+    let ov = st.overrides().clone();
     loading::recalibrate_with(&mut run, &ov)?;
-    st.run = run;
+    st.set_run(run);
     st.highlight_x = None;
     Ok(())
 }
 
 fn restore_override(st: &mut AppState, idx: usize, previous: Option<MarkerOverride>) {
     if let Some(previous) = previous.filter(|ov| !ov.is_empty()) {
-        st.overrides.insert(idx, previous);
+        st.overrides_mut().insert(idx, previous);
     } else {
-        st.overrides.remove(&idx);
+        st.overrides_mut().remove(&idx);
     }
 }
 
@@ -1026,7 +1129,7 @@ fn validate_marker_state(
     idx: usize,
     ov: Option<MarkerOverride>,
 ) -> anyhow::Result<()> {
-    let (lo, up) = marker_times(&st.run, idx, ov.as_ref());
+    let (lo, up) = marker_times(st.run(), idx, ov.as_ref());
     for (name, time) in [("lower", lo), ("upper", up)] {
         if let Some(time) = time {
             if !time.is_finite() {
@@ -1040,7 +1143,7 @@ fn validate_marker_state(
         }
     }
 
-    let Some(sample) = st.run.samples.get(idx) else {
+    let Some(sample) = st.run().samples.get(idx) else {
         anyhow::bail!("sample {idx} is no longer available");
     };
     let mut times = sample.time.iter().copied().filter(|t| t.is_finite());
@@ -1066,7 +1169,7 @@ fn valid_marker_time(st: &AppState, idx: usize, marker: Marker, requested: f64) 
     if !requested.is_finite() {
         return None;
     }
-    let sample = st.run.samples.get(idx)?;
+    let sample = st.run().samples.get(idx)?;
     let mut times = sample.time.iter().copied().filter(|t| t.is_finite());
     let first = times.next()?;
     let (mut min_t, mut max_t) = (first, first);
@@ -1078,8 +1181,8 @@ fn valid_marker_time(st: &AppState, idx: usize, marker: Marker, requested: f64) 
         return None;
     }
 
-    let ov = st.overrides.get(&idx).copied();
-    let (lo, up) = marker_times(&st.run, idx, ov.as_ref());
+    let ov = st.overrides().get(&idx).copied();
+    let (lo, up) = marker_times(st.run(), idx, ov.as_ref());
     let gap = ((max_t - min_t) * 1e-6).max(f64::EPSILON);
     let mut t = requested.clamp(min_t, max_t);
     match marker {

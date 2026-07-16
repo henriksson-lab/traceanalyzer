@@ -29,26 +29,46 @@ fn main() -> anyhow::Result<()> {
     // and prevent any backend from starting. The winit file-drop hook below is
     // active when Slint's selected backend is winit.
 
-    let path = match std::env::args().nth(1) {
-        Some(p) => PathBuf::from(p),
-        None => {
-            let demo = PathBuf::from(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/demo_dna1000.xml.gz"
-            ));
-            if !demo.exists() {
-                anyhow::bail!("no file given and demo fixture not found");
-            }
-            demo
+    // Every command-line argument is a file to open (`traceanalyzer a.xad b.xml
+    // c.xml.gz`). With no arguments, fall back to the bundled DNA 1000 demo.
+    let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
+    let paths: Vec<PathBuf> = if args.is_empty() {
+        let demo = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/demo_dna1000.xml.gz"
+        ));
+        if demo.exists() {
+            vec![demo]
+        } else {
+            Vec::new()
         }
+    } else {
+        args
     };
-    let loaded = loading::load(&path)?;
-    let state: SharedState = Rc::new(RefCell::new(AppState::new(
-        loaded.run,
-        loaded.raw_channels,
-        Some(path.clone()),
-        loaded.warning,
-    )));
+
+    // Load each file; a failure to open one is a non-fatal warning (shown in the
+    // UI) rather than aborting — the other files still open.
+    let mut app = AppState::empty();
+    let mut warnings: Vec<String> = Vec::new();
+    for path in &paths {
+        match loading::load(path) {
+            Ok(loaded) => {
+                app.add_file(loaded.run, loaded.raw_channels, Some(path.clone()));
+                if let Some(w) = loaded.warning {
+                    warnings.push(w);
+                }
+            }
+            Err(e) => warnings.push(format!("Could not open {}: {e:#}", path.display())),
+        }
+    }
+    // `add_file` leaves the last-added file active; show the first one instead.
+    if !app.files.is_empty() {
+        app.active = Some(0);
+    }
+    if !warnings.is_empty() {
+        app.error = Some(warnings.join("\n"));
+    }
+    let state: SharedState = Rc::new(RefCell::new(app));
 
     let ui = AppWindow::new()?;
     let table = {
@@ -307,27 +327,26 @@ fn main() -> anyhow::Result<()> {
         let st = state.clone();
         ui.on_overview_click(move |fx, fy| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let idx = {
+            let hit = {
                 let s = st.borrow();
                 if s.active_file().is_none() || s.raw_mode() {
                     None
-                } else if s.overview_gel {
-                    let indices = overview_sample_indices(&s);
-                    let filtered = filtered_run(s.run(), &indices);
-                    let (w, _) = gel::size(filtered.samples.len());
-                    gel::lane_at(&filtered, fx as f64, w).and_then(|i| indices.get(i).copied())
                 } else {
-                    let indices = overview_sample_indices(&s);
-                    let layout = overview::layout(indices.len());
-                    overview::cell_at(&layout, fx as f64, fy as f64)
-                        .and_then(|i| indices.get(i).copied())
+                    let (run, origin) = overview_combined(&s);
+                    let idx = if s.overview_gel {
+                        let (w, _) = gel::size(run.samples.len());
+                        gel::lane_at(&run, fx as f64, w)
+                    } else {
+                        let layout = overview::layout(run.samples.len());
+                        overview::cell_at(&layout, fx as f64, fy as f64)
+                    };
+                    idx.and_then(|i| origin.get(i).copied())
                 }
             };
-            if let Some(idx) = idx {
+            if let Some((file_idx, well_idx)) = hit {
                 let table = {
                     let mut s = st.borrow_mut();
-                    s.select_click(idx, false, false);
-                    s.set_viewport(None);
+                    s.activate_and_select(file_idx, well_idx);
                     build_table_refresh(&mut s)
                 };
                 table.apply(&ui);
@@ -571,7 +590,6 @@ fn refresh_tree(ui: &AppWindow, st: &AppState) {
     ui.set_tree_labels(ModelRc::from(Rc::new(VecModel::from(labels))));
     ui.set_tree_is_file(ModelRc::from(Rc::new(VecModel::from(t.is_file))));
     ui.set_tree_file_index(ModelRc::from(Rc::new(VecModel::from(t.file_index))));
-    ui.set_tree_well_index(ModelRc::from(Rc::new(VecModel::from(t.well_index))));
     ui.set_tree_file_expanded(ModelRc::from(Rc::new(VecModel::from(t.file_expanded))));
     ui.set_tree_file_path(ModelRc::from(Rc::new(VecModel::from(file_path))));
     ui.set_tree_selected(ModelRc::from(Rc::new(VecModel::from(t.selected))));
@@ -605,16 +623,14 @@ fn refresh_overview(ui: &AppWindow, st: &AppState) {
         ui.set_overview_image_height(h as i32);
         ui.set_overview_image(rgb_to_image(&buf, w, h));
     } else if st.overview_gel {
-        let indices = overview_sample_indices(st);
-        let run = filtered_run(st.run(), &indices);
+        let (run, _) = overview_combined(st);
         let (w, h) = gel::size(run.samples.len());
         let buf = gel::render(&run, w, h);
         ui.set_overview_image_width(w as i32);
         ui.set_overview_image_height(h as i32);
         ui.set_overview_image(rgb_to_image(&buf, w, h));
     } else {
-        let indices = overview_sample_indices(st);
-        let run = filtered_run(st.run(), &indices);
+        let (run, _) = overview_combined(st);
         let layout = overview::layout(run.samples.len());
         let buf = overview::render(&run, st.y_mode, st.overview_shared_y, &layout);
         ui.set_overview_image_width(layout.w as i32);
@@ -623,24 +639,38 @@ fn refresh_overview(ui: &AppWindow, st: &AppState) {
     }
 }
 
-/// Sample indices shown in the Overview tab (optionally excluding ladder wells).
-fn overview_sample_indices(st: &AppState) -> Vec<usize> {
-    st.run()
-        .samples
-        .iter()
-        .enumerate()
-        .filter_map(|(i, sample)| (st.overview_show_ladders || !sample.is_ladder).then_some(i))
-        .collect()
-}
-
-/// Clone a run keeping only the given sample indices, for filtered overview rendering.
-fn filtered_run(run: &Electrophoresis, indices: &[usize]) -> Electrophoresis {
-    let mut out = run.clone();
-    out.samples = indices
-        .iter()
-        .filter_map(|&i| run.samples.get(i).cloned())
-        .collect();
-    out
+/// Every open file's overview samples flattened into one run for the grid/gel,
+/// with a parallel map from each combined sample index to its `(file, well)`
+/// origin. Ladder wells are dropped unless the "show ladders" toggle is on; when
+/// more than one file is open each sample title is prefixed with its file name so
+/// cells stay distinguishable.
+fn overview_combined(st: &AppState) -> (Electrophoresis, Vec<(usize, usize)>) {
+    let multi = st.files.len() > 1;
+    // Use the active file's run as the template (assay units, ladder), then swap
+    // in the flattened sample set.
+    let mut combined = st.run().clone();
+    combined.samples = Vec::new();
+    let mut origin: Vec<(usize, usize)> = Vec::new();
+    for (fi, f) in st.files.iter().enumerate() {
+        let tag = file_base_name(&f.run.assay.file_name);
+        for (wi, sample) in f.run.samples.iter().enumerate() {
+            if !st.overview_show_ladders && sample.is_ladder {
+                continue;
+            }
+            let mut sample = sample.clone();
+            if multi && !tag.is_empty() {
+                let base = if sample.name.is_empty() {
+                    format!("Well {}", sample.well_number)
+                } else {
+                    sample.name.clone()
+                };
+                sample.name = format!("{tag} · {base}");
+            }
+            combined.samples.push(sample);
+            origin.push((fi, wi));
+        }
+    }
+    (combined, origin)
 }
 
 struct TableRefresh {

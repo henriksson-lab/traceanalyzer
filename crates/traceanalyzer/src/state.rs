@@ -24,8 +24,6 @@ pub struct TreeRows {
     pub is_file: Vec<bool>,
     /// Index of the file each row belongs to.
     pub file_index: Vec<i32>,
-    /// Well index within the row's file; `-1` for file rows.
-    pub well_index: Vec<i32>,
     /// Per-row: the owning file's expanded state (meaningful on file rows).
     pub file_expanded: Vec<bool>,
     /// Per-row: full file path (file rows only; empty on well rows) for tooltips.
@@ -200,17 +198,16 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(
-        run: Electrophoresis,
-        raw_channels: Vec<RawChannel>,
-        source_path: Option<PathBuf>,
-        error: Option<String>,
-    ) -> Self {
+    /// An empty state with no files loaded (the "No file loaded" screen). Files
+    /// are added with [`AppState::add_file`].
+    pub fn empty() -> Self {
         AppState {
-            files: vec![OpenFile::new(run, raw_channels, source_path)],
-            active: Some(0),
+            files: Vec::new(),
+            active: None,
             normalize: false,
-            overview_shared_y: true,
+            // Per-plot y-scale by default: each overview cell auto-fits, so files
+            // with very different signal magnitudes stay readable side by side.
+            overview_shared_y: false,
             overview_gel: false,
             overview_show_ladders: false,
             y_mode: YMode::Fluorescence,
@@ -218,8 +215,21 @@ impl AppState {
             highlight_x: None,
             table_peak_x: Vec::new(),
             grabbed: None,
-            error,
+            error: None,
         }
+    }
+
+    pub fn new(
+        run: Electrophoresis,
+        raw_channels: Vec<RawChannel>,
+        source_path: Option<PathBuf>,
+        error: Option<String>,
+    ) -> Self {
+        let mut s = Self::empty();
+        s.files.push(OpenFile::new(run, raw_channels, source_path));
+        s.active = Some(0);
+        s.error = error;
+        s
     }
 
     // ---- active file access ------------------------------------------------
@@ -355,7 +365,6 @@ impl AppState {
             labels: Vec::new(),
             is_file: Vec::new(),
             file_index: Vec::new(),
-            well_index: Vec::new(),
             file_expanded: Vec::new(),
             file_path: Vec::new(),
             selected: Vec::new(),
@@ -365,7 +374,6 @@ impl AppState {
             t.labels.push(f.node_label());
             t.is_file.push(true);
             t.file_index.push(fi as i32);
-            t.well_index.push(-1);
             t.file_expanded.push(f.expanded);
             t.file_path.push(f.run.assay.file_name.clone());
             t.selected.push(false);
@@ -377,7 +385,6 @@ impl AppState {
                 t.labels.push(label);
                 t.is_file.push(false);
                 t.file_index.push(fi as i32);
-                t.well_index.push(w as i32);
                 t.file_expanded.push(false);
                 t.file_path.push(String::new());
                 t.selected.push(is_active && f.selection.contains(&w));
@@ -421,6 +428,22 @@ impl AppState {
                 switched || changed
             }
             None => switched,
+        }
+    }
+
+    /// Make `file_idx` active and plain-select well `well_idx` in it. Used by an
+    /// Overview click, which can land in any open file (not just the active one).
+    pub fn activate_and_select(&mut self, file_idx: usize, well_idx: usize) {
+        if file_idx >= self.files.len() {
+            return;
+        }
+        if self.active != Some(file_idx) {
+            self.active = Some(file_idx);
+            self.reset_transient();
+        }
+        self.select_click(well_idx, false, false);
+        if let Some(f) = self.active_file_mut() {
+            f.viewport = None;
         }
     }
 

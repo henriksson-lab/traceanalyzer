@@ -53,7 +53,16 @@ fn main() -> anyhow::Result<()> {
     for path in &paths {
         match loading::load(path) {
             Ok(loaded) => {
-                app.add_file(loaded.run, loaded.raw_channels, Some(path.clone()));
+                let source = if traceio::fa::is_fa_path(path) {
+                    traceio::fa::run_identity(path)
+                } else {
+                    path.clone()
+                };
+                if let Some(idx) = app.find_file_by_source(&source) {
+                    app.active = Some(idx);
+                    continue;
+                }
+                app.add_file(loaded.run, loaded.raw_channels, Some(source));
                 if let Some(w) = loaded.warning {
                     warnings.push(w);
                 }
@@ -84,7 +93,7 @@ fn main() -> anyhow::Result<()> {
         ui.on_open_file(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Electrophoresis", &["xad", "xml", "gz", "zip"])
+                .add_filter("Electrophoresis", &["xad", "xml", "gz", "zip", "raw"])
                 .pick_file()
             {
                 open_added_file(&ui, &st, &path);

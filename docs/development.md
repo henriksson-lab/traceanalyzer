@@ -16,6 +16,9 @@ cargo run -p traceio --example inspect -- testdata/demo_rna_nano.xml.gz
 
 # GUI viewer (needs a display):
 cargo run -p traceanalyzer -- testdata/demo_dna1000.xml.gz
+
+# macOS app bundle:
+make osx-app
 ```
 
 The `inspect`/GUI loaders accept `.xad` (native), `.xml`, and `.xml.gz`.

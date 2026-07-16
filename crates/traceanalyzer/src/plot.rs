@@ -44,12 +44,29 @@ pub enum YMode {
 }
 
 impl YMode {
+    /// All modes in dropdown order; index into this matches [`YMode::index`].
+    pub const ALL: [YMode; 3] = [YMode::Fluorescence, YMode::Concentration, YMode::Molarity];
+
     pub fn next(self) -> YMode {
         match self {
             YMode::Fluorescence => YMode::Concentration,
             YMode::Concentration => YMode::Molarity,
             YMode::Molarity => YMode::Fluorescence,
         }
+    }
+
+    /// Position of this mode in [`YMode::ALL`].
+    pub fn index(self) -> usize {
+        match self {
+            YMode::Fluorescence => 0,
+            YMode::Concentration => 1,
+            YMode::Molarity => 2,
+        }
+    }
+
+    /// Mode for a dropdown index; out-of-range falls back to fluorescence.
+    pub fn from_index(i: usize) -> YMode {
+        YMode::ALL.get(i).copied().unwrap_or(YMode::Fluorescence)
     }
     pub fn label(self, run: &Electrophoresis) -> String {
         match self {
@@ -347,8 +364,22 @@ pub fn auto_viewport(series: &Series) -> Viewport {
 
 /// Auto-fit viewport covering the union of several series' extents.
 pub fn auto_viewport_multi(series: &[&Series]) -> Viewport {
+    viewport_impl(series, false)
+}
+
+/// Like [`auto_viewport_multi`], but the upper y-bound ignores an extreme narrow
+/// spike so it doesn't squash the rest of the trace. Use for derived quantities
+/// (concentration, molarity) where a tiny-size point can blow up numerically:
+/// e.g. molarity = concentration / molecular_weight explodes as length → 0.
+/// Broad real peaks (max within ~4× the 98th percentile) are never clipped.
+pub fn auto_viewport_multi_robust(series: &[&Series]) -> Viewport {
+    viewport_impl(series, true)
+}
+
+fn viewport_impl(series: &[&Series], robust: bool) -> Viewport {
     let (mut x_min, mut x_max) = (f64::INFINITY, f64::NEG_INFINITY);
     let (mut y_min, mut y_max) = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut ys: Vec<f64> = Vec::new();
     for s in series {
         for &x in &s.xs {
             x_min = x_min.min(x);
@@ -357,6 +388,9 @@ pub fn auto_viewport_multi(series: &[&Series]) -> Viewport {
         for &y in &s.ys {
             y_min = y_min.min(y);
             y_max = y_max.max(y);
+            if robust && y.is_finite() {
+                ys.push(y);
+            }
         }
     }
     if !x_min.is_finite() {
@@ -367,6 +401,9 @@ pub fn auto_viewport_multi(series: &[&Series]) -> Viewport {
         y_min = 0.0;
         y_max = 1.0;
     }
+    if robust {
+        y_max = robust_y_max(&mut ys, y_max);
+    }
     let pad = ((y_max - y_min) * 0.05).max(f64::EPSILON);
     Viewport {
         x_min,
@@ -374,6 +411,30 @@ pub fn auto_viewport_multi(series: &[&Series]) -> Viewport {
         y_min: y_min - pad,
         y_max: y_max + pad,
     }
+}
+
+/// Upper y-bound that discards an extreme narrow spike. A spike is detected when
+/// the maximum exceeds `SPIKE_FACTOR` × the 98th percentile (broad peaks sit well
+/// under that); the bound then becomes the largest value below the spike, so the
+/// spike runs off the top of the plot while the rest of the trace fills it.
+fn robust_y_max(ys: &mut [f64], plain_max: f64) -> f64 {
+    const SPIKE_FACTOR: f64 = 4.0;
+    // Too few points to characterize a distribution — keep the true max.
+    if ys.len() < 20 {
+        return plain_max;
+    }
+    ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p98 = ys[((ys.len() - 1) as f64 * 0.98).round() as usize];
+    if p98 <= 0.0 || plain_max <= SPIKE_FACTOR * p98 {
+        return plain_max; // no dominating spike
+    }
+    let threshold = SPIKE_FACTOR * p98;
+    // Largest value at or below the spike threshold (ys is sorted ascending).
+    ys.iter()
+        .rev()
+        .copied()
+        .find(|&y| y <= threshold)
+        .unwrap_or(plain_max)
 }
 
 /// Render one series into an RGB buffer (`w*h*3` bytes).
@@ -537,4 +598,61 @@ pub fn data_x_to_frac(data_x: f64, vp: &Viewport) -> f64 {
         0.0
     };
     left + tx * (right - left)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn series_with_ys(ys: Vec<f64>) -> Series {
+        let xs: Vec<f64> = (0..ys.len()).map(|i| i as f64).collect();
+        Series {
+            name: String::new(),
+            xs,
+            ys,
+            peaks_x: Vec::new(),
+            x_label: String::new(),
+            y_label: String::new(),
+        }
+    }
+
+    #[test]
+    fn robust_viewport_clips_a_narrow_spike() {
+        // 200 points near ~1.0, plus one huge spike: the marker-molarity case.
+        let mut ys = vec![1.0; 200];
+        ys[0] = 500.0;
+        let s = series_with_ys(ys);
+        let robust = auto_viewport_multi_robust(&[&s]);
+        let plain = auto_viewport_multi(&[&s]);
+        assert!(plain.y_max > 400.0, "plain keeps the spike: {}", plain.y_max);
+        assert!(
+            robust.y_max < 10.0,
+            "robust drops the spike so the bulk fills the plot: {}",
+            robust.y_max
+        );
+    }
+
+    #[test]
+    fn robust_viewport_preserves_a_broad_peak() {
+        // A broad peak (many points near the top) is real signal, not a spike:
+        // robust scaling must not clip it. Baseline 0, a wide plateau at 100.
+        let mut ys = vec![0.0; 200];
+        for y in ys.iter_mut().take(80) {
+            *y = 100.0;
+        }
+        let s = series_with_ys(ys);
+        let robust = auto_viewport_multi_robust(&[&s]);
+        assert!(
+            robust.y_max >= 100.0,
+            "broad peak kept: {}",
+            robust.y_max
+        );
+    }
+
+    #[test]
+    fn robust_viewport_noop_with_few_points() {
+        let s = series_with_ys(vec![1.0, 2.0, 50.0]);
+        let robust = auto_viewport_multi_robust(&[&s]);
+        assert!(robust.y_max > 49.0, "too few points to judge: keep max");
+    }
 }

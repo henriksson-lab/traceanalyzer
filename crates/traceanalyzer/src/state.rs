@@ -22,6 +22,16 @@ pub struct TreeRows {
     pub primary_row: i32,
 }
 
+/// Last path component of an instrument file path. The path may use Windows
+/// (`\`) or Unix (`/`) separators, so split on both; falls back to the whole
+/// string when there is no separator.
+fn file_base_name(path: &str) -> String {
+    path.rsplit(|c| c == '\\' || c == '/')
+        .next()
+        .unwrap_or(path)
+        .to_string()
+}
+
 /// Which marker line is being dragged in marker-edit mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Marker {
@@ -54,6 +64,8 @@ pub struct AppState {
     pub overview_shared_y: bool,
     /// Overview tab: show the virtual gel instead of the small-multiples grid.
     pub overview_gel: bool,
+    /// Overview tab: include ladder wells in the all-sample overview.
+    pub overview_show_ladders: bool,
     pub y_mode: YMode,
     /// Zoom/pan window; `None` means auto-fit the current entry.
     pub viewport: Option<Viewport>,
@@ -94,6 +106,7 @@ impl AppState {
             normalize: false,
             overview_shared_y: true,
             overview_gel: false,
+            overview_show_ladders: false,
             y_mode: YMode::Fluorescence,
             viewport: None,
             highlight_x: None,
@@ -109,12 +122,22 @@ impl AppState {
     }
 
     /// Visible rows of the well tree (see [`TreeRows`]).
+    /// Full path of the loaded file as reported by the instrument (may be an
+    /// absolute Windows path); empty if none. Shown as the tree file-node tooltip.
+    pub fn file_path(&self) -> String {
+        self.run.assay.file_name.clone()
+    }
+
     pub fn tree_rows(&self) -> TreeRows {
-        let file_label = if self.run.assay.file_name.is_empty() {
+        let mut file_label = if self.run.assay.file_name.is_empty() {
             "run".to_string()
         } else {
-            self.run.assay.file_name.clone()
+            file_base_name(&self.run.assay.file_name)
         };
+        // Flag unsaved edits on the file node only (not the wells below it).
+        if self.dirty {
+            file_label.push_str(" (mod)");
+        }
         let mut t = TreeRows {
             labels: vec![file_label],
             is_file: vec![true],
@@ -296,5 +319,34 @@ impl AppState {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use traceio::AssayInfo;
+
+    fn state_with_file(name: &str) -> AppState {
+        let run = Electrophoresis {
+            assay: AssayInfo {
+                file_name: name.to_string(),
+                ..Default::default()
+            },
+            ladder_peaks: Vec::new(),
+            regions: Vec::new(),
+            samples: Vec::new(),
+        };
+        AppState::new(run, Vec::new(), None, None)
+    }
+
+    #[test]
+    fn tree_file_label_shows_basename_and_mod_marker_when_dirty() {
+        let mut st = state_with_file(r"C:\Program Files\demo\Demo DNA 1000.xad");
+        // Clean: basename only, no marker.
+        assert_eq!(st.tree_rows().labels[0], "Demo DNA 1000.xad");
+        // Dirty: same basename plus the " (mod)" marker.
+        st.dirty = true;
+        assert_eq!(st.tree_rows().labels[0], "Demo DNA 1000.xad (mod)");
     }
 }

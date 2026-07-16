@@ -22,6 +22,9 @@ const UPPER_MARKER_NAMES: [&str; 2] = ["Upper Marker", "edited Upper Marker"];
 /// dsDNA = length·607.4 + 157.9, ssRNA = length·320.5 + 159.0. Unknown assay
 /// types yield NaN.
 pub fn molecular_weight(length: f64, assay_type: &str) -> f64 {
+    if !length.is_finite() || length <= 0.0 {
+        return f64::NAN;
+    }
     match assay_type {
         "DNA" => length * 607.4 + 157.9,
         "RNA" => length * 320.5 + 159.0,
@@ -116,7 +119,14 @@ pub fn calculate_molarity(run: &mut Electrophoresis) -> Result<()> {
             .concentration
             .iter()
             .zip(s.length.iter())
-            .map(|(&c, &l)| c / molecular_weight(l, &assay_type) * 1e6)
+            .map(|(&c, &l)| {
+                let mw = molecular_weight(l, &assay_type);
+                if c.is_finite() && mw.is_finite() && mw > 0.0 {
+                    c / mw * 1e6
+                } else {
+                    f64::NAN
+                }
+            })
             .collect();
     }
     Ok(())
@@ -139,7 +149,10 @@ fn per_point_area(s: &Sample) -> Vec<f64> {
         let f = s.fluorescence[i] as f64;
         let f_prev = s.fluorescence[i - 1] as f64;
         let dx = s.aligned_time[i] - s.aligned_time[i - 1];
-        *slot = (f + f_prev) * dx / s.aligned_time[i];
+        let at = s.aligned_time[i];
+        if at.is_finite() && at > 0.0 && dx.is_finite() {
+            *slot = (f + f_prev) * dx / at;
+        }
     }
     area
 }
@@ -212,6 +225,8 @@ mod tests {
     fn molecular_weight_matches_formulas() {
         assert!((molecular_weight(100.0, "DNA") - (100.0 * 607.4 + 157.9)).abs() < 1e-9);
         assert!((molecular_weight(100.0, "RNA") - (100.0 * 320.5 + 159.0)).abs() < 1e-9);
+        assert!(molecular_weight(0.0, "DNA").is_nan());
+        assert!(molecular_weight(-1.0, "RNA").is_nan());
         assert!(molecular_weight(100.0, "Protein").is_nan());
     }
 
@@ -255,5 +270,31 @@ mod tests {
         // aligned_time 2,3,4 are within [2,4] -> 20+30+40 = 90
         let got = integrate_peak_area(&s, &s.peaks[0], &area);
         assert!((got - 90.0).abs() < 1e-9, "got {got}");
+    }
+
+    #[test]
+    fn per_point_area_skips_non_positive_aligned_time() {
+        let s = Sample {
+            well_number: 1,
+            name: String::new(),
+            category: String::new(),
+            is_ladder: false,
+            comment: String::new(),
+            observations: String::new(),
+            rin: None,
+            time: vec![0.0, 1.0, 2.0],
+            fluorescence: vec![10.0, 20.0, 30.0],
+            aligned_time: vec![-1.0, 0.0, 2.0],
+            length: Vec::new(),
+            concentration: Vec::new(),
+            molarity: Vec::new(),
+            peaks: Vec::new(),
+        };
+
+        let area = per_point_area(&s);
+
+        assert!(area[0].is_nan());
+        assert!(area[1].is_nan());
+        assert!(area[2].is_finite());
     }
 }

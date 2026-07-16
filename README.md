@@ -1,4 +1,8 @@
-# traceanalyzer
+<p align="center">
+  <img src="assets/icon.svg" alt="Trace analyzer logo" width="120" height="120">
+</p>
+
+# Trace analyzer
 
 Open-source, **post-measurement analysis** for automated-electrophoresis
 instruments — a replacement for the vendor software that ships with the Agilent
@@ -11,6 +15,8 @@ instrument already saved.
 
 > **This software is still under development.** It is an early prototype focused
 > on the Bioanalyzer reader.
+
+![Trace analyzer showing a DNA 1000 ladder run — well tree, electropherogram, and per-peak sizing/concentration/molarity table](docs/screenshot.png)
 
 ## Supported instruments
 
@@ -47,6 +53,27 @@ cargo run -p traceanalyzer -- testdata/demo_dna1000.xml.gz
 Running the GUI needs a working display. On Linux you may also need X11/Wayland
 and GTK development packages; see [docs/development.md](docs/development.md) for
 prerequisites, headless use, and the command-line `inspect` tool.
+
+## Installing
+
+**Linux** — install the release binary, a `.desktop` launcher entry, and the app
+icons into a standard [freedesktop](https://specifications.freedesktop.org)
+layout, so Trace analyzer shows up in your application menu:
+
+```sh
+sudo make install                # into /usr/local (default)
+make install PREFIX=~/.local     # per-user, no sudo
+```
+
+`make uninstall` (with the same `PREFIX`) removes them again. Packagers can stage
+into a build root with `DESTDIR`. At runtime the GUI needs X11/Wayland plus GTK
+(used for the file-open dialog).
+
+**macOS** — build a double-clickable app bundle (with icon):
+
+```sh
+make osx-app                     # → target/osx/Trace analyzer.app
+```
 
 ## Documentation
 

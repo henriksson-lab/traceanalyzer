@@ -13,10 +13,11 @@ use slint::{
     Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, StandardListViewItem, VecModel,
 };
 
-use traceanalyzer::plot::{self, Series, Viewport, XAxis};
+use traceanalyzer::plot::{self, Series, Viewport, XAxis, YMode};
 use traceanalyzer::state::{AppState, Marker, MarkerDrag};
 use traceanalyzer::{gel, loading, overview, render, table};
 use traceio::calibration::{marker_times, MarkerOverride};
+use traceio::Electrophoresis;
 
 slint::include_modules!();
 
@@ -107,16 +108,40 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // File → Quit.
-    ui.on_quit(|| {
-        let _ = slint::quit_event_loop();
-    });
+    // File → Quit (prompt to save unsaved edits first).
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_quit(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if confirm_exit(&ui, &st) {
+                let _ = slint::quit_event_loop();
+            }
+        });
+    }
+
+    // Window close button (X): same save prompt; veto the close on Cancel.
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.window().on_close_requested(move || {
+            let Some(ui) = ui_weak.upgrade() else {
+                return slint::CloseRequestResponse::HideWindow;
+            };
+            if confirm_exit(&ui, &st) {
+                let _ = slint::quit_event_loop();
+                slint::CloseRequestResponse::HideWindow
+            } else {
+                slint::CloseRequestResponse::KeepWindowShown
+            }
+        });
+    }
 
     // Help → About.
     ui.on_about(|| {
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Info)
-            .set_title("About traceanalyzer")
+            .set_title("About Trace analyzer")
             .set_description(about_text())
             .set_buttons(rfd::MessageButtons::Ok)
             .show();
@@ -128,15 +153,7 @@ fn main() -> anyhow::Result<()> {
         let st = state.clone();
         ui.on_save_file(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let dst = st.borrow().source_path.clone();
-            match dst {
-                // A native .xad cannot be rewritten in place; offer Save As.
-                Some(p) if p.extension().and_then(|e| e.to_str()) == Some("xad") => {
-                    save_as_dialog(&ui, &st)
-                }
-                Some(p) => do_save(&ui, &st, p),
-                None => save_as_dialog(&ui, &st),
-            }
+            save_current(&ui, &st);
         });
     }
 
@@ -161,18 +178,27 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Rename the selected well in memory (persist later via File → Save).
+    // Rename the selected well in memory (persist later via File → Save), then
+    // advance to the next well so a list can be renamed top-to-bottom.
     {
         let ui_weak = ui.as_weak();
         let st = state.clone();
         ui.on_rename_well(move |name| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let changed = st.borrow_mut().rename_primary(name.as_str());
-            if changed {
-                let s = st.borrow();
-                refresh_tree(&ui, &s);
-                ui.set_window_title(SharedString::from(window_title(&s)));
-            }
+            let table = {
+                let mut s = st.borrow_mut();
+                s.rename_primary(name.as_str());
+                let next = s.primary() + 1;
+                if next < s.entry_count() {
+                    s.select_click(next, false, false);
+                    s.viewport = None; // auto-fit the newly focused well
+                }
+                build_table_refresh(&mut s)
+            };
+            table.apply(&ui);
+            let s = st.borrow();
+            refresh_selection(&ui, &s);
+            show_selected(&ui, &s);
         });
     }
 
@@ -246,11 +272,15 @@ fn main() -> anyhow::Result<()> {
                 if s.raw_mode() {
                     None
                 } else if s.overview_gel {
-                    let (w, _) = gel::size(s.run.samples.len());
-                    gel::lane_at(&s.run, fx as f64, w)
+                    let indices = overview_sample_indices(&s);
+                    let filtered = filtered_run(&s.run, &indices);
+                    let (w, _) = gel::size(filtered.samples.len());
+                    gel::lane_at(&filtered, fx as f64, w).and_then(|i| indices.get(i).copied())
                 } else {
-                    let layout = overview::layout(s.run.samples.len());
+                    let indices = overview_sample_indices(&s);
+                    let layout = overview::layout(indices.len());
                     overview::cell_at(&layout, fx as f64, fy as f64)
+                        .and_then(|i| indices.get(i).copied())
                 }
             };
             if let Some(idx) = idx {
@@ -286,6 +316,17 @@ fn main() -> anyhow::Result<()> {
         ui.on_toggle_overview_gel(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             st.borrow_mut().overview_gel ^= true;
+            refresh_overview(&ui, &st.borrow());
+        });
+    }
+
+    // Overview: include/exclude ladder wells.
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_toggle_overview_ladders(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            st.borrow_mut().overview_show_ladders ^= true;
             refresh_overview(&ui, &st.borrow());
         });
     }
@@ -424,15 +465,15 @@ fn main() -> anyhow::Result<()> {
             show_selected(&ui, &st.borrow());
         });
     }
-    // Cycle the y-axis quantity.
+    // Select the y-axis quantity from the dropdown.
     {
         let ui_weak = ui.as_weak();
         let st = state.clone();
-        ui.on_cycle_y_mode(move || {
+        ui.on_select_y_mode(move |idx| {
             let Some(ui) = ui_weak.upgrade() else { return };
             {
                 let mut s = st.borrow_mut();
-                s.y_mode = s.y_mode.next();
+                s.y_mode = YMode::from_index(idx as usize);
                 s.viewport = None; // y-range changes with the quantity
                 refresh_overview(&ui, &s);
             }
@@ -474,27 +515,12 @@ fn reload(ui: &AppWindow, state: &SharedState, path: &std::path::Path) {
 /// Push run-level data (title, entry list, error) into the UI and build a table update.
 fn refresh_all(ui: &AppWindow, st: &mut AppState) -> TableRefresh {
     ui.set_assay_title(SharedString::from(st.title()));
-    ui.set_window_title(SharedString::from(window_title(st)));
     ui.set_error_text(SharedString::from(st.error.clone().unwrap_or_default()));
     refresh_tree(ui, st);
     refresh_overview(ui, st);
     build_table_refresh(st)
 }
 
-/// Native-window title: app name plus the loaded file, with a `*` when there are
-/// unsaved edits.
-fn window_title(st: &AppState) -> String {
-    let base = if st.run.assay.file_name.is_empty() {
-        "traceanalyzer".to_string()
-    } else {
-        format!("traceanalyzer — {}", st.run.assay.file_name)
-    };
-    if st.dirty {
-        format!("{base} *")
-    } else {
-        base
-    }
-}
 
 /// Push the well tree (rows, selection, expansion) and the rename/save enable
 /// state into the UI. Also sets the rename field to the selected well's name.
@@ -507,6 +533,7 @@ fn refresh_tree(ui: &AppWindow, st: &AppState) {
     ui.set_tree_selected(ModelRc::from(Rc::new(VecModel::from(t.selected))));
     ui.set_tree_primary_row(t.primary_row);
     ui.set_tree_expanded(st.expanded);
+    ui.set_file_path(SharedString::from(st.file_path()));
     ui.set_entry_count(st.entry_count() as i32);
     ui.set_current_index(st.primary() as i32);
     ui.set_can_rename(st.can_rename());
@@ -518,6 +545,7 @@ fn refresh_tree(ui: &AppWindow, st: &AppState) {
 fn refresh_overview(ui: &AppWindow, st: &AppState) {
     ui.set_overview_shared_y(st.overview_shared_y);
     ui.set_overview_gel(st.overview_gel);
+    ui.set_overview_show_ladders(st.overview_show_ladders);
     if st.raw_mode() {
         let w = plot::PLOT_W;
         let h = plot::PLOT_H;
@@ -529,18 +557,42 @@ fn refresh_overview(ui: &AppWindow, st: &AppState) {
         ui.set_overview_image_height(h as i32);
         ui.set_overview_image(rgb_to_image(&buf, w, h));
     } else if st.overview_gel {
-        let (w, h) = gel::size(st.run.samples.len());
-        let buf = gel::render(&st.run, w, h);
+        let indices = overview_sample_indices(st);
+        let run = filtered_run(&st.run, &indices);
+        let (w, h) = gel::size(run.samples.len());
+        let buf = gel::render(&run, w, h);
         ui.set_overview_image_width(w as i32);
         ui.set_overview_image_height(h as i32);
         ui.set_overview_image(rgb_to_image(&buf, w, h));
     } else {
-        let layout = overview::layout(st.run.samples.len());
-        let buf = overview::render(&st.run, st.y_mode, st.overview_shared_y, &layout);
+        let indices = overview_sample_indices(st);
+        let run = filtered_run(&st.run, &indices);
+        let layout = overview::layout(run.samples.len());
+        let buf = overview::render(&run, st.y_mode, st.overview_shared_y, &layout);
         ui.set_overview_image_width(layout.w as i32);
         ui.set_overview_image_height(layout.h as i32);
         ui.set_overview_image(rgb_to_image(&buf, layout.w, layout.h));
     }
+}
+
+/// Sample indices shown in the Overview tab (optionally excluding ladder wells).
+fn overview_sample_indices(st: &AppState) -> Vec<usize> {
+    st.run
+        .samples
+        .iter()
+        .enumerate()
+        .filter_map(|(i, sample)| (st.overview_show_ladders || !sample.is_ladder).then_some(i))
+        .collect()
+}
+
+/// Clone a run keeping only the given sample indices, for filtered overview rendering.
+fn filtered_run(run: &Electrophoresis, indices: &[usize]) -> Electrophoresis {
+    let mut out = run.clone();
+    out.samples = indices
+        .iter()
+        .filter_map(|&i| run.samples.get(i).cloned())
+        .collect();
+    out
 }
 
 struct TableRefresh {
@@ -651,9 +703,7 @@ fn show_selected(ui: &AppWindow, st: &AppState) {
 
     let series = selected_series(st);
     let refs: Vec<&Series> = series.iter().collect();
-    let vp = st
-        .viewport
-        .unwrap_or_else(|| plot::auto_viewport_multi(&refs));
+    let vp = st.viewport.unwrap_or_else(|| auto_fit_viewport(st, &refs));
     // Highlight the selected peak only in the single-sample view.
     let highlight = if st.selection.len() == 1 {
         st.highlight_x
@@ -672,7 +722,12 @@ fn show_selected(ui: &AppWindow, st: &AppState) {
         render::info_line(&st.run, &st.run.samples[st.primary()])
     };
     ui.set_sample_info(SharedString::from(info));
-    ui.set_y_mode_label(SharedString::from(st.y_mode.label(&st.run)));
+    let y_options: Vec<SharedString> = YMode::ALL
+        .iter()
+        .map(|m| SharedString::from(m.label(&st.run)))
+        .collect();
+    ui.set_y_mode_options(ModelRc::from(Rc::new(VecModel::from(y_options))));
+    ui.set_y_mode_index(st.y_mode.index() as i32);
     ui.set_normalize_on(st.normalize);
     ui.set_marker_edit(st.marker_edit);
 }
@@ -680,7 +735,7 @@ fn show_selected(ui: &AppWindow, st: &AppState) {
 /// Text shown in the Help → About dialog.
 fn about_text() -> String {
     format!(
-        "traceanalyzer {}\n\nOpen-source post-measurement analysis for automated-electrophoresis runs (Agilent Bioanalyzer, TapeStation, Fragment Analyzer).\n\n© {}",
+        "Trace analyzer {}\n\nOpen-source post-measurement analysis for automated-electrophoresis runs (Agilent Bioanalyzer, TapeStation, Fragment Analyzer).\n\n© {}",
         env!("CARGO_PKG_VERSION"),
         env!("CARGO_PKG_AUTHORS"),
     )
@@ -688,6 +743,61 @@ fn about_text() -> String {
 
 /// Prompt for a destination and save the run there (used by Save As, and by Save
 /// when there is no writable source path — e.g. a native `.xad`).
+/// Save the current run using the same policy as File → Save: rewrite the source
+/// file in place when possible, otherwise (no source, or a native `.xad` that
+/// can't be rewritten) prompt with Save As. Clears `dirty` on success.
+fn save_current(ui: &AppWindow, st: &SharedState) {
+    let dst = st.borrow().source_path.clone();
+    match dst {
+        // A native .xad cannot be rewritten in place; offer Save As.
+        Some(p) if p.extension().and_then(|e| e.to_str()) == Some("xad") => {
+            save_as_dialog(ui, st)
+        }
+        Some(p) => do_save(ui, st, p),
+        None => save_as_dialog(ui, st),
+    }
+}
+
+/// When there are unsaved edits, ask Save / Don't Save / Cancel before exiting.
+/// Returns `true` if the app may close (edits saved or explicitly discarded),
+/// `false` to keep the window open (Cancel, dialog dismissed, or a failed/aborted
+/// save). No borrow of `st` is held across the blocking dialog.
+fn confirm_exit(ui: &AppWindow, st: &SharedState) -> bool {
+    if !st.borrow().dirty {
+        return true;
+    }
+    let description = {
+        let s = st.borrow();
+        let name = file_base_name(&s.file_path());
+        if name.is_empty() {
+            "This run has unsaved changes.\n\nSave them before closing?".to_string()
+        } else {
+            format!("“{name}” has unsaved changes.\n\nSave them before closing?")
+        }
+    };
+    let choice = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("Unsaved changes")
+        .set_description(description)
+        .set_buttons(rfd::MessageButtons::YesNoCancel) // Yes = Save, No = Don't Save
+        .show();
+    match choice {
+        rfd::MessageDialogResult::Yes => {
+            // Attempt the save; only allow exit if it actually cleared `dirty`
+            // (a failed write or a cancelled Save-As dialog leaves it set).
+            save_current(ui, st);
+            !st.borrow().dirty
+        }
+        rfd::MessageDialogResult::No => true, // discard edits and exit
+        _ => false,                           // Cancel / dismissed: stay open
+    }
+}
+
+/// Last path component of an instrument file path (Windows `\` or Unix `/`).
+fn file_base_name(path: &str) -> String {
+    path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
+}
+
 fn save_as_dialog(ui: &AppWindow, st: &SharedState) {
     let start_name = st
         .borrow()
@@ -727,7 +837,6 @@ fn do_save(ui: &AppWindow, st: &SharedState, dst: std::path::PathBuf) {
             }
             let s = st.borrow();
             ui.set_can_save(s.can_save());
-            ui.set_window_title(SharedString::from(window_title(&s)));
             ui.set_error_text(SharedString::default());
         }
         Err(e) => ui.set_error_text(SharedString::from(format!("Save failed: {e:#}"))),
@@ -747,7 +856,19 @@ fn current_viewport(st: &AppState) -> Viewport {
     }
     let series = selected_series(st);
     let refs: Vec<&Series> = series.iter().collect();
-    plot::auto_viewport_multi(&refs)
+    auto_fit_viewport(st, &refs)
+}
+
+/// Auto-fit viewport for the current selection, using robust y-scaling for the
+/// derived quantities (concentration/molarity) so a numeric spike at tiny sizes
+/// doesn't squash the trace. Keeps display and interaction viewports in sync.
+fn auto_fit_viewport(st: &AppState, refs: &[&Series]) -> Viewport {
+    let robust_y = !st.raw_mode() && matches!(st.y_mode, YMode::Concentration | YMode::Molarity);
+    if robust_y {
+        plot::auto_viewport_multi_robust(refs)
+    } else {
+        plot::auto_viewport_multi(refs)
+    }
 }
 
 /// Find the table row whose peak is nearest `data_x`, within a small tolerance

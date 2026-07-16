@@ -15,7 +15,7 @@ format, [`xad_format.md`](xad_format.md).
     Hyman-filtered FMM spline) giving a size (bp/nt) for every trace point.
   - `concentration.rs` — per-point concentration + molarity (trapezoidal area,
     marker-ratio mass coefficients, molecular weight).
-- `crates/traceanalyzer` — Slint GUI: sample list + electropherogram plot.
+- `crates/traceanalyzer` — Slint GUI: well tree + electropherogram plot.
 - `docs/xad_format.md` — reverse-engineered `.xad` container + schema spec.
 - `scripts/fetch-testdata.sh` — download the demo fixtures (they aren't committed).
 - `testdata/` — real demo runs (from jwfoley/bioanalyzeR, MIT).

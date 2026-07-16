@@ -1,8 +1,8 @@
-import { ListView, VerticalBox, HorizontalBox, TabWidget, Button, StandardTableView, ScrollView, LineEdit } from "std-widgets.slint";
+import { ListView, VerticalBox, HorizontalBox, TabWidget, Button, StandardTableView, ScrollView, LineEdit, ComboBox } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
-    title: root.window-title;
-    in property <string> window-title: "traceanalyzer";
+    title: "Trace analyzer";
+    icon: @image-url("../assets/window-icon.png");
     preferred-width: 1040px;
     preferred-height: 620px;
     min-width: 720px;
@@ -19,12 +19,15 @@ export component AppWindow inherits Window {
     in property <int> tree-primary-row: -1; // visible-row index of the primary well
     in property <bool> tree-expanded: true;
     in property <int> entry-count;          // number of wells (keyboard-nav bound)
+    in property <string> file-path;         // full path of the loaded file (tree tooltip)
     // Rename: bound to the selected well's name; edited in the field, applied on Rename.
     in-out property <string> rename-text;
     in property <bool> can-rename: false;
     in property <bool> can-save: false;
     in property <string> sample-info: "";
-    in property <string> y-mode-label: "fluorescence";
+    // Y-axis mode: options for the dropdown and the currently selected index.
+    in property <[string]> y-mode-options;
+    in property <int> y-mode-index: 0;
     in property <bool> normalize-on: false;
     in property <bool> marker-edit: false;
     in property <string> error-text: "";
@@ -37,6 +40,7 @@ export component AppWindow inherits Window {
     in property <int> overview-image-height: 560;
     in property <bool> overview-shared-y: true;
     in property <bool> overview-gel: false;
+    in property <bool> overview-show-ladders: false;
     // Selected tab index; set from Rust to jump to Detail on an overview click.
     in-out property <int> active-tab: 0;
 
@@ -61,6 +65,7 @@ export component AppWindow inherits Window {
     callback overview-click(float, float);
     callback toggle-overview-yscale();
     callback toggle-overview-gel();
+    callback toggle-overview-ladders();
     // fractional-anchor x, y in 0..1; factor <1 zooms in, >1 zooms out
     callback zoom(float, float, float);
     // fractional pan delta (dx, dy) across the plot area
@@ -71,7 +76,8 @@ export component AppWindow inherits Window {
     callback plot-press(float, float);
     callback plot-release();
     callback reset-view();
-    callback cycle-y-mode();
+    // Select the Y-axis mode by index into y-mode-options.
+    callback select-y-mode(int);
     callback toggle-marker-edit();
     callback reset-markers();
 
@@ -112,7 +118,7 @@ export component AppWindow inherits Window {
         Menu {
             title: "Help";
             MenuItem {
-                title: "About traceanalyzer";
+                title: "About Trace analyzer";
                 activated => { root.about(); }
             }
         }
@@ -182,6 +188,22 @@ export component AppWindow inherits Window {
                                             : (i < root.tree-selected.length && root.tree-selected[i] ? #dbeaff : transparent));
                                     accessible-role: list-item;
                                     accessible-label: row;
+                                    // File row: hovering shows the full path verbatim
+                                    // (custom content avoids markdown escaping the path).
+                                    if (i < root.tree-is-file.length && root.tree-is-file[i] && root.file-path != ""): Tooltip {
+                                        Rectangle {
+                                            background: #2b2b2b;
+                                            border-radius: 4px;
+                                            HorizontalLayout {
+                                                padding: 6px;
+                                                Text {
+                                                    text: root.file-path;
+                                                    color: #ffffff;
+                                                    font-size: 12px;
+                                                }
+                                            }
+                                        }
+                                    }
                                     TouchArea {
                                         pointer-event(ev) => {
                                             if (ev.kind == PointerEventKind.up
@@ -260,16 +282,17 @@ export component AppWindow inherits Window {
                                     text: "Reset view";
                                     clicked => { root.reset-view(); }
                                 }
-                                Button {
-                                    text: "Y: " + root.y-mode-label;
-                                    clicked => { root.cycle-y-mode(); }
+                                ComboBox {
+                                    model: root.y-mode-options;
+                                    current-index: root.y-mode-index;
+                                    selected => { root.select-y-mode(self.current-index); }
                                 }
                                 Button {
                                     text: root.normalize-on ? "Normalized ✓" : "Normalize";
                                     clicked => { root.toggle-normalize(); }
                                 }
                                 Button {
-                                    text: root.marker-edit ? "Markers ✓" : "Markers";
+                                    text: root.marker-edit ? "Scale to markers" : "Scale to markers ✓";
                                     clicked => { root.toggle-marker-edit(); }
                                 }
                                 if root.marker-edit: Button {
@@ -397,6 +420,10 @@ export component AppWindow inherits Window {
                             text: root.overview-shared-y ? "Y-scale: shared" : "Y-scale: per-plot";
                             enabled: !root.overview-gel;
                             clicked => { root.toggle-overview-yscale(); }
+                        }
+                        Button {
+                            text: root.overview-show-ladders ? "Show ladders ✓" : "Show ladders";
+                            clicked => { root.toggle-overview-ladders(); }
                         }
                         Text {
                             text: root.overview-gel

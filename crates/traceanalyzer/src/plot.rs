@@ -668,6 +668,7 @@ mod tests {
             concentration,
             molarity,
             peaks: Vec::new(),
+            regions: Vec::new(),
         }
     }
 

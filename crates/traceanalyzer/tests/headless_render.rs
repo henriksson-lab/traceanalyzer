@@ -17,6 +17,7 @@ fn demo_run() -> Electrophoresis {
         concentration: Vec::new(),
         molarity: Vec::new(),
         peaks: Vec::new(),
+        regions: Vec::new(),
     };
 
     Electrophoresis {

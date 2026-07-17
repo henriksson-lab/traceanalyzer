@@ -971,6 +971,7 @@ fn build_run(
             concentration: Vec::new(),
             molarity: Vec::new(),
             peaks: well_peaks,
+            regions: Vec::new(),
         });
     }
 
@@ -1423,6 +1424,7 @@ mod tests {
             concentration: Vec::new(),
             molarity: Vec::new(),
             peaks: Vec::new(),
+            regions: Vec::new(),
         }
     }
 }

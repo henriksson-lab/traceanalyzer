@@ -93,7 +93,7 @@ fn main() -> anyhow::Result<()> {
         ui.on_open_file(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Electrophoresis", &["xad", "xml", "gz", "zip", "raw"])
+                .add_filter("Electrophoresis", &["xad", "xml", "gz", "zip", "raw", "csv"])
                 .pick_file()
             {
                 open_added_file(&ui, &st, &path);

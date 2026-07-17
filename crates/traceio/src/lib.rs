@@ -5,8 +5,14 @@
 //!   ([`bioanalyzer`]). Inner-XML parsing validated against real demo files;
 //!   the native `.xad` container unwrap is a faithful but not-yet-validated
 //!   port of grimbough/bioanalyzeR (needs real `.xad` samples).
-//! - **TapeStation**: TODO — native container is an encrypted ZIP (blocked);
-//!   plan is XML + unaligned-CSV export.
+//! - **TapeStation**: exported reader ([`tapestation`]) — metadata `.xml` +
+//!   `_Electropherogram.csv` (a port of jwfoley/bioanalyzeR `tapestation.R`),
+//!   with per-sample regions, multi-tape (`ScreenTapeID`) ladder grouping, and
+//!   marker-relative sizing. Validated against Agilent demo exports across every
+//!   assay (D1000/D5000, HS variants, cfDNA, gDNA, RNA). The native project file
+//!   (`.D1000`/`.RNA`/…) is a password-encrypted ZIP with no public key, so —
+//!   like bioanalyzeR — only the export is read (per-point concentration/molarity
+//!   are not in the export and are not fabricated; see `docs/tapestation_format.md`).
 //! - **Fragment Analyzer (AATI)**: native run reader ([`fa`]) — reverse-engineered
 //!   from a real run directory (see `docs/fa_format.md`). Reads the `.raw` CCD
 //!   acquisition into 12 per-capillary electropherograms, plus the `.PKS`
@@ -21,6 +27,7 @@ pub mod concentration;
 pub mod fa;
 pub mod model;
 pub mod save;
+pub mod tapestation;
 pub mod xad;
 
 pub use model::*;

@@ -218,8 +218,10 @@ fn approx_eq(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0)
 }
 
-/// A fitted length-vs-aligned-time standard curve.
-struct StandardCurve {
+/// A fitted length-vs-x standard curve (x is aligned time for the Bioanalyzer,
+/// or marker-relative distance for the TapeStation). Public so other readers can
+/// size a trace against a ladder with the same monotone spline.
+pub struct StandardCurve {
     method: Method,
     x: Vec<f64>,
     y: Vec<f64>,
@@ -233,6 +235,14 @@ struct StandardCurve {
 }
 
 impl StandardCurve {
+    /// Fit a monotone Hyman cubic spline through `(x, y)` ladder points (any
+    /// order; duplicates on x are dropped). Errors if fewer than two distinct
+    /// points remain or `y` is not monotone.
+    pub fn fit_hyman(points: &[(f64, f64)]) -> Result<StandardCurve> {
+        let mut pts = points.to_vec();
+        Self::fit(&mut pts, Method::Hyman)
+    }
+
     /// Fit from ladder points `(x = aligned time, y = length)`.
     fn fit(pts: &mut Vec<(f64, f64)>, method: Method) -> Result<StandardCurve> {
         // Sort by x and drop duplicate x (splines need strictly increasing x).
@@ -288,7 +298,7 @@ impl StandardCurve {
     /// Evaluate the curve, returning NaN outside the ladder's interpolation
     /// range (matching `extrapolate = FALSE`): both the x-range and the
     /// resulting length-range must be within the ladder span.
-    fn eval_in_range(&self, u: f64) -> f64 {
+    pub fn eval_in_range(&self, u: f64) -> f64 {
         if !(u >= self.x_min && u <= self.x_max) {
             return f64::NAN;
         }

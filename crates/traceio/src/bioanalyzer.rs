@@ -204,6 +204,7 @@ fn parse_sample(sample: Node) -> Result<Option<Sample>> {
         concentration: Vec::new(),
         molarity: Vec::new(),
         peaks,
+        regions: Vec::new(),
     }))
 }
 

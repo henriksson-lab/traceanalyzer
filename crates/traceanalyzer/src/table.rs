@@ -89,8 +89,11 @@ pub fn rows_with_axis(run: &Electrophoresis, s: &Sample, x_axis: XAxis) -> Vec<R
         })
         .collect();
 
-    // Smear regions (size window only; other columns not applicable).
-    for (i, r) in run.regions.iter().enumerate() {
+    // Smear regions (size window only; other columns not applicable). Prefer the
+    // sample's own regions (TapeStation) and fall back to the run-level ones
+    // (Bioanalyzer keeps regions at the assay level).
+    let regions = if s.regions.is_empty() { &run.regions } else { &s.regions };
+    for (i, r) in regions.iter().enumerate() {
         out.push(Row {
             cells: vec![
                 format!("R{}", i + 1),
@@ -153,6 +156,7 @@ mod tests {
                 concentration: 99.0,
                 molarity: 999.0,
             }],
+            regions: Vec::new(),
         }
     }
 

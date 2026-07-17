@@ -58,6 +58,13 @@ pub fn save_run(run: &Electrophoresis, src: &Path, dst: &Path) -> Result<()> {
 
     // Decode the template into a UTF-8 XML string we can splice.
     let xml = read_xml(src)?;
+    // TapeStation exports share the `.xml` extension but a different schema (the
+    // Bioanalyzer patcher would silently no-op); they are read-only for now.
+    if crate::tapestation::looks_like_tapestation_xml(&xml) {
+        return Err(anyhow!(
+            "TapeStation exports are read-only; sample renames cannot be saved back"
+        ));
+    }
     let patched = patch_names(&xml, run)?;
 
     write_xml(dst, dst_kind, &patched)
@@ -351,6 +358,7 @@ mod tests {
             concentration: vec![],
             molarity: vec![],
             peaks: vec![],
+            regions: vec![],
         }
     }
 }

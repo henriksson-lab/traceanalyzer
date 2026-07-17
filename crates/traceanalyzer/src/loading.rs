@@ -32,6 +32,17 @@ pub fn load(path: &Path) -> Result<Loaded> {
         });
     }
 
+    // TapeStation exports (metadata .xml + _Electropherogram.csv) size
+    // themselves against the ladder, so they also skip `calibrate`.
+    if traceio::tapestation::is_tapestation_path(path) {
+        let run = traceio::tapestation::read_tapestation(path)?;
+        return Ok(Loaded {
+            run,
+            raw_channels: Vec::new(),
+            warning: None,
+        });
+    }
+
     let mut run = parse(path)?;
     calibrate(&mut run);
 

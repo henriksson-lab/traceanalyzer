@@ -264,6 +264,7 @@ mod tests {
             concentration: Vec::new(),
             molarity: Vec::new(),
             peaks: Vec::new(),
+            regions: Vec::new(),
         };
         s.peaks.push(peak_between(2.0, 4.0));
         let area = [10.0, 20.0, 30.0, 40.0, 50.0];
@@ -289,6 +290,7 @@ mod tests {
             concentration: Vec::new(),
             molarity: Vec::new(),
             peaks: Vec::new(),
+            regions: Vec::new(),
         };
 
         let area = per_point_area(&s);

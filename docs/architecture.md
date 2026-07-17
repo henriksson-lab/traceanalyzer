@@ -64,8 +64,10 @@ this bp/nt axis when a run is calibrated.
    ([`calibration`]) and concentration/molarity ([`concentration`]) stages
    already exist and plug in once per-well traces + peaks are produced.
 2. Gel-like (virtual-gel) rendering.
-3. TapeStation (XML + CSV export) and Fragment Analyzer (ProSize CSV) readers
-   into the same `Electrophoresis` model.
+3. ~~TapeStation (XML + CSV export) and Fragment Analyzer readers~~ — **done**:
+   Fragment Analyzer reads the native run (`docs/fa_format.md`); TapeStation
+   reads the exported XML + `_Electropherogram.csv` (`docs/tapestation_format.md`),
+   both into the same `Electrophoresis` model.
 
 [`calibration`]: ../crates/traceio/src/calibration.rs
 [`concentration`]: ../crates/traceio/src/concentration.rs

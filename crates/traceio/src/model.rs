@@ -70,6 +70,10 @@ pub struct Sample {
     /// Empty until then; NaN wherever `length` or `concentration` is NaN.
     pub molarity: Vec<f64>,
     pub peaks: Vec<Peak>,
+    /// Per-sample smear/analysis regions (TapeStation). Empty for instruments
+    /// whose regions are assay-level (Bioanalyzer keeps those in
+    /// [`Electrophoresis::regions`]).
+    pub regions: Vec<Region>,
 }
 
 impl Sample {

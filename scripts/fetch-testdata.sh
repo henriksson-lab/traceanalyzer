@@ -15,12 +15,17 @@ dest="$repo_root/testdata"
 
 mkdir -p "$dest"
 
-base="https://raw.githubusercontent.com/jwfoley/bioanalyzeR/master/inst/extdata/bioanalyzer"
+repo="https://raw.githubusercontent.com/jwfoley/bioanalyzeR/master/inst/extdata"
 
-# local name  <TAB>  remote filename (URL-encoded)
+# each entry: "<local path under testdata/>|<remote path under $repo, URL-encoded>"
 fixtures=(
-  "demo_dna1000.xml.gz|Demo%20DNA%201000%20Series%20II.xml.gz"
-  "demo_rna_nano.xml.gz|Demo%20Eukaryote%20Total%20RNA%20Nano%20Series%20II.xml.gz"
+  # Bioanalyzer exported XML.
+  "demo_dna1000.xml.gz|bioanalyzer/Demo%20DNA%201000%20Series%20II.xml.gz"
+  "demo_rna_nano.xml.gz|bioanalyzer/Demo%20Eukaryote%20Total%20RNA%20Nano%20Series%20II.xml.gz"
+  # TapeStation exported metadata XML + electropherogram CSV (a matched pair;
+  # the reader derives the CSV from the XML stem, so keep these names in sync).
+  "tapestation/d1000.xml.gz|tapestation/D1000-Tubes-16-D1000.xml.gz"
+  "tapestation/d1000_Electropherogram.csv.gz|tapestation/D1000-Tubes-16-D1000_Electropherogram.csv.gz"
 )
 
 is_gzip() {
@@ -32,6 +37,7 @@ for entry in "${fixtures[@]}"; do
   local_name="${entry%%|*}"
   remote_name="${entry##*|}"
   out="$dest/$local_name"
+  mkdir -p "$(dirname "$out")"
 
   if [ -s "$out" ]; then
     echo "skip   $local_name (already present)"
@@ -40,7 +46,7 @@ for entry in "${fixtures[@]}"; do
 
   echo "fetch  $local_name"
   tmp="$out.tmp.$$"
-  if ! curl -fSL --retry 3 "$base/$remote_name" -o "$tmp"; then
+  if ! curl -fSL --retry 3 "$repo/$remote_name" -o "$tmp"; then
     rm -f "$tmp"
     echo "ERROR: download failed for $local_name" >&2
     exit 1

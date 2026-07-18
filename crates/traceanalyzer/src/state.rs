@@ -38,10 +38,7 @@ pub struct TreeRows {
 /// (`\`) or Unix (`/`) separators, so split on both; falls back to the whole
 /// string when there is no separator.
 fn file_base_name(path: &str) -> String {
-    path.rsplit(['\\', '/'])
-        .next()
-        .unwrap_or(path)
-        .to_string()
+    path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
 }
 
 /// Which marker line is being dragged in marker-edit mode.
@@ -118,6 +115,39 @@ impl OpenFile {
                 .and_then(|p| p.extension())
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("raw"))
+    }
+
+    /// True for TapeStation exports. They are intentionally read-only: the XML
+    /// is a derived export, and native project files are encrypted.
+    fn tapestation_mode(&self) -> bool {
+        self.source_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .is_some_and(|n| {
+                n.ends_with("_electropherogram.csv") || n.ends_with("_electropherogram.csv.gz")
+            })
+            || is_tapestation_assay_name(&self.run.assay.assay_name)
+            || self
+                .run
+                .assay
+                .file_name
+                .rsplit_once('.')
+                .map(|(_, ext)| {
+                    matches!(
+                        ext.to_ascii_lowercase().as_str(),
+                        "d1000"
+                            | "hsd1000"
+                            | "d5000"
+                            | "hsd5000"
+                            | "cfdna"
+                            | "gdna"
+                            | "rna"
+                            | "hsrna"
+                    )
+                })
+                .unwrap_or(false)
+            || self.run.samples.iter().any(|s| !s.regions.is_empty())
     }
 
     /// Number of selectable entries in the current mode.
@@ -495,8 +525,9 @@ impl AppState {
 
     /// Whether the primary-selected entry is a renameable well.
     pub fn can_rename(&self) -> bool {
-        self.active_file()
-            .is_some_and(|f| !f.raw_mode() && f.primary() < f.run.samples.len())
+        self.active_file().is_some_and(|f| {
+            !f.raw_mode() && !f.tapestation_mode() && f.primary() < f.run.samples.len()
+        })
     }
 
     /// Current name of the primary-selected well (empty in raw mode / no file).
@@ -522,7 +553,7 @@ impl AppState {
         let Some(f) = self.active_file_mut() else {
             return false;
         };
-        if f.raw_mode() {
+        if f.raw_mode() || f.tapestation_mode() {
             return false;
         }
         let idx = f.primary();
@@ -539,7 +570,8 @@ impl AppState {
 
     /// Whether the active file has a source path that File → Save can write to.
     pub fn can_save(&self) -> bool {
-        self.active_file().is_some_and(|f| f.source_path.is_some())
+        self.active_file()
+            .is_some_and(|f| f.source_path.is_some() && !f.tapestation_mode())
     }
 
     /// True when the active file is a native Fragment Analyzer run.
@@ -661,6 +693,18 @@ fn canonical(path: &std::path::Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn is_tapestation_assay_name(name: &str) -> bool {
+    let normalized: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "D1000" | "HSD1000" | "D5000" | "HSD5000" | "CFDNA" | "GDNA" | "RNA" | "HSRNA"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,6 +749,15 @@ mod tests {
     fn fa_state_with_source(source: &str) -> AppState {
         let mut run = run_named(source, 1);
         run.assay.assay_name = "Fragment Analyzer".to_string();
+        AppState::new(run, Vec::new(), Some(PathBuf::from(source)), None)
+    }
+
+    fn tapestation_state_with_source(source: &str) -> AppState {
+        let mut run = run_named("demo.D1000", 1);
+        run.samples[0].regions.push(traceio::Region {
+            lower_length: 200.0,
+            upper_length: 400.0,
+        });
         AppState::new(run, Vec::new(), Some(PathBuf::from(source)), None)
     }
 
@@ -813,14 +866,53 @@ mod tests {
     }
 
     #[test]
+    fn tapestation_exports_are_read_only() {
+        let mut st = tapestation_state_with_source("run.xml");
+
+        assert!(!st.can_rename());
+        assert!(!st.can_save());
+        assert!(!st.rename_primary("A1"));
+        assert!(!st.is_dirty());
+    }
+
+    #[test]
+    fn tapestation_assay_name_is_read_only_even_without_regions() {
+        let mut run = run_named("export.xml", 1);
+        run.assay.assay_name = "D1000".to_string();
+        let mut st = AppState::new(run, Vec::new(), Some(PathBuf::from("export.xml")), None);
+
+        assert!(!st.can_rename());
+        assert!(!st.can_save());
+        assert!(!st.rename_primary("A1"));
+        assert!(!st.is_dirty());
+    }
+
+    #[test]
     fn find_file_by_source_dedups_and_activates() {
         let mut st = AppState::empty();
-        st.add_file(run_named("a", 1), Vec::new(), Some(PathBuf::from("/runs/a.raw")));
-        st.add_file(run_named("b", 1), Vec::new(), Some(PathBuf::from("/runs/b.raw")));
+        st.add_file(
+            run_named("a", 1),
+            Vec::new(),
+            Some(PathBuf::from("/runs/a.raw")),
+        );
+        st.add_file(
+            run_named("b", 1),
+            Vec::new(),
+            Some(PathBuf::from("/runs/b.raw")),
+        );
 
-        assert_eq!(st.find_file_by_source(std::path::Path::new("/runs/a.raw")), Some(0));
-        assert_eq!(st.find_file_by_source(std::path::Path::new("/runs/b.raw")), Some(1));
-        assert_eq!(st.find_file_by_source(std::path::Path::new("/runs/c.raw")), None);
+        assert_eq!(
+            st.find_file_by_source(std::path::Path::new("/runs/a.raw")),
+            Some(0)
+        );
+        assert_eq!(
+            st.find_file_by_source(std::path::Path::new("/runs/b.raw")),
+            Some(1)
+        );
+        assert_eq!(
+            st.find_file_by_source(std::path::Path::new("/runs/c.raw")),
+            None
+        );
 
         st.activate_file(0);
         assert_eq!(st.active, Some(0));

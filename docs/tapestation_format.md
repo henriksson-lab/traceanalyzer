@@ -47,9 +47,10 @@ Flat schema (distinct from Bioanalyzer's — a separate parser, same target mode
   `FromPercent`/`ToPercent` → boundary distances (÷100), `Area`, `Height`,
   `CalibratedQuantity` → concentration, `Molarity`. Missing numeric fields are
   the literal `-` (parse to NaN).
-- per `Region` (per-sample smear analysis): `From`/`To` (bp), `AverageSize`,
-  `Concentration`, `Molarity`, `PercentOfTotal`. The shared model only carries
-  run-level regions, so these are parsed but not yet surfaced.
+- per `Region` (per-sample smear analysis): `From`/`To` (bp), plus vendor
+  summary fields such as `AverageSize`, `Concentration`, `Molarity`, and
+  `PercentOfTotal`. The shared model currently stores and surfaces only the
+  region bounds.
 
 ### Sizing (distance → length)
 
@@ -67,12 +68,12 @@ uncalibrated traces still plot on the distance axis.
 `loading::load` dispatches via `tapestation::is_tapestation_path` and, like the
 Fragment Analyzer path, fills `length` itself and **skips** the Bioanalyzer
 `calibrate`. Peaks carry size/area/concentration/molarity and marker labels from
-the XML. **Per-sample regions** are parsed into `Sample::regions` and surfaced in
-the Table tab. **Multi-tape** runs are handled: each `ScreenTapeID` (kept in
+the XML. **Per-sample region bounds** are parsed into `Sample::regions` and
+surfaced in the Table tab. **Multi-tape** runs are handled: each `ScreenTapeID` (kept in
 `Sample::category`) is sized by its own ladder, with the sole ladder as a
 fallback. TapeStation exports are **read-only** — a rename cannot be written back
-(the native file is encrypted, the XML is a derived artifact), so File → Save
-reports a clear error.
+(the native file is encrypted, the XML is a derived artifact), so the GUI
+disables rename/save for these runs.
 
 **Per-point concentration/molarity are intentionally not computed.** The export
 gives concentration/molarity only per *peak* (surfaced in the Table tab), never

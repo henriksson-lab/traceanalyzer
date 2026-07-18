@@ -1,6 +1,8 @@
 APP_NAME := Trace analyzer
+APP_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 APP_BUNDLE := target/osx/$(APP_NAME).app
 APP_BINARY := target/release/traceanalyzer
+APP_UNIVERSAL_BINARY := target/osx/traceanalyzer-universal
 APP_EXE := $(APP_BUNDLE)/Contents/MacOS/traceanalyzer
 APP_PLIST := $(APP_BUNDLE)/Contents/Info.plist
 # App icon: assets/icon.svg is the source of truth; assets/icon-1024.png is the
@@ -21,7 +23,7 @@ ICONDIR := $(DATADIR)/icons/hicolor
 # StartupWMClass are all keyed to this name so the desktop finds the icon.
 LINUX_APP_ID := traceanalyzer
 
-.PHONY: osx-app clean-osx-app install uninstall
+.PHONY: osx-app osx-app-universal osx-bundle clean-osx-app install uninstall
 
 # Install the release binary, the .desktop entry, and the icons into a
 # freedesktop layout. Uses the scalable SVG (any size, no rasterizer needed)
@@ -48,8 +50,23 @@ uninstall:
 # --- macOS .app bundle ------------------------------------------------------
 osx-app:
 	cargo build -p traceanalyzer --release
+	$(MAKE) osx-bundle APP_BUNDLE_BINARY="$(APP_BINARY)"
+
+osx-app-universal:
+	rustup target add x86_64-apple-darwin aarch64-apple-darwin
+	cargo build -p traceanalyzer --release --target x86_64-apple-darwin
+	cargo build -p traceanalyzer --release --target aarch64-apple-darwin
+	mkdir -p target/osx
+	lipo -create \
+		target/x86_64-apple-darwin/release/traceanalyzer \
+		target/aarch64-apple-darwin/release/traceanalyzer \
+		-output "$(APP_UNIVERSAL_BINARY)"
+	lipo -verify_arch x86_64 arm64 "$(APP_UNIVERSAL_BINARY)"
+	$(MAKE) osx-bundle APP_BUNDLE_BINARY="$(APP_UNIVERSAL_BINARY)"
+
+osx-bundle:
 	mkdir -p "$(APP_BUNDLE)/Contents/MacOS" "$(APP_BUNDLE)/Contents/Resources" "$(APP_ICONSET)"
-	cp "$(APP_BINARY)" "$(APP_EXE)"
+	cp "$(APP_BUNDLE_BINARY)" "$(APP_EXE)"
 	chmod +x "$(APP_EXE)"
 	set -e; for pair in "16 icon_16x16" "32 icon_16x16@2x" "32 icon_32x32" \
 		"64 icon_32x32@2x" "128 icon_128x128" "256 icon_128x128@2x" \
@@ -81,9 +98,9 @@ osx-app:
 		'  <key>CFBundlePackageType</key>' \
 		'  <string>APPL</string>' \
 		'  <key>CFBundleShortVersionString</key>' \
-		'  <string>0.1.0</string>' \
+		'  <string>$(APP_VERSION)</string>' \
 		'  <key>CFBundleVersion</key>' \
-		'  <string>0.1.0</string>' \
+		'  <string>$(APP_VERSION)</string>' \
 		'  <key>LSMinimumSystemVersion</key>' \
 		'  <string>11.0</string>' \
 		'  <key>NSHighResolutionCapable</key>' \
@@ -94,4 +111,4 @@ osx-app:
 	@printf 'Built %s\n' "$(APP_BUNDLE)"
 
 clean-osx-app:
-	rm -rf "$(APP_BUNDLE)" "$(APP_ICONSET)"
+	rm -rf "$(APP_BUNDLE)" "$(APP_ICONSET)" "$(APP_UNIVERSAL_BINARY)"

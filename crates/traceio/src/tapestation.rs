@@ -75,14 +75,22 @@ pub fn read_tapestation(path: &Path) -> Result<Electrophoresis> {
 /// Given either export file, return `(xml_path, csv_path)`. The CSV is optional
 /// (metadata still loads without a trace).
 fn resolve_pair(path: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let lower = name.to_ascii_lowercase();
     if lower.ends_with("_electropherogram.csv") || lower.ends_with("_electropherogram.csv.gz") {
         // CSV given: derive the .xml stem by stripping the suffix.
         let gz = lower.ends_with(".gz");
-        let base = &name[..name.len() - if gz { "_Electropherogram.csv.gz".len() } else { "_Electropherogram.csv".len() }];
+        let base = &name[..name.len()
+            - if gz {
+                "_Electropherogram.csv.gz".len()
+            } else {
+                "_Electropherogram.csv".len()
+            }];
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let xml = first_existing(dir, base, &[".xml", ".xml.gz"])
+        let xml = first_existing(dir, base, &[".xml", ".xml.gz"])?
             .ok_or_else(|| anyhow!("no metadata .xml next to {}", path.display()))?;
         return Ok((xml, Some(path.to_path_buf())));
     }
@@ -90,12 +98,52 @@ fn resolve_pair(path: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
     let gz = lower.ends_with(".xml.gz");
     let base = &name[..name.len() - if gz { ".xml.gz".len() } else { ".xml".len() }];
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let csv = first_existing(dir, base, &["_Electropherogram.csv", "_Electropherogram.csv.gz"]);
+    let csv = first_existing(
+        dir,
+        base,
+        &["_Electropherogram.csv", "_Electropherogram.csv.gz"],
+    )?;
     Ok((path.to_path_buf(), csv))
 }
 
-fn first_existing(dir: &Path, base: &str, suffixes: &[&str]) -> Option<PathBuf> {
-    suffixes.iter().map(|s| dir.join(format!("{base}{s}"))).find(|p| p.exists())
+fn first_existing(dir: &Path, base: &str, suffixes: &[&str]) -> Result<Option<PathBuf>> {
+    for suffix in suffixes {
+        let exact = dir.join(format!("{base}{suffix}"));
+        if exact.exists() {
+            return Ok(Some(exact));
+        }
+    }
+
+    let wanted = suffixes
+        .iter()
+        .map(|s| format!("{base}{s}").to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        let Some(name) = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        else {
+            continue;
+        };
+        if wanted.iter().any(|w| w == &name) {
+            matches.push(path);
+        }
+    }
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => Err(anyhow!(
+            "ambiguous TapeStation sibling files for {base}: {}",
+            matches
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 /// Read a possibly gzipped file as text. XML is UTF-8; the CSV is Latin-1 — both
@@ -127,24 +175,37 @@ pub fn parse_xml(xml: &str) -> Result<Electrophoresis> {
     let assay_el = child(root, "Assay");
     let units = assay_el.and_then(|a| child(a, "Units"));
 
-    let assay_name = file_info.and_then(|f| child_text(f, "Assay")).unwrap_or_default();
+    let assay_name = file_info
+        .and_then(|f| child_text(f, "Assay"))
+        .unwrap_or_default();
     let length_unit = units
         .and_then(|u| child_text(u, "MolecularWeightUnit"))
         .unwrap_or_else(|| "bp".to_string());
-    let concentration_unit = units.and_then(|u| child_text(u, "ConcentrationUnit")).unwrap_or_default();
+    let concentration_unit = units
+        .and_then(|u| child_text(u, "ConcentrationUnit"))
+        .unwrap_or_default();
     // Molarity unit is in the XML (`MolarityUnit`); fall back to the bioanalyzeR
     // mapping from the concentration unit if it is absent.
-    let molarity_unit = units.and_then(|u| child_text(u, "MolarityUnit")).or_else(|| {
-        match concentration_unit.as_str() {
+    let molarity_unit = units
+        .and_then(|u| child_text(u, "MolarityUnit"))
+        .or_else(|| match concentration_unit.as_str() {
             "ng/µl" | "ng/ul" => Some("nM".to_string()),
             "pg/µl" | "pg/ul" => Some("pM".to_string()),
             _ => None,
-        }
-    });
-    let assay_type = if assay_name.to_ascii_uppercase().contains("RNA") { "RNA" } else { "DNA" };
+        });
+    let assay_type = if assay_name.to_ascii_uppercase().contains("RNA") {
+        "RNA"
+    } else {
+        "DNA"
+    };
 
     let samples: Vec<Sample> = child(root, "Samples")
-        .map(|s| s.children().filter(Node::is_element).map(parse_sample).collect())
+        .map(|s| {
+            s.children()
+                .filter(Node::is_element)
+                .map(parse_sample)
+                .collect()
+        })
         .unwrap_or_default();
 
     let has_upper_marker = samples
@@ -153,8 +214,12 @@ pub fn parse_xml(xml: &str) -> Result<Electrophoresis> {
         .any(|p| UPPER_MARKER_NAMES.contains(&p.observations.as_str()));
 
     let assay = AssayInfo {
-        file_name: file_info.and_then(|f| child_text(f, "FileName")).unwrap_or_default(),
-        creation_date: file_info.and_then(|f| child_text(f, "RunEndDate")).unwrap_or_default(),
+        file_name: file_info
+            .and_then(|f| child_text(f, "FileName"))
+            .unwrap_or_default(),
+        creation_date: file_info
+            .and_then(|f| child_text(f, "RunEndDate"))
+            .unwrap_or_default(),
         assay_name,
         assay_type: assay_type.to_string(),
         length_unit,
@@ -163,7 +228,12 @@ pub fn parse_xml(xml: &str) -> Result<Electrophoresis> {
         has_upper_marker,
     };
 
-    Ok(Electrophoresis { assay, ladder_peaks: Vec::new(), regions: Vec::new(), samples })
+    Ok(Electrophoresis {
+        assay,
+        ladder_peaks: Vec::new(),
+        regions: Vec::new(),
+        samples,
+    })
 }
 
 fn parse_sample(node: Node) -> Sample {
@@ -171,15 +241,29 @@ fn parse_sample(node: Node) -> Sample {
     let observations = child_text(node, "Observations").unwrap_or_default();
     let well_label = child_text(node, "WellNumber").unwrap_or_default();
     // Integrity number: RINe (RNA) or DIN (gDNA); first finite one wins.
-    let rine = child(node, "RNA").map(|r| child_num(r, "RINe")).unwrap_or(f64::NAN);
-    let rin = [rine, child_num(node, "DIN")].into_iter().find(|v| v.is_finite());
+    let rine = child(node, "RNA")
+        .map(|r| child_num(r, "RINe"))
+        .unwrap_or(f64::NAN);
+    let rin = [rine, child_num(node, "DIN")]
+        .into_iter()
+        .find(|v| v.is_finite());
 
     let peaks = child(node, "Peaks")
-        .map(|p| p.children().filter(Node::is_element).map(parse_peak).collect())
+        .map(|p| {
+            p.children()
+                .filter(Node::is_element)
+                .map(parse_peak)
+                .collect()
+        })
         .unwrap_or_default();
     // Per-sample smear-analysis regions.
     let regions: Vec<Region> = child(node, "Regions")
-        .map(|r| r.children().filter(Node::is_element).map(parse_region).collect())
+        .map(|r| {
+            r.children()
+                .filter(Node::is_element)
+                .map(parse_region)
+                .collect()
+        })
         .unwrap_or_default();
     // ScreenTapeID groups which ladder calibrates which samples; stashed in
     // `category` (otherwise unused) so `calibrate` can size per tape.
@@ -248,7 +332,11 @@ fn attach_traces(run: &mut Electrophoresis, csv: &str) {
     let mut lines = csv.lines().filter(|l| !l.trim().is_empty());
     let Some(_header) = lines.next() else { return };
     let rows: Vec<Vec<f32>> = lines
-        .map(|l| l.split(',').map(|c| c.trim().parse::<f32>().unwrap_or(f32::NAN)).collect())
+        .map(|l| {
+            l.split(',')
+                .map(|c| c.trim().parse::<f32>().unwrap_or(f32::NAN))
+                .collect()
+        })
         .collect();
     let n = rows.len();
     if n == 0 {
@@ -262,7 +350,10 @@ fn attach_traces(run: &mut Electrophoresis, csv: &str) {
             break;
         }
         sample.time = distance.clone();
-        sample.fluorescence = rows.iter().map(|r| r.get(col).copied().unwrap_or(f32::NAN)).collect();
+        sample.fluorescence = rows
+            .iter()
+            .map(|r| r.get(col).copied().unwrap_or(f32::NAN))
+            .collect();
     }
 }
 
@@ -364,7 +455,8 @@ fn well_to_number(well: &str) -> i32 {
 }
 
 fn child<'a, 'i>(node: Node<'a, 'i>, tag: &str) -> Option<Node<'a, 'i>> {
-    node.children().find(|c| c.is_element() && c.has_tag_name(tag))
+    node.children()
+        .find(|c| c.is_element() && c.has_tag_name(tag))
 }
 
 fn child_text(node: Node, tag: &str) -> Option<String> {
@@ -485,10 +577,43 @@ mod tests {
         // Row 5 sits at distance 0.50 = the ladder's 500 bp band, so both the
         // ladder and the sample (shared markers → shared curve) size there to
         // ~500 bp. The Hyman spline passes exactly through the node.
-        assert!((run.samples[0].length[5] - 500.0).abs() < 1.0, "ladder: {}", run.samples[0].length[5]);
-        assert!((run.samples[1].length[5] - 500.0).abs() < 1.0, "sample: {}", run.samples[1].length[5]);
+        assert!(
+            (run.samples[0].length[5] - 500.0).abs() < 1.0,
+            "ladder: {}",
+            run.samples[0].length[5]
+        );
+        assert!(
+            (run.samples[1].length[5] - 500.0).abs() < 1.0,
+            "sample: {}",
+            run.samples[1].length[5]
+        );
 
         // Points beyond the markers are uncalibrated (NaN), like the Bioanalyzer.
-        assert!(run.samples[0].length[0].is_nan(), "distance 1.0 is past the lower marker");
+        assert!(
+            run.samples[0].length[0].is_nan(),
+            "distance 1.0 is past the lower marker"
+        );
+    }
+
+    #[test]
+    fn pair_resolution_accepts_case_variant_electropherogram_suffix() {
+        let dir = std::env::temp_dir().join(format!(
+            "traceio_tapestation_pair_case_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let xml_path = dir.join("run.xml");
+        let csv_path = dir.join("run_electropherogram.csv");
+        std::fs::write(&xml_path, xml()).unwrap();
+        std::fs::write(&csv_path, csv()).unwrap();
+
+        let (_, found_csv) = resolve_pair(&xml_path).unwrap();
+
+        assert_eq!(found_csv, Some(csv_path));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

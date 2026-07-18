@@ -13,7 +13,7 @@ No hardware control yet; this sofware only reads and analyses saved runs.
 | Platform | Native format | Status |
 |---|---|---|
 | **Bioanalyzer 2100** | `.xad` | Native `.xad` opens as raw detector channels + metadata; exported `.xml`/`.xml.gz` opens with processed traces, peaks, sizing, concentration, molarity, and RIN. |
-| **TapeStation** | `.D1000`/… (encrypted ZIP) | Not started. Planned via XML + unaligned-CSV export. |
+| **TapeStation** | `.D1000`/… (encrypted ZIP) | Native project files are encrypted; exported `.xml` + `_Electropherogram.csv` pairs open with traces, peaks, sizing, per-peak quantities, integrity values, and region bounds. |
 | **Fragment Analyzer** | `.raw` + `.PKS` sidecars | Partial native reader: `.raw` CCD traces, `.txt` well/sample names, `.PKS` size anchors and peak tables. Concentration/molarity are not yet decoded from `.PKS`. |
 
 **A note on Bioanalyzer `.xad` files:** a native `.xad` stores the **raw
@@ -29,7 +29,7 @@ raw `.xad` is [on the roadmap](docs/architecture.md#roadmap).
 Requires a [Rust toolchain](https://rustup.rs). Build and open a file with:
 
 ```sh
-# GUI viewer — accepts .xad (native raw channels), .xml, and .xml.gz:
+# GUI viewer — accepts .xad (native raw channels), .xml/.xml.gz, TapeStation CSV, FA .zip/.raw:
 cargo run -p traceanalyzer -- path/to/run.xad
 ```
 
@@ -48,7 +48,7 @@ prerequisites, headless use, and the command-line `inspect` tool.
 
 CI builds downloadable artifacts for Windows and macOS on pushes, pull requests,
 tags, and manual workflow runs. Windows is packaged as a single `.exe`; macOS is
-packaged as a `.app` bundle.
+packaged as a universal Intel + Apple Silicon `.app` bundle.
 
 **Linux** — install the release binary, a `.desktop` launcher entry, and the app
 icons into a standard [freedesktop](https://specifications.freedesktop.org)
@@ -67,6 +67,7 @@ into a build root with `DESTDIR`. At runtime the GUI needs X11/Wayland plus GTK
 
 ```sh
 make osx-app                     # → target/osx/Trace analyzer.app
+make osx-app-universal           # Intel + Apple Silicon bundle
 ```
 
 ## Documentation

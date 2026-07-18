@@ -46,6 +46,11 @@ pub fn save_run(run: &Electrophoresis, src: &Path, dst: &Path) -> Result<()> {
         }
         return crate::fa::save_txt_names(src, run);
     }
+    if crate::tapestation::is_tapestation_path(src) {
+        return Err(anyhow!(
+            "TapeStation exports are read-only; sample renames cannot be saved back"
+        ));
+    }
 
     let dst_kind = classify(dst)
         .ok_or_else(|| anyhow!("unsupported output extension for {}", dst.display()))?;
@@ -340,6 +345,29 @@ mod tests {
         assert!(patched.contains("Sample ID: plain"));
         assert!(!patched.contains("Sample ID: old\n"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tapestation_csv_save_is_rejected_as_read_only() {
+        let run = Electrophoresis {
+            assay: Default::default(),
+            ladder_peaks: vec![],
+            regions: vec![],
+            samples: vec![make_sample(1, "renamed")],
+        };
+
+        let err = save_run(
+            &run,
+            Path::new("run_Electropherogram.csv"),
+            Path::new("run.xml"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("TapeStation exports are read-only"),
+            "got {err}"
+        );
     }
 
     fn make_sample(well: i32, name: &str) -> crate::model::Sample {

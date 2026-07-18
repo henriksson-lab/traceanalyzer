@@ -53,11 +53,7 @@ fn main() -> anyhow::Result<()> {
     for path in &paths {
         match loading::load(path) {
             Ok(loaded) => {
-                let source = if traceio::fa::is_fa_path(path) {
-                    traceio::fa::run_identity(path)
-                } else {
-                    path.clone()
-                };
+                let source = source_identity(path);
                 if let Some(idx) = app.find_file_by_source(&source) {
                     app.active = Some(idx);
                     continue;
@@ -93,7 +89,10 @@ fn main() -> anyhow::Result<()> {
         ui.on_open_file(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Electrophoresis", &["xad", "xml", "gz", "zip", "raw", "csv"])
+                .add_filter(
+                    "Electrophoresis",
+                    &["xad", "xml", "gz", "zip", "raw", "csv"],
+                )
                 .pick_file()
             {
                 open_added_file(&ui, &st, &path);
@@ -268,9 +267,9 @@ fn main() -> anyhow::Result<()> {
             let Some(ui) = ui_weak.upgrade() else { return };
             let table = {
                 let mut s = st.borrow_mut();
-                s.rename_primary(name.as_str());
+                let renamed = s.rename_primary(name.as_str());
                 let next = s.primary() + 1;
-                if next < s.entry_count() {
+                if renamed && next < s.entry_count() {
                     s.select_click(next, false, false);
                     s.set_viewport(None); // auto-fit the newly focused well
                 }
@@ -495,6 +494,9 @@ fn main() -> anyhow::Result<()> {
             let Some(ui) = ui_weak.upgrade() else { return };
             let table = {
                 let mut s = st.borrow_mut();
+                if !s.can_edit_markers() {
+                    return;
+                }
                 s.marker_edit ^= true;
                 s.set_viewport(None); // x-axis space changes
                 s.grabbed = None;
@@ -511,7 +513,7 @@ fn main() -> anyhow::Result<()> {
         let st = state.clone();
         ui.on_reset_markers(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            if st.borrow().active_file().is_none() {
+            if !st.borrow().can_edit_markers() {
                 return;
             }
             let table = {
@@ -573,15 +575,7 @@ fn main() -> anyhow::Result<()> {
 /// Open a file as a new entry in the multi-file list, make it active, and
 /// refresh the whole UI. Existing open files are kept.
 fn open_added_file(ui: &AppWindow, state: &SharedState, path: &std::path::Path) {
-    // Canonical run identity: for a Fragment Analyzer run every entry point (the
-    // `.zip`, the `.raw`, the folder, or a sibling like `.PKS`/`.txt`) maps to
-    // one identity, so a multi-file drop opens the run just once. Also drives
-    // save targeting and the tree tooltip path.
-    let source = if traceio::fa::is_fa_path(path) {
-        traceio::fa::run_identity(path)
-    } else {
-        path.to_path_buf()
-    };
+    let source = source_identity(path);
 
     // Already open? Re-activate it instead of loading a duplicate.
     if let Some(idx) = state.borrow().find_file_by_source(&source) {
@@ -615,9 +609,22 @@ fn open_added_file(ui: &AppWindow, state: &SharedState, path: &std::path::Path) 
     }
 }
 
+/// Canonical run identity used for deduplication, save targeting, and tree
+/// tooltips. Multi-file run formats map their accepted entry points to one path.
+fn source_identity(path: &std::path::Path) -> std::path::PathBuf {
+    if traceio::fa::is_fa_path(path) {
+        traceio::fa::run_identity(path)
+    } else if traceio::tapestation::is_tapestation_path(path) {
+        traceio::tapestation::run_identity(path).unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Push run-level data (title, entry list, error) into the UI and build a table update.
 fn refresh_all(ui: &AppWindow, st: &mut AppState) -> TableRefresh {
     ensure_y_mode_available(st);
+    ensure_marker_edit_available(st);
     ui.set_assay_title(SharedString::from(st.title()));
     ui.set_error_text(SharedString::from(st.error.clone().unwrap_or_default()));
     refresh_tree(ui, st);
@@ -630,6 +637,15 @@ fn refresh_all(ui: &AppWindow, st: &mut AppState) -> TableRefresh {
 fn ensure_y_mode_available(st: &mut AppState) {
     if st.active_file().is_some() && !st.y_mode.is_available(st.run()) {
         st.y_mode = YMode::Fluorescence;
+        st.set_viewport(None);
+    }
+}
+
+fn ensure_marker_edit_available(st: &mut AppState) {
+    if st.marker_edit && !st.can_edit_markers() {
+        st.marker_edit = false;
+        st.grabbed = None;
+        st.highlight_x = None;
         st.set_viewport(None);
     }
 }
@@ -651,6 +667,8 @@ fn refresh_tree(ui: &AppWindow, st: &AppState) {
     ui.set_current_index(st.primary() as i32);
     ui.set_can_rename(st.can_rename());
     ui.set_can_save(st.can_save());
+    ui.set_can_save_as(st.can_save_as());
+    ui.set_can_edit_markers(st.can_edit_markers());
     ui.set_rename_text(SharedString::from(st.primary_name()));
 }
 
@@ -930,6 +948,7 @@ fn prompt_unsaved_active(ui: &AppWindow, st: &SharedState) -> bool {
 /// Before closing one file, prompt to save its unsaved edits. Makes that file
 /// active (so Save / Save-As target it) and returns whether it may be closed.
 fn confirm_close_file(ui: &AppWindow, st: &SharedState, file_idx: usize) -> bool {
+    let previous_active = st.borrow().active;
     {
         let mut s = st.borrow_mut();
         if file_idx < s.files.len() {
@@ -939,12 +958,17 @@ fn confirm_close_file(ui: &AppWindow, st: &SharedState, file_idx: usize) -> bool
     if !st.borrow().is_dirty() {
         return true;
     }
-    prompt_unsaved_active(ui, st)
+    let confirmed = prompt_unsaved_active(ui, st);
+    if !confirmed {
+        st.borrow_mut().active = previous_active;
+    }
+    confirmed
 }
 
 /// On exit, prompt per dirty file (Save / Don't Save / Cancel). Any Cancel or a
 /// failed save aborts the whole quit and keeps the window open.
 fn confirm_exit(ui: &AppWindow, st: &SharedState) -> bool {
+    let previous_active = st.borrow().active;
     let dirty: Vec<usize> = {
         let s = st.borrow();
         (0..s.files.len()).filter(|&i| s.files[i].dirty).collect()
@@ -958,6 +982,7 @@ fn confirm_exit(ui: &AppWindow, st: &SharedState) -> bool {
             s.active = Some(idx); // target this file for the prompt/save
         }
         if !prompt_unsaved_active(ui, st) {
+            st.borrow_mut().active = previous_active;
             return false;
         }
     }
@@ -1015,7 +1040,9 @@ fn do_save(ui: &AppWindow, st: &SharedState, dst: std::path::PathBuf) {
             }
             let s = st.borrow();
             ui.set_can_save(s.can_save());
+            ui.set_can_save_as(s.can_save_as());
             ui.set_error_text(SharedString::default());
+            refresh_tree(ui, &s);
         }
         Err(e) => ui.set_error_text(SharedString::from(format!("Save failed: {e:#}"))),
     }
@@ -1117,7 +1144,7 @@ fn pan(state: &SharedState, dfx: f64, dfy: f64) {
 fn drag_marker(ui: &AppWindow, state: &SharedState, drag: MarkerDrag, dfx: f64) {
     let table = {
         let mut st = state.borrow_mut();
-        if st.active_file().is_none() {
+        if !st.can_edit_markers() {
             return;
         }
         let idx = drag.sample_idx;

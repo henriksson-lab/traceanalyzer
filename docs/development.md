@@ -19,9 +19,12 @@ cargo run -p traceanalyzer -- testdata/demo_dna1000.xml.gz
 
 # macOS app bundle:
 make osx-app
+make osx-app-universal
 ```
 
-The `inspect`/GUI loaders accept `.xad` (native), `.xml`, and `.xml.gz`.
+The `inspect`/GUI loaders accept Bioanalyzer `.xad`/`.xml`/`.xml.gz`,
+TapeStation exported XML/`_Electropherogram.csv` pairs, and Fragment Analyzer
+`.raw` files, run directories, or zipped runs.
 
 ## Testing
 

@@ -61,7 +61,7 @@ osx-app-universal:
 		target/x86_64-apple-darwin/release/traceanalyzer \
 		target/aarch64-apple-darwin/release/traceanalyzer \
 		-output "$(APP_UNIVERSAL_BINARY)"
-	lipo -verify_arch x86_64 arm64 "$(APP_UNIVERSAL_BINARY)"
+	lipo "$(APP_UNIVERSAL_BINARY)" -verify_arch x86_64 arm64
 	$(MAKE) osx-bundle APP_BUNDLE_BINARY="$(APP_UNIVERSAL_BINARY)"
 
 osx-bundle:

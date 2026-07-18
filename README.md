@@ -2,9 +2,9 @@
 
 Open-source analysis tool for data from Agilent DNA/RNA analysis instruments
 
-No hardware control yet; this sofware only reads and analyses saved runs.
+No hardware control yet; this software only reads and analyses saved runs.
 
-> **This software needs testing. Tape station support needs work. Please report other issues** 
+> **This software needs testing. TapeStation support needs work. Please report other issues**
 
 ![Trace analyzer showing a DNA 1000 ladder run — well tree, electropherogram, and per-peak sizing/concentration/molarity table](docs/screenshot.png)
 
@@ -14,7 +14,7 @@ No hardware control yet; this sofware only reads and analyses saved runs.
 |---|---|---|
 | **Bioanalyzer 2100** | `.xad` | Native `.xad` opens as raw detector channels + metadata; exported `.xml`/`.xml.gz` opens with processed traces, peaks, sizing, concentration, molarity, and RIN. |
 | **TapeStation** | `.D1000`/… (encrypted ZIP) | Native project files are encrypted; exported `.xml` + `_Electropherogram.csv` pairs open with traces, peaks, sizing, per-peak quantities, integrity values, and region bounds. |
-| **Fragment Analyzer** | `.raw` + `.PKS` sidecars | Partial native reader: `.raw` CCD traces, `.txt` well/sample names, `.PKS` size anchors and peak tables. Concentration/molarity are not yet decoded from `.PKS`. |
+| **Fragment Analyzer** | `.raw` + `.PKS` sidecars | Partial native reader: `.raw` CCD traces, `.txt` well/sample names, `.PKS` size anchors and peak tables. Concentration/molarity are computed from the standard ladder setpoints and decoded peak areas. |
 
 **A note on Bioanalyzer `.xad` files:** a native `.xad` stores the **raw
 detector signal and sample metadata only**. 2100 Expert recomputes the processed

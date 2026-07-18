@@ -215,13 +215,14 @@ fn name_edit(name_elem: Node, escaped: String) -> Option<Edit> {
     let r = name_elem.range();
     let slice = name_elem.document().input_text().get(r.start..r.end)?;
     let gt = slice.find('>')?; // end of the opening tag
-    let self_closing = slice.as_bytes().get(gt.wrapping_sub(1)) == Some(&b'/');
+    let self_closing = slice[..gt].trim_end().ends_with('/');
     if self_closing {
-        // Replace `<Name/>` wholesale with `<Name>text</Name>`.
+        // Replace `<Name/>` / `<Name attr="..."/>` while preserving attributes.
+        let opening = slice[..gt].trim_end().trim_end_matches('/').trim_end();
         Some(Edit {
             start: r.start,
             end: r.end,
-            text: format!("<Name>{escaped}</Name>"),
+            text: format!("{opening}>{escaped}</Name>"),
         })
     } else {
         // Insert between `<Name>` and `</Name>` (inner span is empty).
@@ -309,6 +310,28 @@ mod tests {
         };
         let out = patch_names(xml, &run).unwrap();
         assert!(out.contains("<Name>filled</Name>"), "got: {out}");
+    }
+
+    #[test]
+    fn fills_self_closing_name_elements_with_spacing_or_attributes() {
+        let xml = "<Chipset><Chips><Chip><Files><File><Samples>\
+            <Sample><Name /><WellNumber>3</WellNumber></Sample>\
+            <Sample><Name kind=\"sample\" /><WellNumber>4</WellNumber></Sample>\
+            </Samples></File></Files></Chip></Chips></Chipset>";
+        let run = Electrophoresis {
+            assay: Default::default(),
+            ladder_peaks: vec![],
+            regions: vec![],
+            samples: vec![make_sample(3, "first"), make_sample(4, "second")],
+        };
+
+        let out = patch_names(xml, &run).unwrap();
+
+        assert!(out.contains("<Name>first</Name>"), "got: {out}");
+        assert!(
+            out.contains("<Name kind=\"sample\">second</Name>"),
+            "attributes on empty Name are preserved: {out}"
+        );
     }
 
     #[test]

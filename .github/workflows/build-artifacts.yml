@@ -18,8 +18,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  checks:
+    name: Tests and package checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Headless GUI render test
+        run: cargo test -p traceanalyzer --test headless_render
+
+      - name: Package traceio
+        run: cargo package -p traceio --allow-dirty
+
   windows-exe:
     name: Windows executable
+    needs: checks
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -47,6 +64,7 @@ jobs:
 
   macos-app:
     name: macOS app bundle (universal)
+    needs: checks
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -59,7 +77,7 @@ jobs:
         run: make osx-app-universal
 
       - name: Verify universal binary
-        run: lipo -verify_arch x86_64 arm64 "target/osx/Trace analyzer.app/Contents/MacOS/traceanalyzer"
+        run: lipo "target/osx/Trace analyzer.app/Contents/MacOS/traceanalyzer" -verify_arch x86_64 arm64
 
       - name: Package
         run: ditto -c -k --sequesterRsrc --keepParent "target/osx/Trace analyzer.app" trace-analyzer-macos-universal.zip

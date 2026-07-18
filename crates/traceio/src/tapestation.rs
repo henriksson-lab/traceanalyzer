@@ -19,7 +19,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use roxmltree::{Document, Node};
 
 use crate::calibration::StandardCurve;
@@ -72,6 +72,12 @@ pub fn read_tapestation(path: &Path) -> Result<Electrophoresis> {
     Ok(run)
 }
 
+/// Canonical identity for a TapeStation export pair. Both the metadata XML and
+/// `_Electropherogram.csv` entry point identify the metadata XML.
+pub fn run_identity(path: &Path) -> Result<PathBuf> {
+    resolve_pair(path).map(|(xml, _)| xml)
+}
+
 /// Given either export file, return `(xml_path, csv_path)`. The CSV is optional
 /// (metadata still loads without a trace).
 fn resolve_pair(path: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
@@ -96,6 +102,12 @@ fn resolve_pair(path: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
     }
     // XML given: derive the electropherogram CSV.
     let gz = lower.ends_with(".xml.gz");
+    if !gz && !lower.ends_with(".xml") {
+        bail!(
+            "unsupported TapeStation export extension for {}",
+            path.display()
+        );
+    }
     let base = &name[..name.len() - if gz { ".xml.gz".len() } else { ".xml".len() }];
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let csv = first_existing(
@@ -615,5 +627,15 @@ mod tests {
 
         assert_eq!(found_csv, Some(csv_path));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pair_resolution_rejects_unsupported_extension() {
+        let err = resolve_pair(Path::new("run.txt")).unwrap_err().to_string();
+
+        assert!(
+            err.contains("unsupported TapeStation export extension"),
+            "got {err}"
+        );
     }
 }

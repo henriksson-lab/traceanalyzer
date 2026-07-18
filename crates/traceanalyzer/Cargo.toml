@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 description = "Trace analyzer: open-source post-measurement analysis for automated electrophoresis (Bioanalyzer/TapeStation/Fragment Analyzer)"
 
 [dependencies]

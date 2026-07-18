@@ -192,8 +192,7 @@ pub fn save_txt_names(path: &Path, run: &Electrophoresis) -> Result<()> {
             txt_path.display()
         );
     }
-    std::fs::write(&txt_path, patched.as_bytes())
-        .with_context(|| format!("writing {}", txt_path.display()))?;
+    write_file_atomic(&txt_path, patched.as_bytes())?;
     Ok(())
 }
 
@@ -283,7 +282,7 @@ fn save_txt_names_zip(path: &Path, run: &Electrophoresis) -> Result<()> {
 /// such a directory (so dropping a run's `.PKS`/`.txt`/etc. opens the run).
 pub fn is_fa_path(path: &Path) -> bool {
     if path.is_dir() {
-        return find_raw_in_dir(path).is_some();
+        return matches!(find_raw_in_dir(path), Ok(Some(_)));
     }
     if has_zip_extension(path) {
         return zip_has_fa_raw(path);
@@ -297,7 +296,7 @@ pub fn is_fa_path(path: &Path) -> bool {
     if is_bioanalyzer_ext(path) {
         return false;
     }
-    parent_dir(path).is_some_and(|p| find_raw_in_dir(p).is_some())
+    parent_dir(path).is_some_and(|p| matches!(find_raw_in_dir(p), Ok(Some(_))))
 }
 
 /// Canonical identity of an FA run for any path `is_fa_path` accepts: the `.zip`
@@ -410,6 +409,19 @@ fn create_unique_temp_file(dst: &Path) -> Result<(PathBuf, std::fs::File)> {
         "could not allocate unique temp path next to {}",
         dst.display()
     ))
+}
+
+fn write_file_atomic(dst: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let (tmp, mut out) = create_unique_temp_file(dst)?;
+    out.write_all(contents)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    out.sync_all()
+        .with_context(|| format!("syncing {}", tmp.display()))?;
+    drop(out);
+    replace_file(&tmp, dst)?;
+    Ok(())
 }
 
 fn replace_file(tmp: &Path, dst: &Path) -> Result<()> {
@@ -535,26 +547,47 @@ fn basename(name: &str) -> &str {
 
 fn resolve_raw_path(path: &Path) -> Result<PathBuf> {
     if path.is_dir() {
-        return find_raw_in_dir(path)
+        return find_raw_in_dir(path)?
             .ok_or_else(|| anyhow!("no .raw file found in FA run dir {}", path.display()));
     }
     if has_raw_extension(path) {
         return Ok(path.to_path_buf());
     }
     // A sibling member of the run (e.g. `.PKS`/`.txt`): use its folder's `.raw`.
-    if let Some(raw) = parent_dir(path).and_then(find_raw_in_dir) {
-        return Ok(raw);
+    if let Some(parent) = parent_dir(path) {
+        if let Some(raw) = find_raw_in_dir(parent)? {
+            return Ok(raw);
+        }
     }
     Ok(path.to_path_buf())
 }
 
-fn find_raw_in_dir(dir: &Path) -> Option<PathBuf> {
-    let mut buf = [0u8; 4];
-    std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| has_raw_extension(p) && read_prefix(p, &mut buf).is_ok() && buf == RAW_MAGIC)
+fn find_raw_in_dir(dir: &Path) -> Result<Option<PathBuf>> {
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        if !has_raw_extension(&path) {
+            continue;
+        }
+        let mut buf = [0u8; 4];
+        if read_prefix(&path, &mut buf).is_ok() && buf == RAW_MAGIC {
+            matches.push(path);
+        }
+    }
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => Err(anyhow!(
+            "ambiguous FA .raw files in {}: {}",
+            dir.display(),
+            matches
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 fn has_raw_extension(path: &Path) -> bool {
@@ -1245,6 +1278,26 @@ mod tests {
 
         assert_eq!(run.samples[0].name, "D1: alpha");
         assert_eq!(run.samples[1].name, "D2: beta");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn filesystem_raw_ambiguity_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "traceio_fa_raw_ambiguous_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.raw"), b"FA\0\0").unwrap();
+        std::fs::write(dir.join("b.RAW"), b"FA\0\0").unwrap();
+
+        let err = resolve_raw_path(&dir).unwrap_err().to_string();
+
+        assert!(err.contains("ambiguous FA .raw files"), "got {err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

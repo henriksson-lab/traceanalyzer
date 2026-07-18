@@ -398,7 +398,14 @@ impl AppState {
     /// none. Shown as the tree file-node tooltip.
     pub fn file_path(&self) -> String {
         self.active_file()
-            .map(|f| f.run.assay.file_name.clone())
+            .and_then(|f| {
+                f.source_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .or_else(|| {
+                        (!f.run.assay.file_name.is_empty()).then(|| f.run.assay.file_name.clone())
+                    })
+            })
             .unwrap_or_default()
     }
 
@@ -440,7 +447,12 @@ impl AppState {
             t.is_file.push(true);
             t.file_index.push(fi as i32);
             t.file_expanded.push(f.expanded);
-            t.file_path.push(f.run.assay.file_name.clone());
+            t.file_path.push(
+                f.source_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| f.run.assay.file_name.clone()),
+            );
             t.selected.push(false);
             if !f.expanded {
                 continue;
@@ -572,6 +584,22 @@ impl AppState {
     pub fn can_save(&self) -> bool {
         self.active_file()
             .is_some_and(|f| f.source_path.is_some() && !f.tapestation_mode())
+    }
+
+    /// Whether the active file can be saved to a new Bioanalyzer XML file.
+    pub fn can_save_as(&self) -> bool {
+        self.active_file().is_some_and(|f| {
+            f.source_path.is_some()
+                && !f.raw_mode()
+                && !f.fragment_analyzer_mode()
+                && !f.tapestation_mode()
+        })
+    }
+
+    /// Whether marker override editing is meaningful for the active file.
+    pub fn can_edit_markers(&self) -> bool {
+        self.active_file()
+            .is_some_and(|f| !f.raw_mode() && !f.fragment_analyzer_mode() && !f.tapestation_mode())
     }
 
     /// True when the active file is a native Fragment Analyzer run.
@@ -832,9 +860,24 @@ mod tests {
 
         assert!(st.can_rename());
         assert!(st.can_save());
+        assert!(st.can_save_as());
+        assert!(st.can_edit_markers());
         assert!(st.rename_primary("A1"));
         assert!(st.is_dirty());
         assert_eq!(st.primary_name(), "A1");
+    }
+
+    #[test]
+    fn file_path_prefers_loaded_source_path() {
+        let st = AppState::new(
+            run_named("exported-name.xml", 0),
+            Vec::new(),
+            Some(PathBuf::from("/actual/source.xml")),
+            None,
+        );
+
+        assert_eq!(st.file_path(), "/actual/source.xml");
+        assert_eq!(st.tree_rows().file_path[0], "/actual/source.xml");
     }
 
     #[test]
@@ -844,6 +887,8 @@ mod tests {
         assert!(st.fragment_analyzer_mode());
         assert!(st.can_rename());
         assert!(st.can_save());
+        assert!(!st.can_save_as());
+        assert!(!st.can_edit_markers());
         assert!(st.rename_primary("A1"));
         assert!(st.is_dirty());
         assert_eq!(st.run().samples[0].name, "A1");
@@ -861,6 +906,7 @@ mod tests {
         assert!(st.fragment_analyzer_mode());
         assert!(st.can_rename());
         assert!(st.can_save());
+        assert!(!st.can_save_as());
         assert!(st.rename_primary("A1"));
         assert!(st.is_dirty());
     }
@@ -871,6 +917,8 @@ mod tests {
 
         assert!(!st.can_rename());
         assert!(!st.can_save());
+        assert!(!st.can_save_as());
+        assert!(!st.can_edit_markers());
         assert!(!st.rename_primary("A1"));
         assert!(!st.is_dirty());
     }
@@ -883,6 +931,8 @@ mod tests {
 
         assert!(!st.can_rename());
         assert!(!st.can_save());
+        assert!(!st.can_save_as());
+        assert!(!st.can_edit_markers());
         assert!(!st.rename_primary("A1"));
         assert!(!st.is_dirty());
     }

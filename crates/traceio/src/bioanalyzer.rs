@@ -52,8 +52,8 @@ fn parse_assay_info(chip: Node) -> AssayInfo {
     // Hardcode molarity unit from concentration unit, matching bioanalyzeR:
     // otherwise the molecular-weight scales would be wrong.
     let molarity_unit = match concentration_unit.as_str() {
-        "ng/µl" => Some("nM".to_string()),
-        "pg/µl" => Some("pM".to_string()),
+        "ng/µl" | "ng/ul" => Some("nM".to_string()),
+        "pg/µl" | "pg/ul" => Some("pM".to_string()),
         _ => None,
     };
     let has_upper_marker = descend(

@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 #
-# Package the release `traceanalyzer` binary into a macOS `.app` bundle,
-# and optionally a distributable `.dmg`.
+# Compatibility wrapper for the Makefile macOS bundle target.
 #
-# Output goes to `dist/` at the repo root (git-ignored). The script is
-# idempotent: it rebuilds the bundle from scratch on each run.
+# Output is copied to `dist/` at the repo root (git-ignored). The canonical app
+# bundle is `target/osx/Trace analyzer.app`.
 #
 # Usage:
 #   bash scripts/build-macos-app.sh            # build the .app
@@ -16,10 +15,8 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 
-app_name="traceanalyzer"
-bundle_id="org.traceanalyzer.app"
-version="0.1.0"   # keep in sync with [workspace.package] version in Cargo.toml
-min_macos="11.0"
+app_name="Trace analyzer"
+version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_root/Cargo.toml" | head -n 1)"
 
 make_dmg=false
 for arg in "$@"; do
@@ -42,90 +39,19 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 dist_dir="$repo_root/dist"
-app_dir="$dist_dir/$app_name.app"
-macos_dir="$app_dir/Contents/MacOS"
-resources_dir="$app_dir/Contents/Resources"
-binary="$repo_root/target/release/$app_name"
+app_dir="$repo_root/target/osx/$app_name.app"
+dist_app_dir="$dist_dir/$app_name.app"
 
-echo "==> Building release binary ($app_name)"
-( cd "$repo_root" && cargo build --release -p "$app_name" )
+echo "==> Building $app_name.app"
+( cd "$repo_root" && make osx-app )
 
-if [ ! -x "$binary" ]; then
-  echo "ERROR: expected binary not found at $binary" >&2
-  exit 1
-fi
-
-echo "==> Assembling $app_name.app"
-rm -rf "$app_dir"
-mkdir -p "$macos_dir" "$resources_dir"
-cp "$binary" "$macos_dir/$app_name"
-chmod +x "$macos_dir/$app_name"
-
-# --- App icon -------------------------------------------------------------
-# There is currently no app icon. If/when one is added, drop an .icns file at
-# Resources/$app_name.icns and uncomment the CFBundleIconFile entry in the
-# Info.plist below. Do NOT fabricate binary icon assets here.
-# TODO: add Resources/traceanalyzer.icns and reference it via CFBundleIconFile.
-icon_plist_entry=""
-if [ -f "$repo_root/scripts/$app_name.icns" ]; then
-  cp "$repo_root/scripts/$app_name.icns" "$resources_dir/$app_name.icns"
-  icon_plist_entry="	<key>CFBundleIconFile</key>
-	<string>$app_name.icns</string>
-"
-  echo "    bundled icon: $app_name.icns"
-else
-  echo "    no icon found (skipping; see TODO in script)"
-fi
-
-echo "==> Writing Info.plist"
-cat > "$app_dir/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>CFBundleName</key>
-	<string>$app_name</string>
-	<key>CFBundleDisplayName</key>
-	<string>$app_name</string>
-	<key>CFBundleIdentifier</key>
-	<string>$bundle_id</string>
-	<key>CFBundleExecutable</key>
-	<string>$app_name</string>
-	<key>CFBundleVersion</key>
-	<string>$version</string>
-	<key>CFBundleShortVersionString</key>
-	<string>$version</string>
-	<key>CFBundlePackageType</key>
-	<string>APPL</string>
-	<key>CFBundleInfoDictionaryVersion</key>
-	<string>6.0</string>
-	<key>LSMinimumSystemVersion</key>
-	<string>$min_macos</string>
-	<key>NSHighResolutionCapable</key>
-	<true/>
-${icon_plist_entry}	<key>CFBundleDocumentTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleTypeName</key>
-			<string>Electrophoresis trace</string>
-			<key>CFBundleTypeRole</key>
-			<string>Viewer</string>
-			<key>LSHandlerRank</key>
-			<string>Owner</string>
-			<key>CFBundleTypeExtensions</key>
-			<array>
-				<string>xad</string>
-				<string>xml</string>
-				<string>xml.gz</string>
-			</array>
-		</dict>
-	</array>
-</dict>
-</plist>
-PLIST
+echo "==> Copying app bundle to dist/"
+rm -rf "$dist_app_dir"
+mkdir -p "$dist_dir"
+ditto "$app_dir" "$dist_app_dir"
 
 # Blank the extended-attribute quarantine flag if present (best-effort).
-xattr -cr "$app_dir" 2>/dev/null || true
+xattr -cr "$dist_app_dir" 2>/dev/null || true
 
 # --- Code signing (not performed) -----------------------------------------
 # This bundle is unsigned and un-notarized; Gatekeeper will warn on first run.
@@ -135,20 +61,20 @@ xattr -cr "$app_dir" 2>/dev/null || true
 # followed by notarization via `xcrun notarytool submit`.
 
 if command -v plutil >/dev/null 2>&1; then
-  plutil -lint "$app_dir/Contents/Info.plist" >/dev/null
+  plutil -lint "$dist_app_dir/Contents/Info.plist" >/dev/null
   echo "    Info.plist validated (plutil -lint)"
 fi
 
-echo "ok     $app_dir"
+echo "ok     $dist_app_dir"
 
 if [ "$make_dmg" = true ]; then
   if command -v hdiutil >/dev/null 2>&1; then
-    dmg_path="$dist_dir/$app_name-$version.dmg"
+    dmg_path="$dist_dir/trace-analyzer-$version.dmg"
     echo "==> Building $app_name-$version.dmg"
     rm -f "$dmg_path"
     hdiutil create \
       -volname "$app_name" \
-      -srcfolder "$app_dir" \
+      -srcfolder "$dist_app_dir" \
       -ov -format UDZO \
       "$dmg_path" >/dev/null
     echo "ok     $dmg_path"

@@ -60,7 +60,9 @@ pub fn load(path: &Path) -> Result<Loaded> {
 }
 
 fn is_xad_path(path: &Path) -> bool {
-    path.to_string_lossy().ends_with(".xad")
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|n| n.ends_with(".xad"))
 }
 
 fn read_xad_raw_channels_with_warning(
@@ -102,7 +104,10 @@ pub fn recalibrate_with(
 }
 
 fn parse(path: &Path) -> Result<Electrophoresis> {
-    let name = path.to_string_lossy();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
     if name.ends_with(".xad") {
         Ok(traceio::xad::read_xad_file(path)?)
     } else if name.ends_with(".xml.gz") {
@@ -141,5 +146,6 @@ mod tests {
         assert!(!is_xad_path(Path::new("run.xml")));
         assert!(!is_xad_path(Path::new("run.xml.gz")));
         assert!(is_xad_path(Path::new("run.xad")));
+        assert!(is_xad_path(Path::new("RUN.XAD")));
     }
 }

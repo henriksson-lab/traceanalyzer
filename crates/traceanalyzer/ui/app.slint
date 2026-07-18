@@ -26,6 +26,8 @@ export component AppWindow inherits Window {
     in-out property <string> rename-text;
     in property <bool> can-rename: false;
     in property <bool> can-save: false;
+    in property <bool> can-save-as: false;
+    in property <bool> can-edit-markers: false;
     in property <string> sample-info: "";
     // Y-axis mode: options for the dropdown and the currently selected index.
     in property <[string]> y-mode-options;
@@ -115,7 +117,7 @@ export component AppWindow inherits Window {
             }
             MenuItem {
                 title: "Save As…";
-                enabled: root.can-save;
+                enabled: root.can-save-as;
                 shortcut: @keys(Control + Shift + S);
                 activated => { root.save-file-as(); }
             }
@@ -365,10 +367,11 @@ export component AppWindow inherits Window {
                                     clicked => { root.toggle-normalize(); }
                                 }
                                 Button {
-                                    text: root.marker-edit ? "Scale to markers" : "Scale to markers ✓";
+                                    enabled: root.can-edit-markers;
+                                    text: root.marker-edit ? "Scale to markers ✓" : "Scale to markers";
                                     clicked => { root.toggle-marker-edit(); }
                                 }
-                                if root.marker-edit: Button {
+                                if root.marker-edit && root.can-edit-markers: Button {
                                     text: "Reset markers";
                                     clicked => { root.reset-markers(); }
                                 }

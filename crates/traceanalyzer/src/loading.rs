@@ -1,9 +1,10 @@
-//! Loading electrophoresis runs from the supported file types, running the full
-//! analysis pipeline (sizing → concentration → molarity), and — for native
-//! `.xad` files — the raw detector channels.
+//! GUI adapter around `traceio::io::read_path`.
+//!
+//! The parser crate owns format detection, instrument-specific analysis, and
+//! native raw-channel extraction. This module keeps the older GUI-facing
+//! `Loaded` shape and retains marker-override recalibration helpers.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -18,66 +19,25 @@ pub struct Loaded {
     pub warning: Option<String>,
 }
 
-/// Load a run from `.xad` / `.xml` / `.xml.gz`, calibrate it, and (for `.xad`)
-/// read the raw detector channels.
+/// Load any supported electrophoresis path through the public `traceio` API.
 pub fn load(path: &Path) -> Result<Loaded> {
-    // Fragment Analyzer runs arrive already size-calibrated (the reader fills
-    // per-point length itself), so they skip the marker-based `calibrate`.
-    if traceio::fa::is_fa_path(path) {
-        let run = traceio::fa::read_fa_run(path)?;
-        return Ok(Loaded {
-            run,
-            raw_channels: Vec::new(),
-            warning: None,
-        });
-    }
-
-    // TapeStation exports (metadata .xml + _Electropherogram.csv) size
-    // themselves against the ladder, so they also skip `calibrate`.
-    if traceio::tapestation::is_tapestation_path(path) {
-        let run = traceio::tapestation::read_tapestation(path)?;
-        return Ok(Loaded {
-            run,
-            raw_channels: Vec::new(),
-            warning: None,
-        });
-    }
-
-    let mut run = parse(path)?;
-    calibrate(&mut run);
-
-    let (raw_channels, warning) = if is_xad_path(path) {
-        read_xad_raw_channels_with_warning(path, traceio::xad::read_xad_raw_channels)
-    } else {
-        (Vec::new(), None)
-    };
+    let loaded = traceio::io::read_path(path)?;
 
     Ok(Loaded {
-        run,
-        raw_channels,
-        warning,
+        run: loaded.run,
+        raw_channels: loaded.raw_channels,
+        warning: warnings_to_gui_warning(loaded.warnings),
     })
 }
 
-fn is_xad_path(path: &Path) -> bool {
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_ascii_lowercase())
-        .is_some_and(|n| n.ends_with(".xad"))
-}
-
-fn read_xad_raw_channels_with_warning(
-    path: &Path,
-    reader: impl FnOnce(&Path) -> Result<Vec<RawChannel>>,
-) -> (Vec<RawChannel>, Option<String>) {
-    match reader(path)
-        .with_context(|| format!("reading raw detector channels from {}", path.display()))
-    {
-        Ok(channels) => (channels, None),
-        Err(e) => {
-            let msg = format!("Raw detector channels unavailable: {e:#}");
-            eprintln!("({msg})");
-            (Vec::new(), Some(msg))
+fn warnings_to_gui_warning(warnings: Vec<String>) -> Option<String> {
+    if warnings.is_empty() {
+        None
+    } else {
+        for warning in &warnings {
+            eprintln!("({warning})");
         }
+        Some(warnings.join("\n"))
     }
 }
 
@@ -103,49 +63,26 @@ pub fn recalibrate_with(
     Ok(())
 }
 
-fn parse(path: &Path) -> Result<Electrophoresis> {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    if name.ends_with(".xad") {
-        Ok(traceio::xad::read_xad_file(path)?)
-    } else if name.ends_with(".xml.gz") {
-        let raw = std::fs::read(path)?;
-        let mut d = flate2::read::GzDecoder::new(&raw[..]);
-        let mut s = String::new();
-        d.read_to_string(&mut s)?;
-        Ok(traceio::bioanalyzer::parse_xml(&s)?)
-    } else {
-        let s = std::fs::read_to_string(path)?;
-        Ok(traceio::bioanalyzer::parse_xml(&s)?)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::anyhow;
 
     #[test]
-    fn xad_raw_channel_error_becomes_warning() {
-        let path = Path::new("broken.xad");
-
-        let (channels, warning) =
-            read_xad_raw_channels_with_warning(path, |_| Err(anyhow!("synthetic decode failure")));
-
-        assert!(channels.is_empty());
-        let warning = warning.expect("raw-channel errors should be surfaced as warnings");
-        assert!(warning.contains("Raw detector channels unavailable"));
-        assert!(warning.contains("reading raw detector channels from broken.xad"));
-        assert!(warning.contains("synthetic decode failure"));
+    fn empty_traceio_warnings_leave_gui_warning_empty() {
+        assert!(warnings_to_gui_warning(Vec::new()).is_none());
     }
 
     #[test]
-    fn non_xad_paths_do_not_request_raw_channels() {
-        assert!(!is_xad_path(Path::new("run.xml")));
-        assert!(!is_xad_path(Path::new("run.xml.gz")));
-        assert!(is_xad_path(Path::new("run.xad")));
-        assert!(is_xad_path(Path::new("RUN.XAD")));
+    fn traceio_warnings_are_joined_for_gui_warning_slot() {
+        let warning = warnings_to_gui_warning(vec![
+            "Raw detector channels unavailable: synthetic decode failure".into(),
+            "calibration skipped: sizing failed".into(),
+        ])
+        .expect("traceio warnings should be surfaced through the GUI warning slot");
+
+        assert!(warning.contains("Raw detector channels unavailable"));
+        assert!(warning.contains("synthetic decode failure"));
+        assert!(warning.contains("calibration skipped"));
+        assert!(warning.contains('\n'));
     }
 }

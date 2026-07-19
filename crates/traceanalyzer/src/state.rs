@@ -62,6 +62,9 @@ pub struct OpenFile {
     pub run: Electrophoresis,
     /// Raw detector channels (populated for native `.xad`; see `raw_mode`).
     pub raw_channels: Vec<RawChannel>,
+    /// Optional human-readable sidecar metadata/QC summary for native formats
+    /// that expose it outside the normalized trace model.
+    pub metadata_text: Option<String>,
     /// Path the run was loaded from (target for File → Save).
     pub source_path: Option<PathBuf>,
     /// True when the run has in-memory edits (e.g. renamed wells) not yet saved.
@@ -88,6 +91,7 @@ impl OpenFile {
         OpenFile {
             run,
             raw_channels,
+            metadata_text: None,
             source_path,
             dirty: false,
             expanded: true,
@@ -361,6 +365,16 @@ impl AppState {
         self.active_file()
             .map(|f| f.raw_channels.as_slice())
             .unwrap_or(&[])
+    }
+    pub fn metadata_text(&self) -> &str {
+        self.active_file()
+            .and_then(|f| f.metadata_text.as_deref())
+            .unwrap_or("")
+    }
+    pub fn set_active_metadata_text(&mut self, text: Option<String>) {
+        if let Some(f) = self.active_file_mut() {
+            f.metadata_text = text;
+        }
     }
     pub fn selection(&self) -> &[usize] {
         self.active_file()

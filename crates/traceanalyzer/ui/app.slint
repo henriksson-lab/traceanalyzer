@@ -28,6 +28,9 @@ export component AppWindow inherits Window {
     in property <bool> can-save: false;
     in property <bool> can-save-as: false;
     in property <bool> can-export-table: false;
+    in property <bool> can-export-run-table: false;
+    in property <bool> can-export-traces: false;
+    in property <bool> can-export-metadata: false;
     in property <bool> can-export-plot: false;
     in property <bool> can-edit-markers: false;
     in property <string> sample-info: "";
@@ -38,6 +41,7 @@ export component AppWindow inherits Window {
     in property <bool> marker-edit: false;
     in property <string> error-text: "";
     in property <string> status-text: "";
+    in property <string> metadata-text: "";
     in property <image> plot-image;
     in-out property <int> current-index: 0;
 
@@ -68,6 +72,9 @@ export component AppWindow inherits Window {
     callback save-file();
     callback save-file-as();
     callback export-peak-table();
+    callback export-run-peak-table();
+    callback export-trace-data();
+    callback export-metadata-qc();
     callback export-plot-png();
     callback quit();
     callback about();
@@ -132,6 +139,21 @@ export component AppWindow inherits Window {
                 title: "Export Peak Table CSV…";
                 enabled: root.can-export-table;
                 activated => { root.export-peak-table(); }
+            }
+            MenuItem {
+                title: "Export All Peak Tables CSV…";
+                enabled: root.can-export-run-table;
+                activated => { root.export-run-peak-table(); }
+            }
+            MenuItem {
+                title: "Export Trace Data CSV…";
+                enabled: root.can-export-traces;
+                activated => { root.export-trace-data(); }
+            }
+            MenuItem {
+                title: "Export Metadata/QC CSV…";
+                enabled: root.can-export-metadata;
+                activated => { root.export-metadata-qc(); }
             }
             MenuItem {
                 title: "Export Plot PNG…";
@@ -561,6 +583,20 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            Tab {
+                title: "Metadata";
+                ScrollView {
+                    vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+                    horizontal-scrollbar-policy: ScrollBarPolicy.as-needed;
+                    Text {
+                        text: root.metadata-text != "" ? root.metadata-text : "No metadata/QC sidecar data is available for the active run.";
+                        font-size: 12px;
+                        color: #333333;
+                        wrap: word-wrap;
                     }
                 }
             }

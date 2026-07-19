@@ -4,6 +4,7 @@
 //! With no argument it loads the bundled DNA 1000 demo, if present.
 
 use std::cell::RefCell;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -59,6 +60,12 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 app.add_file(loaded.run, loaded.raw_channels, Some(source));
+                if let Some((metadata, warning)) = load_fa_metadata_text(path) {
+                    app.set_active_metadata_text(metadata);
+                    if let Some(warning) = warning {
+                        warnings.push(warning);
+                    }
+                }
                 if let Some(w) = loaded.warning {
                     warnings.push(w);
                 }
@@ -257,6 +264,36 @@ fn main() -> anyhow::Result<()> {
         ui.on_export_peak_table(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             export_peak_table_dialog(&ui, &st);
+        });
+    }
+
+    // File -> Export All Peak Tables CSV...
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_export_run_peak_table(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            export_run_peak_table_dialog(&ui, &st);
+        });
+    }
+
+    // File -> Export Trace Data CSV...
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_export_trace_data(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            export_trace_data_dialog(&ui, &st);
+        });
+    }
+
+    // File -> Export Metadata/QC CSV...
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_export_metadata_qc(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            export_metadata_qc_dialog(&ui, &st);
         });
     }
 
@@ -631,7 +668,12 @@ fn open_added_file(ui: &AppWindow, state: &SharedState, path: &std::path::Path) 
             let table = {
                 let mut s = state.borrow_mut();
                 s.add_file(loaded.run, loaded.raw_channels, Some(source));
-                s.error = loaded.warning;
+                let metadata_warning =
+                    load_fa_metadata_text(path).and_then(|(metadata, warning)| {
+                        s.set_active_metadata_text(metadata);
+                        warning
+                    });
+                s.error = join_optional_messages([loaded.warning, metadata_warning]);
                 s.status = s
                     .error
                     .is_none()
@@ -662,28 +704,129 @@ fn set_open_error(ui: &AppWindow, state: &SharedState, message: String) {
 }
 
 fn is_supported_open_path(path: &std::path::Path) -> bool {
-    if traceio::fa::is_fa_path(path) || traceio::tapestation::is_tapestation_path(path) {
-        return true;
+    traceio::io::detect_format(path).is_ok_and(|detected| detected.is_some())
+}
+
+fn load_fa_metadata_text(path: &std::path::Path) -> Option<(Option<String>, Option<String>)> {
+    if !traceio::fa::is_fa_path(path) {
+        return None;
     }
-    let Some(name) = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_ascii_lowercase())
-    else {
-        return false;
-    };
-    name.ends_with(".xad") || name.ends_with(".xml") || name.ends_with(".xml.gz")
+
+    Some(match traceio::fa::read_fa_metadata(path) {
+        Ok(metadata) => (format_fa_metadata(&metadata), None),
+        Err(e) => (
+            None,
+            Some(format!(
+                "Fragment Analyzer metadata unavailable for {}: {e:#}",
+                path.display()
+            )),
+        ),
+    })
+}
+
+fn format_fa_metadata(metadata: &traceio::fa::FaMetadata) -> Option<String> {
+    let mut out = String::new();
+
+    if !metadata.run_header.is_empty() {
+        out.push_str("Run header\n");
+        for (key, value) in &metadata.run_header {
+            let _ = writeln!(out, "{key}: {value}");
+        }
+        out.push('\n');
+    }
+
+    write_ini_summary(&mut out, "Method", &metadata.method);
+    write_ini_summary(&mut out, "Analysis", &metadata.analysis);
+
+    if !metadata.current.is_empty() {
+        let mut current_min = f64::INFINITY;
+        let mut current_max = f64::NEG_INFINITY;
+        let mut voltage_min = f64::INFINITY;
+        let mut voltage_max = f64::NEG_INFINITY;
+        let mut pressure_min = f64::INFINITY;
+        let mut pressure_max = f64::NEG_INFINITY;
+        for point in &metadata.current {
+            current_min = current_min.min(point.current_ua);
+            current_max = current_max.max(point.current_ua);
+            voltage_min = voltage_min.min(point.voltage_kv);
+            voltage_max = voltage_max.max(point.voltage_kv);
+            pressure_min = pressure_min.min(point.pressure_psi);
+            pressure_max = pressure_max.max(point.pressure_psi);
+        }
+        out.push_str("Current log\n");
+        let _ = writeln!(out, "Points: {}", metadata.current.len());
+        let _ = writeln!(out, "Current: {current_min:.3} to {current_max:.3} uA");
+        let _ = writeln!(out, "Voltage: {voltage_min:.3} to {voltage_max:.3} kV");
+        let _ = writeln!(out, "Pressure: {pressure_min:.3} to {pressure_max:.3} psi");
+        out.push('\n');
+    }
+
+    if !metadata.timing.is_empty() {
+        out.push_str("Timing\n");
+        let _ = writeln!(out, "Lines: {}", metadata.timing.len());
+        for line in metadata.timing.iter().take(12) {
+            let _ = writeln!(out, "{line}");
+        }
+        if metadata.timing.len() > 12 {
+            let _ = writeln!(out, "... {} more lines", metadata.timing.len() - 12);
+        }
+        out.push('\n');
+    }
+
+    if !metadata.exposure.is_empty() {
+        out.push_str("Exposure\n");
+        let _ = writeln!(out, "Lines: {}", metadata.exposure.len());
+        for line in metadata.exposure.iter().take(12) {
+            let _ = writeln!(out, "{line}");
+        }
+        if metadata.exposure.len() > 12 {
+            let _ = writeln!(out, "... {} more lines", metadata.exposure.len() - 12);
+        }
+        out.push('\n');
+    }
+
+    if let Some(image) = &metadata.camera_image {
+        out.push_str("Camera image\n");
+        let _ = writeln!(out, "Bytes: {}", image.len());
+    }
+
+    let trimmed = out.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn write_ini_summary(out: &mut String, title: &str, document: &traceio::fa::IniDocument) {
+    if document.is_empty() {
+        return;
+    }
+
+    let _ = writeln!(out, "{title}");
+    for (section, values) in document {
+        let _ = writeln!(out, "[{section}]");
+        for (key, value) in values {
+            let _ = writeln!(out, "{key}: {value}");
+        }
+    }
+    out.push('\n');
+}
+
+fn join_optional_messages(messages: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    let joined = messages
+        .into_iter()
+        .flatten()
+        .filter(|message| !message.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!joined.is_empty()).then_some(joined)
 }
 
 /// Canonical run identity used for deduplication, save targeting, and tree
 /// tooltips. Multi-file run formats map their accepted entry points to one path.
 fn source_identity(path: &std::path::Path) -> std::path::PathBuf {
-    if traceio::fa::is_fa_path(path) {
-        traceio::fa::run_identity(path)
-    } else if traceio::tapestation::is_tapestation_path(path) {
-        traceio::tapestation::run_identity(path).unwrap_or_else(|_| path.to_path_buf())
-    } else {
-        path.to_path_buf()
-    }
+    traceio::io::detect_format(path)
+        .ok()
+        .flatten()
+        .map(|detected| detected.identity)
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 /// Push run-level data (title, entry list, error) into the UI and build a table update.
@@ -693,6 +836,7 @@ fn refresh_all(ui: &AppWindow, st: &mut AppState) -> TableRefresh {
     ui.set_assay_title(SharedString::from(st.title()));
     ui.set_error_text(SharedString::from(st.error.clone().unwrap_or_default()));
     ui.set_status_text(SharedString::from(st.status.clone().unwrap_or_default()));
+    ui.set_metadata_text(SharedString::from(st.metadata_text()));
     refresh_tree(ui, st);
     refresh_overview(ui, st);
     build_table_refresh(st)
@@ -735,6 +879,9 @@ fn refresh_tree(ui: &AppWindow, st: &AppState) {
     ui.set_can_save(st.is_dirty() && st.can_save());
     ui.set_can_save_as(st.can_save_as());
     ui.set_can_export_table(can_export_peak_table(st));
+    ui.set_can_export_run_table(can_export_processed_samples(st));
+    ui.set_can_export_traces(can_export_processed_samples(st));
+    ui.set_can_export_metadata(can_export_metadata_qc(st));
     ui.set_can_export_plot(can_export_plot(st));
     ui.set_can_edit_markers(st.can_edit_markers());
     ui.set_rename_text(SharedString::from(st.primary_name()));
@@ -1116,6 +1263,109 @@ fn export_peak_table_dialog(ui: &AppWindow, st: &SharedState) {
     finish_export(ui, st, "Export peak table", &dst, result);
 }
 
+fn export_run_peak_table_dialog(ui: &AppWindow, st: &SharedState) {
+    if !can_export_processed_samples(&st.borrow()) {
+        set_status_error(
+            ui,
+            st,
+            "No processed samples are available to export".to_string(),
+        );
+        return;
+    }
+
+    let start_name = {
+        let s = st.borrow();
+        format!("{}_all_peaks.csv", export_run_stem(&s))
+    };
+    let Some(dst) = rfd::FileDialog::new()
+        .add_filter("CSV", &["csv"])
+        .set_file_name(start_name)
+        .save_file()
+    else {
+        return;
+    };
+
+    let result = {
+        let s = st.borrow();
+        if !can_export_processed_samples(&s) {
+            Err(anyhow::anyhow!("no processed samples are available"))
+        } else {
+            export::write_run_peak_table_csv(&dst, s.run(), table_x_axis(&s))
+        }
+    };
+    finish_export(ui, st, "Export all peak tables", &dst, result);
+}
+
+fn export_trace_data_dialog(ui: &AppWindow, st: &SharedState) {
+    if !can_export_processed_samples(&st.borrow()) {
+        set_status_error(
+            ui,
+            st,
+            "No processed trace data is available to export".to_string(),
+        );
+        return;
+    }
+
+    let start_name = {
+        let s = st.borrow();
+        format!("{}_traces.csv", export_stem(&s))
+    };
+    let Some(dst) = rfd::FileDialog::new()
+        .add_filter("CSV", &["csv"])
+        .set_file_name(start_name)
+        .save_file()
+    else {
+        return;
+    };
+
+    let result = {
+        let s = st.borrow();
+        if !can_export_processed_samples(&s) {
+            Err(anyhow::anyhow!("no processed trace data is available"))
+        } else {
+            let samples: Vec<&traceio::Sample> = if s.selection().len() > 1 {
+                s.selection()
+                    .iter()
+                    .filter_map(|&idx| s.run().samples.get(idx))
+                    .collect()
+            } else {
+                s.run().samples.get(s.primary()).into_iter().collect()
+            };
+            export::write_trace_data_csv(&dst, &samples, export::DEFAULT_TRACE_COLUMNS)
+        }
+    };
+    finish_export(ui, st, "Export trace data", &dst, result);
+}
+
+fn export_metadata_qc_dialog(ui: &AppWindow, st: &SharedState) {
+    if !can_export_metadata_qc(&st.borrow()) {
+        set_status_error(ui, st, "No run metadata is available to export".to_string());
+        return;
+    }
+
+    let start_name = {
+        let s = st.borrow();
+        format!("{}_metadata_qc.csv", export_run_stem(&s))
+    };
+    let Some(dst) = rfd::FileDialog::new()
+        .add_filter("CSV", &["csv"])
+        .set_file_name(start_name)
+        .save_file()
+    else {
+        return;
+    };
+
+    let result = {
+        let s = st.borrow();
+        if !can_export_metadata_qc(&s) {
+            Err(anyhow::anyhow!("no run metadata is available"))
+        } else {
+            export::write_metadata_qc_csv_with_notes(&dst, s.run(), Some(s.metadata_text()))
+        }
+    };
+    finish_export(ui, st, "Export metadata/QC", &dst, result);
+}
+
 fn export_plot_png_dialog(ui: &AppWindow, st: &SharedState) {
     if !can_export_plot(&st.borrow()) {
         set_status_error(ui, st, "No plot is available to export".to_string());
@@ -1170,6 +1420,14 @@ fn export_plot_png_dialog(ui: &AppWindow, st: &SharedState) {
 
 fn can_export_peak_table(st: &AppState) -> bool {
     st.active_file().is_some() && !st.raw_mode() && st.run().samples.get(st.primary()).is_some()
+}
+
+fn can_export_processed_samples(st: &AppState) -> bool {
+    st.active_file().is_some() && !st.raw_mode() && !st.run().samples.is_empty()
+}
+
+fn can_export_metadata_qc(st: &AppState) -> bool {
+    st.active_file().is_some()
 }
 
 fn can_export_plot(st: &AppState) -> bool {

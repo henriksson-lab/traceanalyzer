@@ -22,8 +22,12 @@ ICONDIR := $(DATADIR)/icons/hicolor
 # The window's Wayland app_id / X11 WM_CLASS; the icon PNG/SVG and the .desktop
 # StartupWMClass are all keyed to this name so the desktop finds the icon.
 LINUX_APP_ID := traceanalyzer
+DEB_NAME := trace-analyzer
+DEB_ARCH := amd64
+DEB_ROOT := target/deb/root
+DEB_FILE := target/deb/$(DEB_NAME)_$(APP_VERSION)_$(DEB_ARCH).deb
 
-.PHONY: osx-app osx-app-universal osx-bundle clean-osx-app install uninstall
+.PHONY: deb osx-app osx-app-universal osx-bundle clean-osx-app install uninstall
 
 # Install the release binary, the .desktop entry, and the icons into a
 # freedesktop layout. Uses the scalable SVG (any size, no rasterizer needed)
@@ -46,6 +50,25 @@ uninstall:
 		"$(DATADIR)/applications/$(LINUX_APP_ID).desktop" \
 		"$(ICONDIR)/scalable/apps/$(LINUX_APP_ID).svg" \
 		"$(ICONDIR)/256x256/apps/$(LINUX_APP_ID).png"
+
+deb:
+	rm -rf "$(DEB_ROOT)" "$(DEB_FILE)"
+	$(MAKE) install DESTDIR="$(CURDIR)/$(DEB_ROOT)" PREFIX=/usr
+	mkdir -p "$(DEB_ROOT)/DEBIAN" target/deb
+	printf '%s\n' \
+		'Package: $(DEB_NAME)' \
+		'Version: $(APP_VERSION)' \
+		'Section: science' \
+		'Priority: optional' \
+		'Architecture: $(DEB_ARCH)' \
+		'Maintainer: $(shell sed -n 's/^authors = \[\(.*\)\]/\1/p' Cargo.toml | head -n 1 | tr -d '"')' \
+		'Depends: libc6, libfontconfig1, libgtk-3-0' \
+		'Description: Post-measurement analysis for automated electrophoresis' \
+		' Trace analyzer opens Bioanalyzer, TapeStation, and Fragment Analyzer' \
+		' runs for trace inspection, peak tables, metadata, and exports.' \
+		> "$(DEB_ROOT)/DEBIAN/control"
+	dpkg-deb --build --root-owner-group "$(DEB_ROOT)" "$(DEB_FILE)"
+	@printf 'Built %s\n' "$(DEB_FILE)"
 
 # --- macOS .app bundle ------------------------------------------------------
 osx-app:

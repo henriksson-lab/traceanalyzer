@@ -46,15 +46,17 @@ prerequisites, headless use, and the command-line `inspect` tool.
 
 ## Installing
 
-CI builds downloadable artifacts for Windows and macOS on pushes, pull requests,
-tags, and manual workflow runs. Windows is packaged as a single `.exe`; macOS is
-packaged as a universal Intel + Apple Silicon `.app` bundle.
+CI builds downloadable artifacts for Windows, Linux, and macOS on pushes, pull
+requests, tags, and manual workflow runs. Windows is packaged as a single
+`.exe`, Linux as an amd64 `.deb`, and macOS as a universal Intel + Apple Silicon
+`.app` bundle.
 
 **Linux** — install the release binary, a `.desktop` launcher entry, and the app
 icons into a standard [freedesktop](https://specifications.freedesktop.org)
 layout, so Trace analyzer shows up in your application menu:
 
 ```sh
+make deb                         # → target/deb/trace-analyzer_<version>_amd64.deb
 sudo make install                # into /usr/local (default)
 make install PREFIX=~/.local     # per-user, no sudo
 ```

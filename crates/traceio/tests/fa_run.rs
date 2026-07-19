@@ -22,7 +22,8 @@ fn zip_run_dir(dir: &Path, dest: &Path) {
         if p.is_file() {
             let name = p.file_name().unwrap().to_string_lossy().into_owned();
             w.start_file(name, opts).expect("start entry");
-            w.write_all(&std::fs::read(&p).expect("read file")).expect("write entry");
+            w.write_all(&std::fs::read(&p).expect("read file"))
+                .expect("write entry");
         }
     }
     w.finish().expect("finish zip");
@@ -172,7 +173,10 @@ fn reads_fa_run_from_zip() {
     // A zipped run must decode identically to the folder.
     let from_dir = traceio::fa::read_fa_run(&dir).expect("read dir");
     let from_zip = traceio::fa::read_fa_run(&zip_path).expect("read zip");
-    assert!(traceio::fa::is_fa_path(&zip_path), "zip should be recognized as FA");
+    assert!(
+        traceio::fa::is_fa_path(&zip_path),
+        "zip should be recognized as FA"
+    );
     assert_eq!(from_zip.samples.len(), from_dir.samples.len());
     for (a, b) in from_zip.samples.iter().zip(&from_dir.samples) {
         assert_eq!(a.name, b.name);
@@ -198,8 +202,15 @@ fn saves_renamed_names_into_zip() {
 
     // Reload: the rename persists and the .raw-derived trace is untouched.
     let reloaded = traceio::fa::read_fa_run(&zip_path).expect("reload zip");
-    assert!(reloaded.samples[0].name.contains("RENAMED_SAMPLE"), "got {}", reloaded.samples[0].name);
-    assert_eq!(reloaded.samples[0].fluorescence, orig_trace, "traces must survive a save");
+    assert!(
+        reloaded.samples[0].name.contains("RENAMED_SAMPLE"),
+        "got {}",
+        reloaded.samples[0].name
+    );
+    assert_eq!(
+        reloaded.samples[0].fluorescence, orig_trace,
+        "traces must survive a save"
+    );
     assert_eq!(reloaded.samples.len(), 12);
     let _ = std::fs::remove_file(&zip_path);
 }
@@ -216,7 +227,11 @@ fn opens_from_any_run_member_file() {
             .unwrap()
             .flatten()
             .map(|e| e.path())
-            .find(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case(ext)))
+            .find(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+            })
             .unwrap_or_else(|| panic!("no .{ext} in run dir"))
     };
     let raw = file_with_ext("raw");

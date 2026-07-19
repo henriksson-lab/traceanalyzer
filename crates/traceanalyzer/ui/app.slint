@@ -27,6 +27,8 @@ export component AppWindow inherits Window {
     in property <bool> can-rename: false;
     in property <bool> can-save: false;
     in property <bool> can-save-as: false;
+    in property <bool> can-export-table: false;
+    in property <bool> can-export-plot: false;
     in property <bool> can-edit-markers: false;
     in property <string> sample-info: "";
     // Y-axis mode: options for the dropdown and the currently selected index.
@@ -35,6 +37,7 @@ export component AppWindow inherits Window {
     in property <bool> normalize-on: false;
     in property <bool> marker-edit: false;
     in property <string> error-text: "";
+    in property <string> status-text: "";
     in property <image> plot-image;
     in-out property <int> current-index: 0;
 
@@ -64,6 +67,8 @@ export component AppWindow inherits Window {
     callback open-folder();
     callback save-file();
     callback save-file-as();
+    callback export-peak-table();
+    callback export-plot-png();
     callback quit();
     callback about();
     // Expand/collapse the file node owning a visible row.
@@ -107,6 +112,7 @@ export component AppWindow inherits Window {
             }
             MenuItem {
                 title: "Open Folder…";
+                shortcut: @keys(Control + Shift + O);
                 activated => { root.open-folder(); }
             }
             MenuItem {
@@ -120,6 +126,17 @@ export component AppWindow inherits Window {
                 enabled: root.can-save-as;
                 shortcut: @keys(Control + Shift + S);
                 activated => { root.save-file-as(); }
+            }
+            MenuSeparator {}
+            MenuItem {
+                title: "Export Peak Table CSV…";
+                enabled: root.can-export-table;
+                activated => { root.export-peak-table(); }
+            }
+            MenuItem {
+                title: "Export Plot PNG…";
+                enabled: root.can-export-plot;
+                activated => { root.export-plot-png(); }
             }
             MenuSeparator {}
             MenuItem {
@@ -148,6 +165,13 @@ export component AppWindow inherits Window {
             wrap: word-wrap;
         }
 
+        if root.status-text != "" && root.error-text == "": Text {
+            text: root.status-text;
+            color: #3f5f3f;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+
         // Empty-state guidance: shown until the first file is opened.
         if root.tree-labels.length == 0: Rectangle {
             background: #eef4fb;
@@ -163,7 +187,7 @@ export component AppWindow inherits Window {
                     font-weight: 700;
                 }
                 Text {
-                    text: "Use File → Open… (Ctrl+O) or drag a file onto the window.";
+                    text: "Use File → Open… (Ctrl+O), File → Open Folder… (Ctrl+Shift+O), or drag a file or run folder onto the window.";
                     font-size: 12px;
                     wrap: word-wrap;
                 }

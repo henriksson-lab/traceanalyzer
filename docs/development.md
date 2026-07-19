@@ -22,9 +22,9 @@ make osx-app
 make osx-app-universal
 ```
 
-The `inspect`/GUI loaders accept Bioanalyzer `.xad`/`.xml`/`.xml.gz`,
-TapeStation exported XML/`_Electropherogram.csv` pairs, and Fragment Analyzer
-`.raw` files, run directories, or zipped runs.
+The `inspect` example uses `traceio::io::read_path`, which accepts Bioanalyzer
+`.xad`/`.xml`/`.xml.gz`, TapeStation exported XML/`_Electropherogram.csv` pairs,
+and Fragment Analyzer `.raw` files, run directories, or zipped runs.
 
 ## Testing
 

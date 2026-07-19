@@ -45,6 +45,9 @@ centre-column positions; extracted, size-calibrated traces correlate 0.82–0.95
 with the ProSize `Electropherogram.csv` for wells with real sample (empty wells
 correlate low, as expected — only the co-injected markers are present).
 
+The header date/time fields are read into `AssayInfo::creation_date` when they
+look like ASCII text; missing or unrecognised values are left blank.
+
 ## `.PKS` — peaks + size calibration (partially decoded)
 
 LabVIEW-flattened, big-endian. Starts with `u32` count `= 12` (wells), then
@@ -112,12 +115,38 @@ concentration/molarity from the computed per-point arrays at each peak apex.
 
 ## Other files (not used yet)
 
-- **`.raw2D`** (`"## #"` magic) — a small 2-D CCD image / gel snapshot.
-- **`.ANNT` / `.GANNT`** — LabVIEW Flatten-To-XML annotation trees (a 4-byte
-  length prefix then `<Array>/<Cluster>/<NumElts>/<Dimsize>/<Val>` XML).
-- **`.ANAI`** — INI-style per-capillary analysis settings.
-- **`.current`** — TSV log of Current/Voltage/Pressure during the run.
-- **`.txt`** — capillary → well → sample-name (used for names/wells).
+- **`.txt`** — capillary → well → sample-name, plus run header metadata
+  (`Raw file`, `Operator`, capillary-array ID/utilisation, notes) and per-sample
+  `Description`. The reader currently uses well/sample names and preserves each
+  sample description in `Sample::comment`; save rewrites only `Sample ID:`.
+- **`.ANAI`** — INI-style per-capillary analysis settings: peak-width/min-height,
+  baseline setpoints, marker thresholds, smear/inclusion windows, dilution
+  factor, ladder profile, ladder well, and general analysis flags. This is
+  straightforward to parse, but most fields need model/UI decisions before they
+  are useful.
+- **`method.mthd`** — INI-style run method: gel/conditioning, pre-run,
+  injections, separation voltage/time, tray moves, method name, capillary length,
+  ladder/marker lots. This is also easy to parse as metadata.
+- **`.current`** — TSV log of Current/Voltage/Pressure during the run. The local
+  fixture has one header plus 1501 rows, matching the 1501 CCD scans, so this
+  can become run-QC trace data.
+- **`Timing.txt`** — one event/status line per frame during separation (1500
+  lines in the local fixture). It appears to log per-frame instrument/state
+  channels rather than analytical peaks.
+- **`ExpTime.txt`** — camera exposure log. The local fixture alternates exposure
+  lines and repeated camera error/status lines.
+- **`CameraImage.bmp`** — despite the extension, this is a PNG image (752×290 in
+  the local fixture), probably a camera snapshot.
+- **`.raw2D`** (`"##\0#"` magic) — small binary image/snapshot. In the local
+  fixture it has date/time strings and a plausible `u16` image payload at offset
+  204 that factors as 101×113 pixels, but orientation/scaling still needs
+  validation against the exported gel PNG before exposing it.
+- **`.ANNT` / `.GANNT`** — LabVIEW Flatten-To-XML annotation trees: a 4-byte
+  big-endian XML length followed by `<Array>/<Cluster>/<NumElts>/<Dimsize>/<Val>`
+  XML. In the local fixture they are valid but contain empty annotation schemas
+  (`ANNT` has 12 empty per-capillary annotation lists; `GANNT` has an empty gel
+  annotation list).
+- **`.RQN`** — empty in the local fixture.
 
 ## Packaging: one run = one `.zip`
 
@@ -146,7 +175,7 @@ members are read; every other file in the run (or zip) is ignored.
 
 Fragment Analyzer runs arrive already size-calibrated, so the FA reader fills
 each `Sample::length` directly (scan→bp interpolation from `.PKS` anchors) and
-**skips** the Bioanalyzer marker-based `calibration` path. `loading::load`
+**skips** the Bioanalyzer marker-based `calibration` path. `traceio::io::read_path`
 dispatches to it via `fa::is_fa_path` (a `.zip` holding an FA `.raw`, a `.raw`
 file with the `FA\0\0` magic, or a directory holding one). Peaks (with
 lower/upper marker labels and ladder-well detection) are populated from `.PKS`;

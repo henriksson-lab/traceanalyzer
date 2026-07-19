@@ -237,6 +237,9 @@ pub struct AppState {
     pub grabbed: Option<MarkerDrag>,
     /// Last load/save error, shown in the UI.
     pub error: Option<String>,
+    /// Last non-error user-visible status message, shown until an error replaces
+    /// it or a new action updates it.
+    pub status: Option<String>,
 }
 
 impl AppState {
@@ -258,6 +261,7 @@ impl AppState {
             table_peak_x: Vec::new(),
             grabbed: None,
             error: None,
+            status: None,
         }
     }
 

@@ -65,8 +65,8 @@ uncalibrated traces still plot on the distance axis.
 
 ## Model mapping & limitations
 
-`loading::load` dispatches via `tapestation::is_tapestation_path` and, like the
-Fragment Analyzer path, fills `length` itself and **skips** the Bioanalyzer
+`traceio::io::read_path` dispatches via `tapestation::is_tapestation_path` and,
+like the Fragment Analyzer path, fills `length` itself and **skips** the Bioanalyzer
 `calibrate`. Peaks carry size/area/concentration/molarity and marker labels from
 the XML. **Per-sample region bounds** are parsed into `Sample::regions` and
 surfaced in the Table tab. **Multi-tape** runs are handled: each `ScreenTapeID` (kept in

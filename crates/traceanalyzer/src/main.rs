@@ -15,7 +15,7 @@ use slint::{
 
 use traceanalyzer::plot::{self, Series, Viewport, XAxis, YMode};
 use traceanalyzer::state::{AppState, Marker, MarkerDrag};
-use traceanalyzer::{gel, loading, overview, render, table};
+use traceanalyzer::{export, gel, loading, overview, render, table};
 use traceio::calibration::{marker_times, MarkerOverride};
 use traceio::Electrophoresis;
 
@@ -90,9 +90,12 @@ fn main() -> anyhow::Result<()> {
             let Some(ui) = ui_weak.upgrade() else { return };
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter(
-                    "Electrophoresis",
+                    "All supported runs",
                     &["xad", "xml", "gz", "zip", "raw", "csv"],
                 )
+                .add_filter("Bioanalyzer", &["xad", "xml", "gz"])
+                .add_filter("TapeStation export", &["xml", "gz", "csv"])
+                .add_filter("Fragment Analyzer", &["zip", "raw"])
                 .pick_file()
             {
                 open_added_file(&ui, &st, &path);
@@ -244,6 +247,26 @@ fn main() -> anyhow::Result<()> {
         ui.on_save_file_as(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             save_as_dialog(&ui, &st);
+        });
+    }
+
+    // File -> Export Peak Table CSV...
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_export_peak_table(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            export_peak_table_dialog(&ui, &st);
+        });
+    }
+
+    // File -> Export Plot PNG...
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_export_plot_png(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            export_plot_png_dialog(&ui, &st);
         });
     }
 
@@ -575,6 +598,18 @@ fn main() -> anyhow::Result<()> {
 /// Open a file as a new entry in the multi-file list, make it active, and
 /// refresh the whole UI. Existing open files are kept.
 fn open_added_file(ui: &AppWindow, state: &SharedState, path: &std::path::Path) {
+    if !is_supported_open_path(path) {
+        set_open_error(
+            ui,
+            state,
+            format!(
+                "Unsupported input: {}. Open a Bioanalyzer .xad/.xml/.xml.gz file, a TapeStation exported .xml or _Electropherogram.csv file, or a Fragment Analyzer .zip/.raw/run folder.",
+                path.display()
+            ),
+        );
+        return;
+    }
+
     let source = source_identity(path);
 
     // Already open? Re-activate it instead of loading a duplicate.
@@ -582,6 +617,8 @@ fn open_added_file(ui: &AppWindow, state: &SharedState, path: &std::path::Path) 
         let table = {
             let mut s = state.borrow_mut();
             s.activate_file(idx);
+            s.error = None;
+            s.status = Some(format!("Already open: {}", source.display()));
             refresh_all(ui, &mut s)
         };
         table.apply(ui);
@@ -595,18 +632,46 @@ fn open_added_file(ui: &AppWindow, state: &SharedState, path: &std::path::Path) 
                 let mut s = state.borrow_mut();
                 s.add_file(loaded.run, loaded.raw_channels, Some(source));
                 s.error = loaded.warning;
+                s.status = s
+                    .error
+                    .is_none()
+                    .then(|| format!("Opened {}", path.display()));
                 refresh_all(ui, &mut s)
             };
             table.apply(ui);
             show_selected(ui, &state.borrow());
         }
         Err(e) => {
-            ui.set_error_text(SharedString::from(format!(
-                "Could not open {}: {e}",
-                path.display()
-            )));
+            set_open_error(
+                ui,
+                state,
+                format!("Could not open {}: {e:#}", path.display()),
+            );
         }
     }
+}
+
+fn set_open_error(ui: &AppWindow, state: &SharedState, message: String) {
+    {
+        let mut s = state.borrow_mut();
+        s.error = Some(message.clone());
+        s.status = None;
+    }
+    ui.set_error_text(SharedString::from(message));
+    ui.set_status_text(SharedString::default());
+}
+
+fn is_supported_open_path(path: &std::path::Path) -> bool {
+    if traceio::fa::is_fa_path(path) || traceio::tapestation::is_tapestation_path(path) {
+        return true;
+    }
+    let Some(name) = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+    else {
+        return false;
+    };
+    name.ends_with(".xad") || name.ends_with(".xml") || name.ends_with(".xml.gz")
 }
 
 /// Canonical run identity used for deduplication, save targeting, and tree
@@ -627,6 +692,7 @@ fn refresh_all(ui: &AppWindow, st: &mut AppState) -> TableRefresh {
     ensure_marker_edit_available(st);
     ui.set_assay_title(SharedString::from(st.title()));
     ui.set_error_text(SharedString::from(st.error.clone().unwrap_or_default()));
+    ui.set_status_text(SharedString::from(st.status.clone().unwrap_or_default()));
     refresh_tree(ui, st);
     refresh_overview(ui, st);
     build_table_refresh(st)
@@ -666,8 +732,10 @@ fn refresh_tree(ui: &AppWindow, st: &AppState) {
     ui.set_entry_count(st.entry_count() as i32);
     ui.set_current_index(st.primary() as i32);
     ui.set_can_rename(st.can_rename());
-    ui.set_can_save(st.can_save());
+    ui.set_can_save(st.is_dirty() && st.can_save());
     ui.set_can_save_as(st.can_save_as());
+    ui.set_can_export_table(can_export_peak_table(st));
+    ui.set_can_export_plot(can_export_plot(st));
     ui.set_can_edit_markers(st.can_edit_markers());
     ui.set_rename_text(SharedString::from(st.primary_name()));
 }
@@ -677,12 +745,15 @@ fn refresh_overview(ui: &AppWindow, st: &AppState) {
     ui.set_overview_shared_y(st.overview_shared_y);
     ui.set_overview_gel(st.overview_gel);
     ui.set_overview_show_ladders(st.overview_show_ladders);
-    if st.active_file().is_none() {
-        ui.set_overview_image_width(plot::PLOT_W as i32);
-        ui.set_overview_image_height(plot::PLOT_H as i32);
-        ui.set_overview_image(blank_plot_image());
-        return;
-    }
+    let (buf, w, h) = render_overview_bitmap(st).unwrap_or_else(blank_plot_bitmap);
+    ui.set_overview_image_width(w as i32);
+    ui.set_overview_image_height(h as i32);
+    ui.set_overview_image(rgb_to_image(&buf, w, h));
+}
+
+fn render_overview_bitmap(st: &AppState) -> Option<(Vec<u8>, u32, u32)> {
+    st.active_file()?;
+
     if st.raw_mode() {
         let w = plot::PLOT_W;
         let h = plot::PLOT_H;
@@ -690,23 +761,17 @@ fn refresh_overview(ui: &AppWindow, st: &AppState) {
         let refs: Vec<&Series> = series.iter().collect();
         let vp = plot::auto_viewport_multi(&refs);
         let buf = plot::render_overlay(&refs, &vp, None, &[], w, h);
-        ui.set_overview_image_width(w as i32);
-        ui.set_overview_image_height(h as i32);
-        ui.set_overview_image(rgb_to_image(&buf, w, h));
+        Some((buf, w, h))
     } else if st.overview_gel {
         let (run, _) = overview_combined(st);
         let (w, h) = gel::size(run.samples.len());
         let buf = gel::render(&run, w, h);
-        ui.set_overview_image_width(w as i32);
-        ui.set_overview_image_height(h as i32);
-        ui.set_overview_image(rgb_to_image(&buf, w, h));
+        Some((buf, w, h))
     } else {
         let (run, _) = overview_combined(st);
         let layout = overview::layout(run.samples.len());
         let buf = overview::render(&run, st.y_mode, st.overview_shared_y, &layout);
-        ui.set_overview_image_width(layout.w as i32);
-        ui.set_overview_image_height(layout.h as i32);
-        ui.set_overview_image(rgb_to_image(&buf, layout.w, layout.h));
+        Some((buf, layout.w, layout.h))
     }
 }
 
@@ -1021,6 +1086,197 @@ fn save_as_dialog(ui: &AppWindow, st: &SharedState) {
     }
 }
 
+fn export_peak_table_dialog(ui: &AppWindow, st: &SharedState) {
+    if !can_export_peak_table(&st.borrow()) {
+        set_status_error(ui, st, "No peak table is available to export".to_string());
+        return;
+    }
+
+    let start_name = {
+        let s = st.borrow();
+        format!("{}_peaks.csv", export_stem(&s))
+    };
+    let Some(dst) = rfd::FileDialog::new()
+        .add_filter("CSV", &["csv"])
+        .set_file_name(start_name)
+        .save_file()
+    else {
+        return;
+    };
+
+    let result = {
+        let s = st.borrow();
+        if !can_export_peak_table(&s) {
+            Err(anyhow::anyhow!("no peak table is available"))
+        } else {
+            let sample = &s.run().samples[s.primary()];
+            export::write_peak_table_csv(&dst, s.run(), sample, table_x_axis(&s))
+        }
+    };
+    finish_export(ui, st, "Export peak table", &dst, result);
+}
+
+fn export_plot_png_dialog(ui: &AppWindow, st: &SharedState) {
+    if !can_export_plot(&st.borrow()) {
+        set_status_error(ui, st, "No plot is available to export".to_string());
+        return;
+    }
+    let export_overview = ui.get_active_tab() == 1;
+
+    let start_name = {
+        let s = st.borrow();
+        let suffix = if export_overview { "overview" } else { "plot" };
+        let stem = if export_overview {
+            export_run_stem(&s)
+        } else {
+            export_stem(&s)
+        };
+        format!("{stem}_{suffix}.png")
+    };
+    let Some(dst) = rfd::FileDialog::new()
+        .add_filter("PNG image", &["png"])
+        .set_file_name(start_name)
+        .save_file()
+    else {
+        return;
+    };
+
+    let result = {
+        let s = st.borrow();
+        if !can_export_plot(&s) {
+            Err(anyhow::anyhow!("no plot is available"))
+        } else if export_overview {
+            match render_overview_bitmap(&s) {
+                Some((buf, w, h)) => export::write_rgb_png(&dst, &buf, w, h),
+                None => Err(anyhow::anyhow!("no overview is available")),
+            }
+        } else {
+            let series = selected_series(&s);
+            let refs: Vec<&Series> = series.iter().collect();
+            let vp = s.viewport().unwrap_or_else(|| auto_fit_viewport(&s, &refs));
+            let highlight = if s.selection().len() == 1 {
+                s.highlight_x
+            } else {
+                None
+            };
+            let markers = marker_lines(&s);
+            let buf =
+                plot::render_overlay(&refs, &vp, highlight, &markers, plot::PLOT_W, plot::PLOT_H);
+            export::write_rgb_png(&dst, &buf, plot::PLOT_W, plot::PLOT_H)
+        }
+    };
+    finish_export(ui, st, "Export plot", &dst, result);
+}
+
+fn can_export_peak_table(st: &AppState) -> bool {
+    st.active_file().is_some() && !st.raw_mode() && st.run().samples.get(st.primary()).is_some()
+}
+
+fn can_export_plot(st: &AppState) -> bool {
+    st.active_file().is_some() && st.primary() < st.entry_count()
+}
+
+fn finish_export(
+    ui: &AppWindow,
+    st: &SharedState,
+    operation: &str,
+    dst: &std::path::Path,
+    result: anyhow::Result<()>,
+) {
+    match result {
+        Ok(()) => {
+            let message = format!(
+                "{}: {}",
+                operation.replacen("Export", "Exported", 1),
+                dst.display()
+            );
+            {
+                let mut s = st.borrow_mut();
+                s.error = None;
+                s.status = Some(message.clone());
+            }
+            ui.set_error_text(SharedString::default());
+            ui.set_status_text(SharedString::from(message));
+        }
+        Err(e) => set_status_error(ui, st, format!("{operation} failed: {e:#}")),
+    }
+}
+
+fn set_status_error(ui: &AppWindow, st: &SharedState, message: String) {
+    {
+        let mut s = st.borrow_mut();
+        s.error = Some(message.clone());
+        s.status = None;
+    }
+    ui.set_error_text(SharedString::from(message));
+    ui.set_status_text(SharedString::default());
+}
+
+fn export_stem(st: &AppState) -> String {
+    let mut parts = Vec::new();
+    parts.push(export_run_stem(st));
+
+    if st.selection().len() > 1 {
+        parts.push("overlay".to_string());
+    } else if st.raw_mode() {
+        if let Some(ch) = st.raw_channels().get(st.primary()) {
+            parts.push(ch.channel_id.to_string());
+        }
+    } else if let Some(sample) = st.run().samples.get(st.primary()) {
+        let label = if sample.name.trim().is_empty() {
+            format!("well_{}", sample.well_number)
+        } else {
+            format!("well_{}_{}", sample.well_number, sample.name.trim())
+        };
+        parts.push(label);
+    }
+
+    sanitize_export_stem(&parts.join("_"))
+}
+
+fn export_run_stem(st: &AppState) -> String {
+    let run_part = st
+        .source_path()
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(|n| strip_known_extension(n).to_string())
+        .or_else(|| {
+            let name = file_base_name(&st.run().assay.file_name);
+            (!name.is_empty()).then_some(strip_known_extension(&name).to_string())
+        })
+        .unwrap_or_else(|| "run".to_string());
+    sanitize_export_stem(&run_part)
+}
+
+fn strip_known_extension(name: &str) -> &str {
+    for suffix in [".xml.gz", ".csv.gz", ".xml", ".csv", ".xad", ".zip", ".raw"] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    name
+}
+
+fn sanitize_export_stem(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches(['_', '.']);
+    if trimmed.is_empty() {
+        "traceanalyzer".to_string()
+    } else {
+        trimmed.chars().take(96).collect()
+    }
+}
+
 /// Write the current run to `dst`, using the loaded source file as the template,
 /// then adopt `dst` as the new source and clear the dirty flag.
 fn do_save(ui: &AppWindow, st: &SharedState, dst: std::path::PathBuf) {
@@ -1037,14 +1293,26 @@ fn do_save(ui: &AppWindow, st: &SharedState, dst: std::path::PathBuf) {
                 let mut s = st.borrow_mut();
                 s.set_dirty(false);
                 s.set_source_path(Some(dst));
+                s.error = None;
+                s.status = Some("Saved changes".to_string());
             }
             let s = st.borrow();
-            ui.set_can_save(s.can_save());
+            ui.set_can_save(s.is_dirty() && s.can_save());
             ui.set_can_save_as(s.can_save_as());
             ui.set_error_text(SharedString::default());
+            ui.set_status_text(SharedString::from(s.status.clone().unwrap_or_default()));
             refresh_tree(ui, &s);
         }
-        Err(e) => ui.set_error_text(SharedString::from(format!("Save failed: {e:#}"))),
+        Err(e) => {
+            let message = format!("Save failed: {e:#}");
+            {
+                let mut s = st.borrow_mut();
+                s.error = Some(message.clone());
+                s.status = None;
+            }
+            ui.set_error_text(SharedString::from(message));
+            ui.set_status_text(SharedString::default());
+        }
     }
 }
 
@@ -1056,10 +1324,15 @@ fn rgb_to_image(buf: &[u8], w: u32, h: u32) -> Image {
 
 /// A plot-sized image with just empty axes, shown when no file is open.
 fn blank_plot_image() -> Image {
+    let (buf, w, h) = blank_plot_bitmap();
+    rgb_to_image(&buf, w, h)
+}
+
+fn blank_plot_bitmap() -> (Vec<u8>, u32, u32) {
     let refs: Vec<&Series> = Vec::new();
     let vp = plot::auto_viewport_multi(&refs);
     let buf = plot::render_overlay(&refs, &vp, None, &[], plot::PLOT_W, plot::PLOT_H);
-    rgb_to_image(&buf, plot::PLOT_W, plot::PLOT_H)
+    (buf, plot::PLOT_W, plot::PLOT_H)
 }
 
 /// Ensure a concrete viewport exists (materializing the auto-fit), returning it.

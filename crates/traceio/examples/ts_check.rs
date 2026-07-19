@@ -34,10 +34,17 @@ fn main() -> anyhow::Result<()> {
         let ladder = if s.is_ladder { " [ladder]" } else { "" };
         println!(
             "  well {:>3}  {:20}  trace {n}pts  size {lo:.0}..{hi:.0} {}  {} peaks{rin}{ladder}",
-            s.well_number, s.name, run.assay.length_unit, s.peaks.len()
+            s.well_number,
+            s.name,
+            run.assay.length_unit,
+            s.peaks.len()
         );
         for p in &s.peaks {
-            let tag = if p.observations.is_empty() { "peak" } else { &p.observations };
+            let tag = if p.observations.is_empty() {
+                "peak"
+            } else {
+                &p.observations
+            };
             println!(
                 "        {tag:14} {:.0} {}  conc {:.2}  molarity {:.1}  area {:.3}",
                 p.length, run.assay.length_unit, p.concentration, p.molarity, p.area

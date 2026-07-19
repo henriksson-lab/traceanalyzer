@@ -16,6 +16,7 @@ anyhow.workspace = true
 slint = { version = "1", features = ["unstable-winit-030"] }
 # ab_glyph = bundled font (no system-font dependency; works headless/portable).
 plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series", "area_series", "ab_glyph"] }
+png = "0.18"
 rfd = "0.15"
 
 [build-dependencies]

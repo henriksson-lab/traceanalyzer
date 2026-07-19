@@ -20,11 +20,16 @@
 //!   markers, ladder detection). Computes concentration/molarity from the
 //!   standard FA ladder setpoints and marker-area scaling. Validated against the
 //!   ProSize CSV export.
+//!
+//! Most applications should start with [`io::read_path`] or
+//! [`io::detect_format`]. The format modules remain available for callers that
+//! already know their input type.
 
 pub mod bioanalyzer;
 pub mod calibration;
 pub mod concentration;
 pub mod fa;
+pub mod io;
 pub mod model;
 pub mod save;
 pub mod tapestation;

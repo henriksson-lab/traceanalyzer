@@ -8,8 +8,8 @@ use std::path::PathBuf;
 /// The D1000 demo XML (its `_Electropherogram.csv` sibling sits alongside), or
 /// `None` when the fixtures have not been fetched.
 fn d1000_xml() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../testdata/tapestation/d1000.xml.gz");
+    let p =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tapestation/d1000.xml.gz");
     p.is_file().then_some(p)
 }
 
@@ -39,12 +39,23 @@ fn reads_d1000_export_with_traces_and_sizing() {
     // Traces attached from the CSV and size-calibrated across the ladder span.
     assert!(ladder.fluorescence.len() > 500, "trace attached");
     assert_eq!(ladder.time.len(), ladder.fluorescence.len());
-    let finite: Vec<f64> = ladder.length.iter().copied().filter(|v| v.is_finite()).collect();
+    let finite: Vec<f64> = ladder
+        .length
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect();
     assert!(finite.len() > 300, "sized across the ladder");
     let lo = finite.iter().cloned().fold(f64::INFINITY, f64::min);
     let hi = finite.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    assert!((lo - 25.0).abs() < 5.0, "calibration starts ~25 bp, got {lo}");
-    assert!((hi - 1500.0).abs() < 10.0, "calibration ends ~1500 bp, got {hi}");
+    assert!(
+        (lo - 25.0).abs() < 5.0,
+        "calibration starts ~25 bp, got {lo}"
+    );
+    assert!(
+        (hi - 1500.0).abs() < 10.0,
+        "calibration ends ~1500 bp, got {hi}"
+    );
 
     // A "300bp fragment" sample sizes its main peak near 300 bp (from the XML).
     let frag = run
@@ -58,6 +69,10 @@ fn reads_d1000_export_with_traces_and_sizing() {
         .filter(|p| p.observations.is_empty()) // exclude the markers
         .max_by(|a, b| a.area.total_cmp(&b.area))
         .expect("a sample peak");
-    assert!((main.length - 300.0).abs() < 30.0, "300bp fragment sized {}", main.length);
+    assert!(
+        (main.length - 300.0).abs() < 30.0,
+        "300bp fragment sized {}",
+        main.length
+    );
     assert!(main.concentration.is_finite() && main.concentration > 0.0);
 }

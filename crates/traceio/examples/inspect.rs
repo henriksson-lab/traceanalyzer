@@ -1,21 +1,20 @@
-//! Headless inspector: parse a Bioanalyzer file and print a summary.
+//! Headless inspector: parse any supported electrophoresis file and print a summary.
 //!
-//! Usage: cargo run -p traceio --example inspect -- <file.xad | file.xml | file.xml.gz>
-
-use std::io::Read;
+//! Usage: cargo run -p traceio --example inspect -- <path>
 
 fn main() -> anyhow::Result<()> {
     let path = std::env::args()
         .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("usage: inspect <file.xad|file.xml|file.xml.gz>"))?;
-    let mut run = load(&path)?;
-    // Per-point ladder calibration (length in bp/nt for every trace point).
-    if let Err(e) =
-        traceio::calibration::calculate_length(&mut run, traceio::calibration::Method::Hyman)
-    {
-        eprintln!("(calibration skipped: {e})");
+        .ok_or_else(|| anyhow::anyhow!("usage: inspect <path>"))?;
+    let loaded = traceio::io::read_path(&path)?;
+    for warning in &loaded.warnings {
+        eprintln!("({warning})");
     }
+    let run = &loaded.run;
 
+    println!("Path:        {}", loaded.source.path.display());
+    println!("Identity:    {}", loaded.source.identity.display());
+    println!("Format:      {:?}", loaded.source.format);
     println!("File:        {}", run.assay.file_name);
     println!(
         "Assay:       {} ({})",
@@ -48,43 +47,20 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // For native .xad, also show the raw detector channels (the actual signal;
-    // per-well processed traces are recomputed by 2100 Expert, see docs).
-    if path.ends_with(".xad") {
-        match traceio::xad::read_xad_raw_channels(std::path::Path::new(&path)) {
-            Ok(chs) if !chs.is_empty() => {
-                println!("\nRaw detector channels (whole-chip acquisition):");
-                for c in &chs {
-                    let secs = c.x_step * c.signal.len() as f64;
-                    println!(
-                        "  {:<18} {:>7} samples  @ {}s step  (~{:.0}s run)",
-                        c.channel_id,
-                        c.signal.len(),
-                        c.x_step,
-                        secs
-                    );
-                }
-            }
-            _ => {}
+    if !loaded.raw_channels.is_empty() {
+        println!("\nRaw detector channels (whole-chip acquisition):");
+        for c in &loaded.raw_channels {
+            let secs = c.x_step * c.signal.len() as f64;
+            println!(
+                "  {:<18} {:>7} samples  @ {}s step  (~{:.0}s run)",
+                c.channel_id,
+                c.signal.len(),
+                c.x_step,
+                secs
+            );
         }
     }
     Ok(())
-}
-
-fn load(path: &str) -> anyhow::Result<traceio::Electrophoresis> {
-    let p = std::path::Path::new(path);
-    if path.ends_with(".xad") {
-        traceio::xad::read_xad_file(p)
-    } else if path.ends_with(".xml.gz") {
-        let raw = std::fs::read(p)?;
-        let mut d = flate2::read::GzDecoder::new(&raw[..]);
-        let mut s = String::new();
-        d.read_to_string(&mut s)?;
-        traceio::bioanalyzer::parse_xml(&s)
-    } else {
-        let s = std::fs::read_to_string(p)?;
-        traceio::bioanalyzer::parse_xml(&s)
-    }
 }
 
 /// Min/max of the calibrated (finite) per-point length, e.g. "15–1500 bp".

@@ -19,6 +19,7 @@
 //! Bioanalyzer path this reader fills each sample's `length` directly by
 //! interpolating the ladder and does **not** use [`crate::calibration`].
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -53,6 +54,38 @@ const LADDER_CONC: [f64; 16] = [
 struct CapInfo {
     well: String,
     sample_id: String,
+    description: String,
+}
+
+/// Fragment Analyzer run metadata that does not fit the normalized
+/// [`Electrophoresis`] model.
+#[derive(Debug, Clone, Default)]
+pub struct FaMetadata {
+    /// Header fields from the `.txt` sidecar before the capillary list.
+    pub run_header: BTreeMap<String, String>,
+    /// Parsed `method.mthd` sections.
+    pub method: IniDocument,
+    /// Parsed `.ANAI` analysis settings.
+    pub analysis: IniDocument,
+    /// Current/voltage/pressure samples from `.current`, one row per scan when
+    /// present.
+    pub current: Vec<FaCurrentPoint>,
+    /// Raw per-frame timing/status lines from `Timing.txt`.
+    pub timing: Vec<String>,
+    /// Raw exposure/status lines from `ExpTime.txt`.
+    pub exposure: Vec<String>,
+    /// Bytes from `CameraImage.bmp`; observed files are PNG despite the name.
+    pub camera_image: Option<Vec<u8>>,
+}
+
+/// INI-like document, preserving section and key order within sorted maps.
+pub type IniDocument = BTreeMap<String, BTreeMap<String, String>>;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FaCurrentPoint {
+    pub current_ua: f64,
+    pub voltage_kv: f64,
+    pub pressure_psi: f64,
 }
 
 /// Read a Fragment Analyzer run. `path` may be the `.raw` file itself or the run
@@ -79,6 +112,59 @@ pub fn read_fa_run(path: &Path) -> Result<Electrophoresis> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     build_fa_run(&raw, pks.as_deref(), txt.as_deref(), file_name)
+}
+
+/// Read FA-specific method, analysis, and QC sidecars. Missing optional files
+/// are left empty; malformed present files return an error with their file name.
+pub fn read_fa_metadata(path: &Path) -> Result<FaMetadata> {
+    if has_zip_extension(path) {
+        return read_fa_metadata_zip(path);
+    }
+
+    let raw_path = resolve_raw_path(path)?;
+    let dir = raw_path.parent().unwrap_or_else(|| Path::new("."));
+    let text_sibling = |ext: &str| -> Result<Option<String>> {
+        sibling_path(dir, &raw_path, ext)?
+            .map(|p| read_lossy_text(&p))
+            .transpose()
+    };
+    let txt = text_sibling("txt")?;
+    let method = dir.join("method.mthd");
+    let anai = text_sibling("ANAI")?;
+    let current = text_sibling("current")?;
+    let timing = dir.join("Timing.txt");
+    let exposure = dir.join("ExpTime.txt");
+    let camera = dir.join("CameraImage.bmp");
+
+    Ok(FaMetadata {
+        run_header: txt.as_deref().map(parse_txt_header).unwrap_or_default(),
+        method: if method.exists() {
+            parse_ini(&read_lossy_text(&method)?)
+        } else {
+            IniDocument::default()
+        },
+        analysis: anai.as_deref().map(parse_ini).unwrap_or_default(),
+        current: current
+            .as_deref()
+            .map(parse_current_log)
+            .transpose()?
+            .unwrap_or_default(),
+        timing: if timing.exists() {
+            read_lines_lossy(&timing)?
+        } else {
+            Vec::new()
+        },
+        exposure: if exposure.exists() {
+            read_lines_lossy(&exposure)?
+        } else {
+            Vec::new()
+        },
+        camera_image: if camera.exists() {
+            Some(std::fs::read(&camera).with_context(|| format!("reading {}", camera.display()))?)
+        } else {
+            None
+        },
+    })
 }
 
 /// Build an [`Electrophoresis`] from the raw bytes of the three FA files this
@@ -147,6 +233,84 @@ fn read_fa_zip(path: &Path) -> Result<Electrophoresis> {
     build_fa_run(&raw, pks.as_deref(), txt.as_deref(), file_name)
 }
 
+fn read_fa_metadata_zip(path: &Path) -> Result<FaMetadata> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .with_context(|| format!("reading zip {}", path.display()))?;
+
+    let mut names = Vec::with_capacity(zip.len());
+    let mut raw_name: Option<String> = None;
+    for i in 0..zip.len() {
+        let mut e = zip.by_index(i)?;
+        let name = e.name().to_string();
+        if raw_name.is_none() {
+            if let Some(name) = fa_raw_entry_name(&mut e) {
+                raw_name = Some(name.clone());
+            }
+        }
+        names.push(name);
+    }
+    let raw_name = raw_name.ok_or_else(|| {
+        anyhow!(
+            "{} is not a Fragment Analyzer run (no .raw entry with FA magic)",
+            path.display()
+        )
+    })?;
+    let stem = strip_known_ext(&raw_name);
+    let prefix = raw_name
+        .rsplit_once('/')
+        .map(|(prefix, _)| format!("{prefix}/"))
+        .unwrap_or_default();
+
+    let txt = find_sibling(&names, stem, "txt")?
+        .map(|n| read_zip_entry(&mut zip, &n))
+        .transpose()?
+        .map(lossy_string);
+    let anai = find_sibling(&names, stem, "ANAI")?
+        .map(|n| read_zip_entry(&mut zip, &n))
+        .transpose()?
+        .map(lossy_string);
+    let current = find_sibling(&names, stem, "current")?
+        .map(|n| read_zip_entry(&mut zip, &n))
+        .transpose()?
+        .map(lossy_string);
+    let method_name = find_named_entry(&names, &prefix, "method.mthd");
+    let timing_name = find_named_entry(&names, &prefix, "Timing.txt");
+    let exposure_name = find_named_entry(&names, &prefix, "ExpTime.txt");
+    let camera_name = find_named_entry(&names, &prefix, "CameraImage.bmp");
+
+    Ok(FaMetadata {
+        run_header: txt.as_deref().map(parse_txt_header).unwrap_or_default(),
+        method: method_name
+            .map(|n| read_zip_entry(&mut zip, &n).map(lossy_string))
+            .transpose()?
+            .as_deref()
+            .map(parse_ini)
+            .unwrap_or_default(),
+        analysis: anai.as_deref().map(parse_ini).unwrap_or_default(),
+        current: current
+            .as_deref()
+            .map(parse_current_log)
+            .transpose()?
+            .unwrap_or_default(),
+        timing: timing_name
+            .map(|n| read_zip_entry(&mut zip, &n).map(lossy_string))
+            .transpose()?
+            .as_deref()
+            .map(lines)
+            .unwrap_or_default(),
+        exposure: exposure_name
+            .map(|n| read_zip_entry(&mut zip, &n).map(lossy_string))
+            .transpose()?
+            .as_deref()
+            .map(lines)
+            .unwrap_or_default(),
+        camera_image: camera_name
+            .map(|n| read_zip_entry(&mut zip, &n))
+            .transpose()?,
+    })
+}
+
 fn read_zip_entry<R: std::io::Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     name: &str,
@@ -168,6 +332,108 @@ fn fa_raw_entry_name(entry: &mut zip::read::ZipFile<'_>) -> Option<String> {
     let name = entry.name().to_string();
     let mut magic = [0u8; 4];
     (entry.read_exact(&mut magic).is_ok() && magic == RAW_MAGIC).then_some(name)
+}
+
+fn find_named_entry(names: &[String], prefix: &str, name: &str) -> Option<String> {
+    let exact = format!("{prefix}{name}");
+    names
+        .iter()
+        .find(|n| n.eq_ignore_ascii_case(&exact))
+        .cloned()
+        .or_else(|| {
+            names
+                .iter()
+                .find(|n| basename(n).eq_ignore_ascii_case(name))
+                .cloned()
+        })
+}
+
+fn read_lossy_text(path: &Path) -> Result<String> {
+    std::fs::read(path)
+        .map(lossy_string)
+        .with_context(|| format!("reading {}", path.display()))
+}
+
+fn read_lines_lossy(path: &Path) -> Result<Vec<String>> {
+    read_lossy_text(path).map(|s| lines(&s))
+}
+
+fn lossy_string(bytes: Vec<u8>) -> String {
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .collect()
+}
+
+fn parse_txt_header(text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("Capillary #:") || line.starts_with("====") {
+            break;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            out.insert(key.trim().to_string(), value.trim().to_string());
+        }
+    }
+    out
+}
+
+fn parse_ini(text: &str) -> IniDocument {
+    let mut out = IniDocument::new();
+    let mut section = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = name.trim().to_string();
+            out.entry(section.clone()).or_default();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        out.entry(section.clone()).or_default().insert(
+            key.trim().to_string(),
+            value.trim().trim_matches('"').to_string(),
+        );
+    }
+    out
+}
+
+fn parse_current_log(text: &str) -> Result<Vec<FaCurrentPoint>> {
+    let mut rows = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if idx == 0 && line.to_ascii_lowercase().contains("current") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() != 3 {
+            bail!("FA .current line {} has {} columns", idx + 1, cols.len());
+        }
+        rows.push(FaCurrentPoint {
+            current_ua: parse_decimal(cols[0])?,
+            voltage_kv: parse_decimal(cols[1])?,
+            pressure_psi: parse_decimal(cols[2])?,
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_decimal(s: &str) -> Result<f64> {
+    s.trim()
+        .replace(',', ".")
+        .parse::<f64>()
+        .with_context(|| format!("parsing numeric value {s:?}"))
 }
 
 /// Save user-renamed FA sample IDs back to the `.txt` sidecar. The `.raw`
@@ -607,6 +873,7 @@ fn read_prefix(path: &Path, buf: &mut [u8]) -> Result<()> {
 struct RawTraces {
     scans: usize,
     width: usize,
+    creation_date: String,
     /// `scans * width` big-endian u16 intensities.
     data: Vec<u16>,
     /// Centre pixel column for each capillary (in acquisition order).
@@ -654,9 +921,11 @@ fn parse_raw(raw: &[u8], nwells_hint: usize) -> Result<RawTraces> {
     }
 
     let columns = capillary_columns(raw, width, nwells_hint)?;
+    let creation_date = raw_header_datetime(raw);
     Ok(RawTraces {
         scans,
         width,
+        creation_date,
         data,
         columns,
     })
@@ -703,17 +972,39 @@ fn capillary_columns(raw: &[u8], width: usize, nwells_hint: usize) -> Result<Vec
     best.ok_or_else(|| anyhow!("FA .raw: could not locate the capillary column table"))
 }
 
-/// Parse the `.txt` sidecar into per-capillary (well, sample id), in order.
-/// Parse the `.txt` sidecar text into per-capillary (well, sample id), in order.
+fn raw_header_datetime(raw: &[u8]) -> String {
+    let date = ascii_cstr_field(raw, 0x64, 0x30);
+    let time = ascii_cstr_field(raw, 0x96, 0x20);
+    match (date.as_deref(), time.as_deref()) {
+        (Some(date), Some(time)) => format!("{date} {time}"),
+        (Some(date), None) => date.to_string(),
+        (None, Some(time)) => time.to_string(),
+        (None, None) => String::new(),
+    }
+}
+
+fn ascii_cstr_field(raw: &[u8], start: usize, len: usize) -> Option<String> {
+    let bytes = raw.get(start..start + len)?;
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let s = std::str::from_utf8(&bytes[..end]).ok()?.trim();
+    (!s.is_empty() && s.chars().all(|c| c.is_ascii() && !c.is_control())).then(|| s.to_string())
+}
+
+/// Parse the `.txt` sidecar text into per-capillary metadata, in order.
 fn parse_txt(text: &str) -> Vec<CapInfo> {
     let mut caps = Vec::new();
-    let (mut well, mut sample) = (String::new(), String::new());
+    let (mut well, mut sample, mut description) = (String::new(), String::new(), String::new());
     let mut in_cap = false;
-    let flush = |caps: &mut Vec<CapInfo>, w: &mut String, s: &mut String, in_cap: &mut bool| {
+    let flush = |caps: &mut Vec<CapInfo>,
+                 w: &mut String,
+                 s: &mut String,
+                 d: &mut String,
+                 in_cap: &mut bool| {
         if *in_cap {
             caps.push(CapInfo {
                 well: std::mem::take(w),
                 sample_id: std::mem::take(s),
+                description: std::mem::take(d),
             });
         }
         *in_cap = false;
@@ -721,15 +1012,29 @@ fn parse_txt(text: &str) -> Vec<CapInfo> {
     for line in text.lines() {
         let line = line.trim();
         if let Some(_rest) = line.strip_prefix("Capillary #:") {
-            flush(&mut caps, &mut well, &mut sample, &mut in_cap);
+            flush(
+                &mut caps,
+                &mut well,
+                &mut sample,
+                &mut description,
+                &mut in_cap,
+            );
             in_cap = true;
         } else if let Some(rest) = line.strip_prefix("Well:") {
             well = rest.trim().to_string();
         } else if let Some(rest) = line.strip_prefix("Sample ID:") {
             sample = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("Description:") {
+            description = rest.trim().to_string();
         }
     }
-    flush(&mut caps, &mut well, &mut sample, &mut in_cap);
+    flush(
+        &mut caps,
+        &mut well,
+        &mut sample,
+        &mut description,
+        &mut in_cap,
+    );
     caps
 }
 
@@ -994,7 +1299,7 @@ fn build_run(
             name,
             category: String::new(),
             is_ladder,
-            comment: String::new(),
+            comment: info.map(|c| c.description.clone()).unwrap_or_default(),
             observations: String::new(),
             rin: None,
             time,
@@ -1010,7 +1315,7 @@ fn build_run(
 
     let assay = AssayInfo {
         file_name,
-        creation_date: String::new(),
+        creation_date: traces.creation_date,
         assay_name: "Fragment Analyzer".to_string(),
         assay_type: "DNA".to_string(),
         length_unit: "bp".to_string(),
@@ -1133,6 +1438,9 @@ mod tests {
         let mut raw = vec![0u8; DATA_START + scans * width * 2];
         raw[..4].copy_from_slice(RAW_MAGIC);
         put_u16(&mut raw, 0xff, width as u16);
+        raw[0x64..0x64 + b"Wednesday, November 19, 2025".len()]
+            .copy_from_slice(b"Wednesday, November 19, 2025");
+        raw[0x96..0x96 + b"4:19:23 PM".len()].copy_from_slice(b"4:19:23 PM");
 
         let table = 0x40;
         put_u16(&mut raw, table, 0);
@@ -1159,6 +1467,10 @@ mod tests {
 
         assert_eq!(parsed.width, 20);
         assert_eq!(parsed.scans, 3);
+        assert_eq!(
+            parsed.creation_date,
+            "Wednesday, November 19, 2025 4:19:23 PM"
+        );
         assert_eq!(parsed.columns, vec![5, 14]);
         assert_eq!(parsed.data.len(), 60);
         assert_eq!(parsed.value(0, 2), 205.0);
@@ -1235,6 +1547,20 @@ mod tests {
     }
 
     #[test]
+    fn txt_sidecar_parse_keeps_sample_descriptions() {
+        let caps = parse_txt(
+            "Capillary #: 1\nWell: D1\nSample ID: alpha\nDescription: note one\n\
+             Capillary #: 2\nWell: D2\nSample ID: beta\nDescription: note two\n",
+        );
+
+        assert_eq!(caps.len(), 2);
+        assert_eq!(caps[0].well, "D1");
+        assert_eq!(caps[0].sample_id, "alpha");
+        assert_eq!(caps[0].description, "note one");
+        assert_eq!(caps[1].description, "note two");
+    }
+
+    #[test]
     fn fa_path_detection_accepts_uppercase_raw_extension() {
         let dir = std::env::temp_dir().join(format!(
             "traceio_fa_upper_raw_{}_{}",
@@ -1278,6 +1604,92 @@ mod tests {
 
         assert_eq!(run.samples[0].name, "D1: alpha");
         assert_eq!(run.samples[1].name, "D2: beta");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn build_run_maps_raw_creation_date_and_txt_descriptions() {
+        let raw = synthetic_raw(20, 3, &[5, 14]);
+        let txt = "Capillary #: 1\nWell: D1\nSample ID: alpha\nDescription: first note\n\
+                   Capillary #: 2\nWell: D2\nSample ID: beta\nDescription: second note\n";
+
+        let run = build_fa_run(&raw, None, Some(txt), "run.raw".to_string()).unwrap();
+
+        assert_eq!(
+            run.assay.creation_date,
+            "Wednesday, November 19, 2025 4:19:23 PM"
+        );
+        assert_eq!(run.samples[0].comment, "first note");
+        assert_eq!(run.samples[1].comment, "second note");
+    }
+
+    #[test]
+    fn metadata_parses_ini_current_logs_and_header() {
+        let txt = "Raw file: C:\\AATI\\Data\\run.raw\nOperator: admin\nNotes: ok\n\
+                   ============================================================\n\
+                   Capillary #: 1\nWell: D1\nSample ID: alpha\n";
+        let method = "[Separation]\nKV=7.00\nTime minutes=25.00\n";
+        let anai = "[Size Calibration]\nCalibration Ladder = \"1,100,200\"\nColumn = 11\n";
+        let current = "Current(uA)\tVoltage(kV)\tPressure(PSI)\n54.0\t6.99\t-0.007\n";
+
+        let header = parse_txt_header(txt);
+        let method = parse_ini(method);
+        let anai = parse_ini(anai);
+        let current = parse_current_log(current).unwrap();
+
+        assert_eq!(header["Operator"], "admin");
+        assert_eq!(header["Raw file"], "C:\\AATI\\Data\\run.raw");
+        assert_eq!(method["Separation"]["KV"], "7.00");
+        assert_eq!(anai["Size Calibration"]["Calibration Ladder"], "1,100,200");
+        assert_eq!(
+            current[0],
+            FaCurrentPoint {
+                current_ua: 54.0,
+                voltage_kv: 6.99,
+                pressure_psi: -0.007,
+            }
+        );
+    }
+
+    #[test]
+    fn filesystem_metadata_reads_known_sidecars() {
+        let dir = std::env::temp_dir().join(format!(
+            "traceio_fa_metadata_fs_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("run.raw");
+        std::fs::write(&raw, synthetic_raw(20, 3, &[5, 14])).unwrap();
+        std::fs::write(
+            dir.join("run.txt"),
+            "Raw file: C:\\AATI\\Data\\run.raw\nOperator: admin\n\
+             Capillary #: 1\nWell: D1\nSample ID: alpha\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("method.mthd"), "[Separation]\nKV=7.00\n").unwrap();
+        std::fs::write(dir.join("run.ANAI"), "[General]\nMode = 2\n").unwrap();
+        std::fs::write(
+            dir.join("run.current"),
+            "Current(uA)\tVoltage(kV)\tPressure(PSI)\n54.0\t7.00\t-0.01\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("Timing.txt"), "Frame 1: Start\n").unwrap();
+        std::fs::write(dir.join("ExpTime.txt"), "845ms, 50\n").unwrap();
+        std::fs::write(dir.join("CameraImage.bmp"), b"\x89PNG\r\n").unwrap();
+
+        let meta = read_fa_metadata(&raw).unwrap();
+
+        assert_eq!(meta.run_header["Operator"], "admin");
+        assert_eq!(meta.method["Separation"]["KV"], "7.00");
+        assert_eq!(meta.analysis["General"]["Mode"], "2");
+        assert_eq!(meta.current.len(), 1);
+        assert_eq!(meta.timing, vec!["Frame 1: Start"]);
+        assert_eq!(meta.exposure, vec!["845ms, 50"]);
+        assert_eq!(meta.camera_image.as_deref(), Some(&b"\x89PNG\r\n"[..]));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1399,6 +1811,56 @@ mod tests {
         let run = read_fa_run(&zip_path).unwrap();
 
         assert_eq!(run.samples[0].name, "D1: real");
+        std::fs::remove_file(zip_path).unwrap();
+    }
+
+    #[test]
+    fn zip_metadata_reads_known_sidecars() {
+        use std::io::Write;
+
+        let zip_path = std::env::temp_dir().join(format!(
+            "traceio_fa_metadata_zip_{}_{}.zip",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let out = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(out);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("folder/run.raw", opts).unwrap();
+            zip.write_all(&synthetic_raw(20, 3, &[5, 14])).unwrap();
+            zip.start_file("folder/run.txt", opts).unwrap();
+            zip.write_all(b"Raw file: C:\\AATI\\Data\\run.raw\nOperator: admin\n")
+                .unwrap();
+            zip.start_file("folder/run.ANAI", opts).unwrap();
+            zip.write_all(b"[General]\nMode = 2\n").unwrap();
+            zip.start_file("folder/run.current", opts).unwrap();
+            zip.write_all(b"Current(uA)\tVoltage(kV)\tPressure(PSI)\n54.0\t7.00\t-0.01\n")
+                .unwrap();
+            zip.start_file("folder/method.mthd", opts).unwrap();
+            zip.write_all(b"[Separation]\nKV=7.00\n").unwrap();
+            zip.start_file("folder/Timing.txt", opts).unwrap();
+            zip.write_all(b"Frame 1: Start\n").unwrap();
+            zip.start_file("folder/ExpTime.txt", opts).unwrap();
+            zip.write_all(b"845ms, 50\n").unwrap();
+            zip.start_file("folder/CameraImage.bmp", opts).unwrap();
+            zip.write_all(b"\x89PNG\r\n").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let meta = read_fa_metadata(&zip_path).unwrap();
+
+        assert_eq!(meta.run_header["Operator"], "admin");
+        assert_eq!(meta.method["Separation"]["KV"], "7.00");
+        assert_eq!(meta.analysis["General"]["Mode"], "2");
+        assert_eq!(meta.current.len(), 1);
+        assert_eq!(meta.timing, vec!["Frame 1: Start"]);
+        assert_eq!(meta.exposure, vec!["845ms, 50"]);
+        assert_eq!(meta.camera_image.as_deref(), Some(&b"\x89PNG\r\n"[..]));
         std::fs::remove_file(zip_path).unwrap();
     }
 

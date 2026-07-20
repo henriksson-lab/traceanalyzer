@@ -30,9 +30,10 @@ self-describing lengths, inflates, and validates. A legacy 1-byte/9-byte framing
 (original grimbough `readXAD.R`) is kept as a fallback.
 
 The inner XML is the **raw acquisition** layout (`Chip/RawSignals/…` +
-per-sample metadata), **not** the processed export — so `read_xad_file` returns
-assay info + defined ladder + sample metadata, and `read_xad_raw_channels`
-returns the raw detector electropherograms (Blue/Red). The
+limited per-sample/assay fields), **not** the processed export — so
+`read_xad_file` returns the fields currently mapped into the shared model plus
+the defined ladder, and `read_xad_raw_channels` returns the raw detector
+electropherograms (Blue/Red). The
 `bioanalyzer::parse_xml` element paths (`ProcessedSignal`, `PeakMolecular`,
 `DARRIN`, …) apply to the **export** XML, which does contain processed per-well
 results.

@@ -10,7 +10,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use traceio::calibration::MarkerOverride;
+use traceio::calibration::{marker_times, MarkerOverride};
+use traceio::io::{DetectedFormat, SaveCapabilities, SourceCapabilities};
 use traceio::xad::RawChannel;
 use traceio::Electrophoresis;
 
@@ -65,9 +66,21 @@ pub struct OpenFile {
     /// Optional human-readable sidecar metadata/QC summary for native formats
     /// that expose it outside the normalized trace model.
     pub metadata_text: Option<String>,
+    /// Compact source-specific key/value summary shown in the Metadata tab.
+    pub metadata_rows: Vec<(String, String)>,
     /// Path the run was loaded from (target for File → Save).
     pub source_path: Option<PathBuf>,
-    /// True when the run has in-memory edits (e.g. renamed wells) not yet saved.
+    /// User-facing path that was opened or last saved. For multi-file formats
+    /// this can differ from the canonical save/dedup identity in `source_path`.
+    pub opened_path: Option<PathBuf>,
+    /// Source capabilities from `traceio` detection, when this file came through
+    /// the path-oriented loader.
+    pub source_capabilities: Option<SourceCapabilities>,
+    /// Save capabilities from `traceio` detection, when available.
+    pub save_capabilities: Option<SaveCapabilities>,
+    /// True when the run has saveable in-memory edits (e.g. renamed wells).
+    /// Marker overrides are session-only calibration/view state and must not
+    /// make Save imply persistence until the save layer supports them.
     pub dirty: bool,
     /// Whether this file's node in the well tree is expanded.
     pub expanded: bool,
@@ -92,7 +105,11 @@ impl OpenFile {
             run,
             raw_channels,
             metadata_text: None,
+            metadata_rows: Vec::new(),
+            opened_path: source_path.clone(),
             source_path,
+            source_capabilities: None,
+            save_capabilities: None,
             dirty: false,
             expanded: true,
             selection: vec![0],
@@ -119,6 +136,14 @@ impl OpenFile {
                 .and_then(|p| p.extension())
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("raw"))
+    }
+
+    fn bioanalyzer_xad_mode(&self) -> bool {
+        self.source_path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("xad"))
     }
 
     /// True for TapeStation exports. They are intentionally read-only: the XML
@@ -152,6 +177,10 @@ impl OpenFile {
                 })
                 .unwrap_or(false)
             || self.run.samples.iter().any(|s| !s.regions.is_empty())
+    }
+
+    fn has_processed_sample_data(&self) -> bool {
+        self.run.samples.iter().any(sample_has_processed_data)
     }
 
     /// Number of selectable entries in the current mode.
@@ -197,7 +226,15 @@ impl OpenFile {
 
     /// File-node label: basename (or "run"), plus " (mod)" when unsaved.
     fn node_label(&self) -> String {
-        let mut label = if self.run.assay.file_name.is_empty() {
+        let source_label = self
+            .opened_path
+            .as_ref()
+            .or(self.source_path.as_ref())
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned());
+        let mut label = if let Some(name) = source_label {
+            name
+        } else if self.run.assay.file_name.is_empty() {
             "run".to_string()
         } else {
             file_base_name(&self.run.assay.file_name)
@@ -308,6 +345,68 @@ impl AppState {
         self.reset_transient();
     }
 
+    pub fn add_file_with_capabilities(
+        &mut self,
+        run: Electrophoresis,
+        raw_channels: Vec<RawChannel>,
+        source_path: Option<PathBuf>,
+        source_capabilities: SourceCapabilities,
+        save_capabilities: SaveCapabilities,
+    ) {
+        self.files
+            .push(OpenFile::new(run, raw_channels, source_path));
+        if let Some(file) = self.files.last_mut() {
+            file.source_capabilities = Some(source_capabilities);
+            file.save_capabilities = Some(save_capabilities);
+        }
+        self.active = Some(self.files.len() - 1);
+        self.reset_transient();
+    }
+
+    pub fn replace_active_file_with_capabilities(
+        &mut self,
+        run: Electrophoresis,
+        raw_channels: Vec<RawChannel>,
+        source_path: Option<PathBuf>,
+        source_capabilities: SourceCapabilities,
+        save_capabilities: SaveCapabilities,
+    ) {
+        let Some(idx) = self.active else {
+            return;
+        };
+        if idx >= self.files.len() {
+            return;
+        }
+        let old = &self.files[idx];
+        let expanded = old.expanded;
+        let opened_path = old.opened_path.clone();
+        let old_selection = old.selection.clone();
+        let old_anchor = old.anchor;
+        let viewport = old.viewport;
+        let overrides = old.overrides.clone();
+        let mut file = OpenFile::new(run, raw_channels, source_path);
+        let entry_count = file.entry_count();
+        file.expanded = expanded;
+        file.opened_path = opened_path;
+        file.selection = old_selection
+            .into_iter()
+            .filter(|&idx| idx < entry_count)
+            .collect();
+        if file.selection.is_empty() && entry_count > 0 {
+            file.selection.push(0);
+        }
+        file.anchor = old_anchor.min(entry_count.saturating_sub(1));
+        file.viewport = viewport;
+        let sample_count = file.run.samples.len();
+        file.overrides = overrides
+            .into_iter()
+            .filter(|(idx, _)| *idx < sample_count)
+            .collect();
+        file.source_capabilities = Some(source_capabilities);
+        file.save_capabilities = Some(save_capabilities);
+        self.files[idx] = file;
+    }
+
     /// Index of an already-open file whose source matches `path` (compared
     /// canonically), if any — so re-opening a run just re-activates it.
     pub fn find_file_by_source(&self, path: &std::path::Path) -> Option<usize> {
@@ -333,6 +432,7 @@ impl AppState {
         }
         self.files.remove(idx);
         self.active = if self.files.is_empty() {
+            self.reset_no_active_file();
             None
         } else {
             let a = self.active.unwrap_or(0);
@@ -347,6 +447,14 @@ impl AppState {
         self.highlight_x = None;
         self.grabbed = None;
         self.table_peak_x.clear();
+    }
+
+    /// Drop file-scoped view controls when there is no active file to apply
+    /// them to. Overview toggles remain application preferences.
+    fn reset_no_active_file(&mut self) {
+        self.normalize = false;
+        self.y_mode = YMode::Fluorescence;
+        self.marker_edit = false;
     }
 
     // ---- pervasive accessors delegating to the active file -----------------
@@ -376,6 +484,16 @@ impl AppState {
             f.metadata_text = text;
         }
     }
+    pub fn metadata_rows(&self) -> &[(String, String)] {
+        self.active_file()
+            .map(|f| f.metadata_rows.as_slice())
+            .unwrap_or(&[])
+    }
+    pub fn set_active_metadata_rows(&mut self, rows: Vec<(String, String)>) {
+        if let Some(f) = self.active_file_mut() {
+            f.metadata_rows = rows;
+        }
+    }
     pub fn selection(&self) -> &[usize] {
         self.active_file()
             .map(|f| f.selection.as_slice())
@@ -395,12 +513,43 @@ impl AppState {
     pub fn overrides_mut(&mut self) -> &mut HashMap<usize, MarkerOverride> {
         &mut self.active_file_mut().expect("no active file").overrides
     }
+    pub fn has_marker_overrides(&self) -> bool {
+        self.active_file()
+            .is_some_and(|f| file_has_effective_marker_overrides(f))
+    }
+    pub fn file_has_marker_overrides(&self, idx: usize) -> bool {
+        self.files
+            .get(idx)
+            .is_some_and(file_has_effective_marker_overrides)
+    }
+    pub fn file_sample_has_marker_override(&self, file_idx: usize, sample_idx: usize) -> bool {
+        self.files
+            .get(file_idx)
+            .is_some_and(|f| sample_has_effective_marker_override(f, sample_idx))
+    }
     pub fn source_path(&self) -> Option<PathBuf> {
         self.active_file().and_then(|f| f.source_path.clone())
+    }
+    pub fn opened_path(&self) -> Option<PathBuf> {
+        self.active_file().and_then(|f| f.opened_path.clone())
+    }
+    pub fn set_active_opened_path(&mut self, p: Option<PathBuf>) {
+        if let Some(f) = self.active_file_mut() {
+            f.opened_path = p;
+        }
     }
     pub fn set_source_path(&mut self, p: Option<PathBuf>) {
         if let Some(f) = self.active_file_mut() {
             f.source_path = p;
+        }
+    }
+    pub fn adopt_detected_source(&mut self, detected: DetectedFormat) {
+        if let Some(f) = self.active_file_mut() {
+            let save_capabilities = detected.save_capabilities();
+            f.opened_path = Some(detected.path);
+            f.source_path = Some(detected.identity);
+            f.source_capabilities = Some(detected.capabilities);
+            f.save_capabilities = Some(save_capabilities);
         }
     }
     pub fn is_dirty(&self) -> bool {
@@ -410,6 +559,17 @@ impl AppState {
         if let Some(f) = self.active_file_mut() {
             f.dirty = dirty;
         }
+    }
+
+    /// True if a session-only marker override changed its effective marker
+    /// positions since `before`. Empty overrides are equivalent to no override.
+    pub fn marker_override_changed(&self, idx: usize, before: Option<MarkerOverride>) -> bool {
+        let Some(f) = self.active_file() else {
+            return false;
+        };
+        let before = effective_marker_times(&f.run, idx, before);
+        let after = effective_marker_times(&f.run, idx, f.overrides.get(&idx).copied());
+        before != after
     }
 
     /// Full path of the active file (may be an absolute Windows path); empty if
@@ -538,17 +698,26 @@ impl AppState {
         }
         self.select_click(well_idx, false, false);
         if let Some(f) = self.active_file_mut() {
+            f.expanded = true;
             f.viewport = None;
         }
     }
 
-    /// Toggle the expanded state of the file owning a visible row.
-    pub fn toggle_expand_row(&mut self, row: usize) {
-        if let Some(rr) = self.row_ref(row) {
-            if let Some(f) = self.files.get_mut(rr.file) {
-                f.expanded ^= true;
-            }
+    /// Activate and toggle the expanded state of the file owning a visible row.
+    /// Returns whether the active file changed.
+    pub fn toggle_expand_row(&mut self, row: usize) -> bool {
+        let Some(rr) = self.row_ref(row) else {
+            return false;
+        };
+        let switched = self.active != Some(rr.file);
+        if switched {
+            self.active = Some(rr.file);
+            self.reset_transient();
         }
+        if let Some(f) = self.files.get_mut(rr.file) {
+            f.expanded ^= true;
+        }
+        switched
     }
 
     // ---- active-file queries (empty-safe) ----------------------------------
@@ -556,7 +725,18 @@ impl AppState {
     /// Whether the primary-selected entry is a renameable well.
     pub fn can_rename(&self) -> bool {
         self.active_file().is_some_and(|f| {
-            !f.raw_mode() && !f.tapestation_mode() && f.primary() < f.run.samples.len()
+            if f.raw_mode() || f.primary() >= f.run.samples.len() {
+                return false;
+            }
+            if let Some(capabilities) = f.source_capabilities {
+                return capabilities.can_rename;
+            }
+            !f.bioanalyzer_xad_mode()
+                && !f.tapestation_mode()
+                && (!f.fragment_analyzer_mode()
+                    || f.source_path
+                        .as_deref()
+                        .is_some_and(traceio::fa::has_saveable_txt_sidecar))
         })
     }
 
@@ -580,12 +760,12 @@ impl AppState {
     /// Rename the active file's primary-selected well; marks that file dirty.
     /// Returns true if the name actually changed.
     pub fn rename_primary(&mut self, name: &str) -> bool {
+        if !self.can_rename() {
+            return false;
+        }
         let Some(f) = self.active_file_mut() else {
             return false;
         };
-        if f.raw_mode() || f.tapestation_mode() {
-            return false;
-        }
         let idx = f.primary();
         if let Some(s) = f.run.samples.get_mut(idx) {
             let name = name.trim();
@@ -598,26 +778,63 @@ impl AppState {
         false
     }
 
-    /// Whether the active file has a source path that File → Save can write to.
+    /// Whether File → Save can persist the active file. Most formats save in
+    /// place; native `.xad` sources use the Save As fallback because the source
+    /// container is not rewritable.
     pub fn can_save(&self) -> bool {
-        self.active_file()
-            .is_some_and(|f| f.source_path.is_some() && !f.tapestation_mode())
+        self.active_file().is_some_and(|f| {
+            if f.source_path.is_none() {
+                return false;
+            }
+            if let Some(capabilities) = f.save_capabilities {
+                return capabilities.can_save_in_place
+                    || (f.bioanalyzer_xad_mode()
+                        && (capabilities.can_save_as_xml || capabilities.can_save_as_xml_gz));
+            }
+            !f.bioanalyzer_xad_mode()
+                && !f.tapestation_mode()
+                && (!f.fragment_analyzer_mode()
+                    || f.source_path
+                        .as_deref()
+                        .is_some_and(traceio::fa::has_saveable_txt_sidecar))
+        })
     }
 
     /// Whether the active file can be saved to a new Bioanalyzer XML file.
     pub fn can_save_as(&self) -> bool {
+        if self.has_marker_overrides() {
+            return false;
+        }
         self.active_file().is_some_and(|f| {
-            f.source_path.is_some()
-                && !f.raw_mode()
-                && !f.fragment_analyzer_mode()
-                && !f.tapestation_mode()
+            if f.source_path.is_none() {
+                return false;
+            }
+            if let Some(capabilities) = f.save_capabilities {
+                return capabilities.can_save_as_xml || capabilities.can_save_as_xml_gz;
+            }
+            if f.raw_mode() {
+                return false;
+            }
+            !f.bioanalyzer_xad_mode() && !f.fragment_analyzer_mode() && !f.tapestation_mode()
         })
     }
 
     /// Whether marker override editing is meaningful for the active file.
     pub fn can_edit_markers(&self) -> bool {
-        self.active_file()
-            .is_some_and(|f| !f.raw_mode() && !f.fragment_analyzer_mode() && !f.tapestation_mode())
+        self.active_file().is_some_and(|f| {
+            if f.raw_mode()
+                || f.selection.len() != 1
+                || !f.selection.iter().all(|&idx| idx < f.run.samples.len())
+            {
+                return false;
+            }
+            let source_allows = if let Some(capabilities) = f.source_capabilities {
+                capabilities.can_edit_markers
+            } else {
+                !f.bioanalyzer_xad_mode() && !f.fragment_analyzer_mode() && !f.tapestation_mode()
+            };
+            source_allows && sample_has_usable_marker_times(f, f.selection[0])
+        })
     }
 
     /// True when the active file is a native Fragment Analyzer run.
@@ -690,6 +907,10 @@ impl AppState {
         };
         if changed {
             self.highlight_x = None; // stale peak highlight from the old sample
+            if !self.can_edit_markers() {
+                self.marker_edit = false;
+                self.grabbed = None;
+            }
         }
         changed
     }
@@ -697,6 +918,19 @@ impl AppState {
     /// True when the active file is in raw-channel mode.
     pub fn raw_mode(&self) -> bool {
         self.active_file().is_some_and(|f| f.raw_mode())
+    }
+
+    /// True when the active run has at least one sample with processed trace
+    /// arrays, as opposed to metadata-only sample shells.
+    pub fn has_processed_sample_data(&self) -> bool {
+        self.active_file()
+            .is_some_and(|f| f.has_processed_sample_data())
+    }
+
+    pub fn sample_has_processed_data(&self, idx: usize) -> bool {
+        self.active_file()
+            .and_then(|f| f.run.samples.get(idx))
+            .is_some_and(sample_has_processed_data)
     }
 
     /// Header summary line for the info area.
@@ -751,10 +985,64 @@ fn is_tapestation_assay_name(name: &str) -> bool {
     )
 }
 
+fn sample_has_processed_data(sample: &traceio::Sample) -> bool {
+    !sample.fluorescence.is_empty()
+        && (!sample.time.is_empty() || !sample.aligned_time.is_empty() || !sample.length.is_empty())
+}
+
+fn sample_has_usable_marker_times(file: &OpenFile, idx: usize) -> bool {
+    let Some(sample) = file.run.samples.get(idx) else {
+        return false;
+    };
+    if !sample_has_processed_data(sample) {
+        return false;
+    }
+    let ov = file.overrides.get(&idx).filter(|ov| !ov.is_empty());
+    let (lower, upper) = marker_times(&file.run, idx, ov);
+    let Some(lower) = lower.filter(|time| time.is_finite()) else {
+        return false;
+    };
+    if file.run.assay.has_upper_marker {
+        let Some(upper) = upper.filter(|time| time.is_finite()) else {
+            return false;
+        };
+        lower < upper
+    } else {
+        true
+    }
+}
+
+fn effective_marker_times(
+    run: &Electrophoresis,
+    idx: usize,
+    ov: Option<MarkerOverride>,
+) -> (Option<f64>, Option<f64>) {
+    let ov = ov.filter(|ov| !ov.is_empty());
+    marker_times(run, idx, ov.as_ref())
+}
+
+fn file_has_effective_marker_overrides(file: &OpenFile) -> bool {
+    file.overrides
+        .iter()
+        .any(|(&idx, _)| sample_has_effective_marker_override(file, idx))
+}
+
+fn sample_has_effective_marker_override(file: &OpenFile, idx: usize) -> bool {
+    let Some(override_state) = file.overrides.get(&idx).copied() else {
+        return false;
+    };
+    if override_state.is_empty() {
+        return false;
+    }
+    effective_marker_times(&file.run, idx, None)
+        != effective_marker_times(&file.run, idx, Some(override_state))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use traceio::{AssayInfo, Sample};
+    use traceio::io::TraceFormat;
+    use traceio::{AssayInfo, LadderPeak, Peak, Sample};
 
     fn sample(well: i32, name: &str) -> Sample {
         Sample {
@@ -776,6 +1064,55 @@ mod tests {
         }
     }
 
+    fn processed_sample(well: i32, name: &str) -> Sample {
+        let mut sample = sample(well, name);
+        sample.time = vec![0.0, 1.0, 9.0, 10.0];
+        sample.fluorescence = vec![1.0, 2.0, 2.0, 1.0];
+        sample
+    }
+
+    fn marker_peak(name: &str, time: f64, concentration: f64) -> Peak {
+        Peak {
+            observations: name.to_string(),
+            length: f64::NAN,
+            time,
+            aligned_time: time,
+            start_time: f64::NAN,
+            end_time: f64::NAN,
+            aligned_start_time: f64::NAN,
+            aligned_end_time: f64::NAN,
+            area: f64::NAN,
+            concentration,
+            molarity: f64::NAN,
+        }
+    }
+
+    fn state_with_detected_markers() -> AppState {
+        let mut run = processed_run_named("run.xml", 2);
+        run.assay.has_upper_marker = true;
+        run.ladder_peaks = vec![
+            LadderPeak {
+                size: 15.0,
+                area_a: f64::NAN,
+                area_b: f64::NAN,
+                concentration: 1.0,
+            },
+            LadderPeak {
+                size: 1500.0,
+                area_a: f64::NAN,
+                area_b: f64::NAN,
+                concentration: 2.0,
+            },
+        ];
+        for sample in &mut run.samples {
+            sample.peaks = vec![
+                marker_peak("Lower Marker", 1.0, 1.0),
+                marker_peak("Upper Marker", 9.0, 2.0),
+            ];
+        }
+        AppState::new(run, Vec::new(), Some(PathBuf::from("run.xml")), None)
+    }
+
     fn run_named(name: &str, wells: i32) -> Electrophoresis {
         Electrophoresis {
             assay: AssayInfo {
@@ -788,12 +1125,18 @@ mod tests {
         }
     }
 
+    fn processed_run_named(name: &str, wells: i32) -> Electrophoresis {
+        let mut run = run_named(name, 0);
+        run.samples = (0..wells).map(|w| processed_sample(w + 1, "")).collect();
+        run
+    }
+
     fn state_with_file(name: &str) -> AppState {
         AppState::new(run_named(name, 0), Vec::new(), None, None)
     }
 
     fn fa_state_with_source(source: &str) -> AppState {
-        let mut run = run_named(source, 1);
+        let mut run = processed_run_named(source, 1);
         run.assay.assay_name = "Fragment Analyzer".to_string();
         AppState::new(run, Vec::new(), Some(PathBuf::from(source)), None)
     }
@@ -805,6 +1148,16 @@ mod tests {
             upper_length: 400.0,
         });
         AppState::new(run, Vec::new(), Some(PathBuf::from(source)), None)
+    }
+
+    fn raw_channel() -> RawChannel {
+        RawChannel {
+            channel_id: "BlueFluorescence".to_string(),
+            name: "Blue".to_string(),
+            x_start: 0.0,
+            x_step: 1.0,
+            signal: vec![1.0, 2.0],
+        }
     }
 
     #[test]
@@ -831,6 +1184,135 @@ mod tests {
     }
 
     #[test]
+    fn marker_override_change_is_session_only_and_not_save_dirty() {
+        let mut st = state_with_detected_markers();
+        let before = st.overrides().get(&0).copied();
+
+        st.overrides_mut().insert(
+            0,
+            MarkerOverride {
+                lower_time: Some(2.0),
+                upper_time: None,
+            },
+        );
+
+        assert!(st.marker_override_changed(0, before));
+        assert!(!st.is_dirty());
+    }
+
+    #[test]
+    fn unchanged_marker_override_does_not_mark_save_dirty() {
+        let mut st = state_with_detected_markers();
+        let ov = MarkerOverride {
+            lower_time: Some(1.0),
+            upper_time: None,
+        };
+        st.overrides_mut().insert(0, ov);
+
+        assert!(!st.marker_override_changed(0, Some(ov)));
+        assert!(!st.is_dirty());
+    }
+
+    #[test]
+    fn empty_marker_override_is_equivalent_to_absent_for_change_tracking() {
+        let mut st = state_with_detected_markers();
+        let before = st.overrides().get(&0).copied();
+
+        st.overrides_mut().insert(0, MarkerOverride::default());
+
+        assert!(!st.marker_override_changed(0, before));
+        assert!(!st.is_dirty());
+    }
+
+    #[test]
+    fn marker_override_equal_to_detected_marker_is_not_changed() {
+        let mut st = state_with_detected_markers();
+        let before = st.overrides().get(&0).copied();
+
+        st.overrides_mut().insert(
+            0,
+            MarkerOverride {
+                lower_time: Some(1.0),
+                upper_time: Some(9.0),
+            },
+        );
+
+        assert!(!st.marker_override_changed(0, before));
+        assert!(!st.has_marker_overrides());
+        assert!(st.can_save_as());
+        assert!(!st.is_dirty());
+    }
+
+    #[test]
+    fn marker_edit_requires_single_selected_sample() {
+        let mut st = state_with_detected_markers();
+        assert!(st.can_edit_markers());
+
+        assert!(st.select_click(1, true, false));
+        assert!(!st.can_edit_markers());
+
+        st.marker_edit = true;
+        assert!(st.select_click(0, false, false));
+        assert!(st.can_edit_markers());
+        assert!(st.marker_edit);
+    }
+
+    #[test]
+    fn marker_edit_requires_processed_selected_sample() {
+        let mut st = state_with_detected_markers();
+        st.active_file_mut().unwrap().run.samples[0]
+            .fluorescence
+            .clear();
+
+        assert!(!st.can_edit_markers());
+
+        st.active_file_mut().unwrap().run.samples[0].fluorescence = vec![1.0, 2.0, 2.0, 1.0];
+        assert!(st.can_edit_markers());
+    }
+
+    #[test]
+    fn marker_edit_requires_finite_lower_marker() {
+        let mut st = state_with_detected_markers();
+        st.active_file_mut().unwrap().run.samples[0].peaks[0].time = f64::NAN;
+
+        assert!(!st.can_edit_markers());
+
+        st.active_file_mut().unwrap().run.samples[0].peaks[0].time = 1.0;
+        assert!(st.can_edit_markers());
+    }
+
+    #[test]
+    fn marker_edit_requires_upper_marker_when_assay_has_upper_marker() {
+        let mut st = state_with_detected_markers();
+        st.active_file_mut().unwrap().run.samples[0].peaks.pop();
+
+        assert!(!st.can_edit_markers());
+
+        st.active_file_mut().unwrap().run.assay.has_upper_marker = false;
+        assert!(st.can_edit_markers());
+    }
+
+    #[test]
+    fn marker_edit_requires_lower_before_upper_marker() {
+        let mut st = state_with_detected_markers();
+        st.active_file_mut().unwrap().run.samples[0].peaks[1].time = 0.5;
+
+        assert!(!st.can_edit_markers());
+    }
+
+    #[test]
+    fn multi_selection_turns_off_marker_edit_mode() {
+        let mut st = state_with_detected_markers();
+        st.marker_edit = true;
+
+        assert!(st.select_click(1, true, false));
+
+        assert!(!st.can_edit_markers());
+        assert!(!st.marker_edit);
+        assert_eq!(st.grabbed, None);
+    }
+
+    #[test]
     fn row_mapping_across_files_with_mixed_expand() {
         // File 0: 2 wells (expanded); File 1: 1 well (expanded).
         let mut st = AppState::new(run_named("a", 2), Vec::new(), None, None);
@@ -853,6 +1335,33 @@ mod tests {
     }
 
     #[test]
+    fn file_row_toggle_activates_that_file() {
+        let mut st = AppState::new(run_named("a", 1), Vec::new(), None, None);
+        st.add_file(run_named("b", 1), Vec::new(), None);
+        st.active = Some(0);
+
+        assert!(st.toggle_expand_row(2));
+
+        assert_eq!(st.active, Some(1));
+        assert!(!st.files[1].expanded);
+    }
+
+    #[test]
+    fn overview_selection_expands_collapsed_file() {
+        let mut st = AppState::new(run_named("a", 1), Vec::new(), None, None);
+        st.add_file(run_named("b", 1), Vec::new(), None);
+        st.files[0].expanded = false;
+        st.active = Some(1);
+
+        st.activate_and_select(0, 0);
+
+        assert_eq!(st.active, Some(0));
+        assert!(st.files[0].expanded);
+        assert_eq!(st.selection(), &[0]);
+        assert_eq!(st.tree_rows().primary_row, 1);
+    }
+
+    #[test]
     fn close_file_fixes_up_active_index() {
         let mut st = state_with_file("a");
         st.add_file(run_named("b", 0), Vec::new(), None); // active = 1
@@ -868,13 +1377,47 @@ mod tests {
     }
 
     #[test]
+    fn close_inactive_file_preserves_active_logical_file() {
+        let mut st = state_with_file("a");
+        st.add_file(run_named("b", 0), Vec::new(), None);
+        st.add_file(run_named("c", 0), Vec::new(), None);
+        st.add_file(run_named("d", 0), Vec::new(), None);
+        st.activate_file(2);
+        assert_eq!(st.active_file().unwrap().run.assay.file_name, "c");
+
+        st.close_file(0);
+        assert_eq!(st.active, Some(1));
+        assert_eq!(st.active_file().unwrap().run.assay.file_name, "c");
+
+        st.close_file(2);
+        assert_eq!(st.active, Some(1));
+        assert_eq!(st.active_file().unwrap().run.assay.file_name, "c");
+    }
+
+    #[test]
+    fn close_last_file_clears_file_scoped_view_state() {
+        let mut st = state_with_file("a");
+        st.normalize = true;
+        st.y_mode = YMode::Concentration;
+        st.marker_edit = true;
+        st.highlight_x = Some(42.0);
+        st.table_peak_x = vec![Some(42.0)];
+        st.overview_shared_y = true;
+
+        st.close_file(0);
+
+        assert_eq!(st.active, None);
+        assert!(!st.normalize);
+        assert_eq!(st.y_mode, YMode::Fluorescence);
+        assert!(!st.marker_edit);
+        assert_eq!(st.highlight_x, None);
+        assert!(st.table_peak_x.is_empty());
+        assert!(st.overview_shared_y);
+    }
+
+    #[test]
     fn bioanalyzer_wells_can_be_renamed_and_saved() {
-        let mut st = AppState::new(
-            run_named("run.xml", 1),
-            Vec::new(),
-            Some(PathBuf::from("run.xml")),
-            None,
-        );
+        let mut st = state_with_detected_markers();
 
         assert!(st.can_rename());
         assert!(st.can_save());
@@ -883,6 +1426,188 @@ mod tests {
         assert!(st.rename_primary("A1"));
         assert!(st.is_dirty());
         assert_eq!(st.primary_name(), "A1");
+    }
+
+    #[test]
+    fn marker_overrides_disable_save_as_without_dirtying_file() {
+        let mut st = state_with_detected_markers();
+
+        st.overrides_mut().insert(
+            0,
+            MarkerOverride {
+                lower_time: Some(2.0),
+                upper_time: None,
+            },
+        );
+
+        assert!(st.can_save());
+        assert!(!st.can_save_as());
+        assert!(!st.is_dirty());
+    }
+
+    #[test]
+    fn xad_sources_are_read_only_even_with_processed_samples() {
+        let mut st = AppState::new(
+            processed_run_named("run.xad", 1),
+            Vec::new(),
+            Some(PathBuf::from("run.xad")),
+            None,
+        );
+
+        assert!(!st.can_rename());
+        assert!(!st.can_save());
+        assert!(!st.can_save_as());
+        assert!(!st.can_edit_markers());
+        assert!(!st.rename_primary("A1"));
+        assert!(!st.is_dirty());
+    }
+
+    #[test]
+    fn raw_xad_can_save_as_when_detected_capabilities_allow_it() {
+        let detected = traceio::io::DetectedFormat {
+            path: PathBuf::from("run.xad"),
+            identity: PathBuf::from("run.xad"),
+            format: TraceFormat::BioanalyzerXad,
+            capabilities: SourceCapabilities {
+                can_rename: true,
+                can_save_in_place: false,
+                can_save_as_xml: true,
+                can_edit_markers: false,
+            },
+        };
+        let mut st = AppState::empty();
+        st.add_file_with_capabilities(
+            run_named("run.xad", 1),
+            vec![raw_channel()],
+            Some(detected.identity.clone()),
+            detected.capabilities,
+            detected.save_capabilities(),
+        );
+
+        assert!(st.raw_mode());
+        assert!(st.can_save_as());
+    }
+
+    #[test]
+    fn detected_xad_can_use_save_menu_to_fall_back_to_save_as() {
+        let detected = traceio::io::DetectedFormat {
+            path: PathBuf::from("run.xad"),
+            identity: PathBuf::from("run.xad"),
+            format: TraceFormat::BioanalyzerXad,
+            capabilities: SourceCapabilities {
+                can_rename: true,
+                can_save_in_place: false,
+                can_save_as_xml: true,
+                can_edit_markers: false,
+            },
+        };
+        let mut st = AppState::empty();
+        st.add_file_with_capabilities(
+            processed_run_named("run.xad", 1),
+            Vec::new(),
+            Some(detected.identity.clone()),
+            detected.capabilities,
+            detected.save_capabilities(),
+        );
+
+        assert!(st.can_rename());
+        assert!(st.can_save());
+        assert!(st.can_save_as());
+        assert!(st.rename_primary("A1"));
+        assert!(st.is_dirty());
+    }
+
+    #[test]
+    fn adopt_detected_source_updates_active_identity_and_capabilities() {
+        let xad = traceio::io::DetectedFormat {
+            path: PathBuf::from("run.xad"),
+            identity: PathBuf::from("run.xad"),
+            format: TraceFormat::BioanalyzerXad,
+            capabilities: SourceCapabilities {
+                can_rename: true,
+                can_save_in_place: false,
+                can_save_as_xml: true,
+                can_edit_markers: false,
+            },
+        };
+        let xml = traceio::io::DetectedFormat {
+            path: PathBuf::from("saved.xml"),
+            identity: PathBuf::from("/canonical/saved.xml"),
+            format: TraceFormat::BioanalyzerXml,
+            capabilities: SourceCapabilities {
+                can_rename: true,
+                can_save_in_place: true,
+                can_save_as_xml: true,
+                can_edit_markers: true,
+            },
+        };
+        let mut st = AppState::empty();
+        st.add_file_with_capabilities(
+            processed_run_named("run.xad", 1),
+            Vec::new(),
+            Some(xad.identity.clone()),
+            xad.capabilities,
+            xad.save_capabilities(),
+        );
+
+        st.adopt_detected_source(xml);
+
+        assert_eq!(
+            st.source_path(),
+            Some(PathBuf::from("/canonical/saved.xml"))
+        );
+        assert!(st.can_save());
+        assert!(st.can_save_as());
+        let file = st.active_file().unwrap();
+        assert!(file.source_capabilities.unwrap().can_edit_markers);
+        assert!(file.save_capabilities.unwrap().can_save_in_place);
+    }
+
+    #[test]
+    fn replace_active_file_preserves_session_view_state() {
+        let mut st = state_with_detected_markers();
+        st.files[0].expanded = false;
+        st.files[0].selection = vec![1];
+        st.files[0].anchor = 1;
+        st.files[0].viewport = Some(Viewport {
+            x_min: 1.0,
+            x_max: 9.0,
+            y_min: 0.0,
+            y_max: 10.0,
+        });
+        st.files[0].overrides.insert(
+            1,
+            MarkerOverride {
+                lower_time: Some(2.0),
+                upper_time: Some(8.0),
+            },
+        );
+
+        st.replace_active_file_with_capabilities(
+            processed_run_named("saved.xml", 2),
+            Vec::new(),
+            Some(PathBuf::from("saved.xml")),
+            SourceCapabilities {
+                can_rename: true,
+                can_save_in_place: true,
+                can_save_as_xml: true,
+                can_edit_markers: true,
+            },
+            SaveCapabilities {
+                can_save_sample_names: true,
+                can_save_in_place: true,
+                can_save_as_xml: true,
+                can_save_as_xml_gz: true,
+            },
+        );
+
+        let file = st.active_file().unwrap();
+        assert!(!file.expanded);
+        assert_eq!(file.selection, vec![1]);
+        assert_eq!(file.anchor, 1);
+        assert_eq!(file.viewport.unwrap().x_min, 1.0);
+        assert_eq!(file.overrides.get(&1).unwrap().lower_time, Some(2.0));
+        assert!(!file.dirty);
     }
 
     #[test]
@@ -899,8 +1624,32 @@ mod tests {
     }
 
     #[test]
+    fn tree_label_prefers_opened_path_over_canonical_identity() {
+        let mut st = AppState::new(
+            run_named("canonical.raw", 1),
+            Vec::new(),
+            Some(PathBuf::from("/run/canonical.raw")),
+            None,
+        );
+        st.set_active_opened_path(Some(PathBuf::from("/run/run.fa.zip")));
+
+        assert_eq!(st.tree_rows().labels[0], "run.fa.zip");
+        assert_eq!(st.opened_path(), Some(PathBuf::from("/run/run.fa.zip")));
+        assert_eq!(st.source_path(), Some(PathBuf::from("/run/canonical.raw")));
+    }
+
+    #[test]
     fn fragment_analyzer_runs_can_be_renamed_and_saved_in_place() {
-        let mut st = fa_state_with_source("run.raw");
+        let dir = unique_temp_dir("traceanalyzer_fa_saveable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("run.raw");
+        std::fs::write(&raw, b"FA\0\0").unwrap();
+        std::fs::write(
+            dir.join("run.txt"),
+            b"Capillary #: 1\nWell: 1\nSample ID: old\n",
+        )
+        .unwrap();
+        let mut st = fa_state_with_source(raw.to_str().unwrap());
 
         assert!(st.fragment_analyzer_mode());
         assert!(st.can_rename());
@@ -910,23 +1659,46 @@ mod tests {
         assert!(st.rename_primary("A1"));
         assert!(st.is_dirty());
         assert_eq!(st.run().samples[0].name, "A1");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn raw_extension_source_is_treated_as_fragment_analyzer_saveable() {
+    fn raw_extension_source_without_txt_sidecar_is_read_only() {
         let mut st = AppState::new(
-            run_named("run.raw", 1),
+            processed_run_named("run.raw", 1),
             Vec::new(),
             Some(PathBuf::from("run.RAW")),
             None,
         );
 
         assert!(st.fragment_analyzer_mode());
-        assert!(st.can_rename());
-        assert!(st.can_save());
+        assert!(!st.can_rename());
+        assert!(!st.can_save());
         assert!(!st.can_save_as());
-        assert!(st.rename_primary("A1"));
-        assert!(st.is_dirty());
+        assert!(!st.rename_primary("A1"));
+        assert!(!st.is_dirty());
+    }
+
+    #[test]
+    fn processed_sample_data_requires_real_trace_arrays() {
+        let st = AppState::new(
+            run_named("metadata-only.xml", 1),
+            Vec::new(),
+            Some(PathBuf::from("metadata-only.xml")),
+            None,
+        );
+        assert!(!st.raw_mode());
+        assert!(!st.has_processed_sample_data());
+        assert!(!st.sample_has_processed_data(0));
+
+        let st = AppState::new(
+            processed_run_named("processed.xml", 1),
+            Vec::new(),
+            Some(PathBuf::from("processed.xml")),
+            None,
+        );
+        assert!(st.has_processed_sample_data());
+        assert!(st.sample_has_processed_data(0));
     }
 
     #[test]
@@ -984,5 +1756,16 @@ mod tests {
 
         st.activate_file(0);
         assert_eq!(st.active, Some(0));
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 }

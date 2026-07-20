@@ -4,7 +4,7 @@
 #
 # These are real demo runs from the MIT-licensed jwfoley/bioanalyzeR package.
 # They are downloaded rather than committed, so binary blobs stay out of git.
-# Idempotent: an existing non-empty file is left untouched.
+# Idempotent: an existing non-empty, valid gzip file is left untouched.
 #
 set -euo pipefail
 
@@ -33,15 +33,24 @@ is_gzip() {
   [ "$(head -c 2 "$1" | od -An -tx1 | tr -d ' \n')" = "1f8b" ]
 }
 
+validate_gzip() {
+  is_gzip "$1" && gzip -t "$1" >/dev/null 2>&1
+}
+
 for entry in "${fixtures[@]}"; do
   local_name="${entry%%|*}"
   remote_name="${entry##*|}"
   out="$dest/$local_name"
   mkdir -p "$(dirname "$out")"
 
-  if [ -s "$out" ]; then
+  if [ -s "$out" ] && validate_gzip "$out"; then
     echo "skip   $local_name (already present)"
     continue
+  fi
+
+  if [ -e "$out" ]; then
+    echo "stale  $local_name (missing or invalid gzip; replacing)" >&2
+    rm -f "$out"
   fi
 
   echo "fetch  $local_name"
@@ -51,9 +60,9 @@ for entry in "${fixtures[@]}"; do
     echo "ERROR: download failed for $local_name" >&2
     exit 1
   fi
-  if ! is_gzip "$tmp"; then
+  if ! validate_gzip "$tmp"; then
     rm -f "$tmp"
-    echo "ERROR: $local_name is not a gzip file (bad download?)" >&2
+    echo "ERROR: $local_name is not a valid gzip file (bad download?)" >&2
     exit 1
   fi
   mv "$tmp" "$out"

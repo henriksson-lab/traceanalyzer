@@ -14,8 +14,8 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 - **Headless/CI:** bitmap render tests and examples run without a display. GUI
   smoke runs need a real display or Xvfb (`xvfb-run -a cargo run -p
   traceanalyzer -- testdata/demo_dna1000.xml.gz`). Fetch gitignored fixtures
-  first with `scripts/fetch-testdata.sh` for parser/file-loading coverage; the
-  headless render smoke test does not need downloaded fixtures.
+  first with `bash scripts/fetch-testdata.sh` for parser/file-loading coverage;
+  the headless render smoke test does not need downloaded fixtures.
 - **System packages:** Slint/winit/rfd Linux builds may require X11/Wayland and
   GTK development packages, depending on the distribution image.
 

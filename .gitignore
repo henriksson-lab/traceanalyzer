@@ -1,4 +1,5 @@
 target/
+/Cargo.lock
 
 # Packaged macOS app/dmg output (see scripts/build-macos-app.sh) — not committed.
 dist/

@@ -148,17 +148,19 @@ concentration/molarity from the computed per-point arrays at each peak apex.
   annotation list).
 - **`.RQN`** — empty in the local fixture.
 
-## Packaging: one run = one `.zip`
+## Packaging: one run = one `.fa.zip`
 
 A native FA run is a *folder* of ~13 files, which is awkward to open or drag as a
 unit. The recommended, and UI-advertised, way to open a run is therefore to
-**zip the whole run folder into a single `.zip`** and open that one file — it
+**zip the whole run folder into a single `.fa.zip`** and open that one file — it
 then behaves like the single-file Bioanalyzer formats for File → Open and
 drag-and-drop. The reader accepts several entry points, all resolving to the same run:
 
-1. a **`.zip`** containing the run (entries may be flat or under a folder
+1. a **`.fa.zip`** containing the run (entries may be flat or under a folder
    prefix; the `.raw` entry is found by its `FA\0\0` magic and the `.PKS`/`.txt`
-   siblings by shared stem),
+   siblings by shared stem). Plain `.zip` archives with FA contents are still
+   accepted by File → Open and drag-and-drop for compatibility, but desktop MIME
+   association is limited to `.fa.zip` to avoid claiming generic ZIP files,
 2. the **`.raw`** file itself,
 3. the **run directory** (the single `.raw` inside is used), or
 4. **any other member** of the run directory — dropping/opening a run's `.PKS`,
@@ -167,23 +169,24 @@ drag-and-drop. The reader accepts several entry points, all resolving to the sam
    next to a run is never hijacked.)
 
 `fa::run_identity` maps every entry point above to one canonical path (the
-`.zip`, or the run's `.raw`), so a multi-file drag-and-drop of a whole run opens
-it exactly once instead of once per file. Only the `.raw`, `.PKS` and `.txt`
-members are read; every other file in the run (or zip) is ignored.
+`.fa.zip`/`.zip`, or the run's `.raw`), so a multi-file drag-and-drop of a whole
+run opens it exactly once instead of once per file. Only the `.raw`, `.PKS` and
+`.txt` members are read; every other file in the run (or zip) is ignored.
 
 ## Model mapping
 
 Fragment Analyzer runs arrive already size-calibrated, so the FA reader fills
 each `Sample::length` directly (scan→bp interpolation from `.PKS` anchors) and
-**skips** the Bioanalyzer marker-based `calibration` path. `traceio::io::read_path`
-dispatches to it via `fa::is_fa_path` (a `.zip` holding an FA `.raw`, a `.raw`
-file with the `FA\0\0` magic, or a directory holding one). Peaks (with
-lower/upper marker labels and ladder-well detection) are populated from `.PKS`;
-per-point and per-peak concentration/molarity are computed from the standard
-ladder metadata.
+**skips** the Bioanalyzer marker-based `calibration` path.
+`traceio::io::read_path` dispatches to it via `fa::is_fa_path` (a
+`.fa.zip`/`.zip` holding an FA `.raw`, a `.raw` file with the `FA\0\0` magic, or
+a directory holding one). Peaks (with lower/upper marker labels and ladder-well
+detection) are populated from `.PKS`; per-point and per-peak
+concentration/molarity are computed from the standard ladder metadata.
 
 `File → Save` for FA runs never modifies `.raw`; it rewrites only the `Sample
 ID:` values in the `.txt` for renamed samples. For a folder/`.raw` run that
-patches the sidecar file in place; for a `.zip` run the archive is rewritten in
-place with only its `.txt` entry patched (every other entry, including the large
-`.raw`, is copied verbatim without recompression).
+patches the sidecar file in place; for a `.fa.zip`/`.zip` run the archive is
+rewritten in place with the `.txt` entry patched and the other entry payloads
+copied. Archive-level ZIP comments are preserved; per-entry comments and extra
+fields are rejected before writing.

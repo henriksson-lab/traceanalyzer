@@ -19,7 +19,7 @@
 //! Bioanalyzer path this reader fills each sample's `length` directly by
 //! interpolating the ladder and does **not** use [`crate::calibration`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -76,6 +76,9 @@ pub struct FaMetadata {
     pub exposure: Vec<String>,
     /// Bytes from `CameraImage.bmp`; observed files are PNG despite the name.
     pub camera_image: Option<Vec<u8>>,
+    /// Non-fatal sidecar diagnostics. Optional metadata that cannot be parsed
+    /// is omitted from the typed fields and described here.
+    pub warnings: Vec<String>,
 }
 
 /// INI-like document, preserving section and key order within sorted maps.
@@ -88,8 +91,9 @@ pub struct FaCurrentPoint {
     pub pressure_psi: f64,
 }
 
-/// Read a Fragment Analyzer run. `path` may be the `.raw` file itself or the run
-/// directory (in which case the single `.raw` inside is used).
+/// Read a Fragment Analyzer run. `path` may be a `.fa.zip`/`.zip` archive, the
+/// `.raw` file itself, or the run directory (in which case the single `.raw`
+/// inside is used).
 pub fn read_fa_run(path: &Path) -> Result<Electrophoresis> {
     if has_zip_extension(path) {
         return read_fa_zip(path);
@@ -115,7 +119,9 @@ pub fn read_fa_run(path: &Path) -> Result<Electrophoresis> {
 }
 
 /// Read FA-specific method, analysis, and QC sidecars. Missing optional files
-/// are left empty; malformed present files return an error with their file name.
+/// are left empty. Malformed optional `.current` telemetry is omitted and
+/// reported in [`FaMetadata::warnings`]; other malformed present files return an
+/// error with their file name.
 pub fn read_fa_metadata(path: &Path) -> Result<FaMetadata> {
     if has_zip_extension(path) {
         return read_fa_metadata_zip(path);
@@ -129,41 +135,40 @@ pub fn read_fa_metadata(path: &Path) -> Result<FaMetadata> {
             .transpose()
     };
     let txt = text_sibling("txt")?;
-    let method = dir.join("method.mthd");
+    let method = named_path(dir, "method.mthd")?;
     let anai = text_sibling("ANAI")?;
     let current = text_sibling("current")?;
-    let timing = dir.join("Timing.txt");
-    let exposure = dir.join("ExpTime.txt");
-    let camera = dir.join("CameraImage.bmp");
+    let timing = named_path(dir, "Timing.txt")?;
+    let exposure = named_path(dir, "ExpTime.txt")?;
+    let camera = named_path(dir, "CameraImage.bmp")?;
+
+    let (current, current_warning) = parse_optional_current_log(current.as_deref(), ".current");
 
     Ok(FaMetadata {
         run_header: txt.as_deref().map(parse_txt_header).unwrap_or_default(),
-        method: if method.exists() {
+        method: if let Some(method) = method {
             parse_ini(&read_lossy_text(&method)?)
         } else {
             IniDocument::default()
         },
         analysis: anai.as_deref().map(parse_ini).unwrap_or_default(),
-        current: current
-            .as_deref()
-            .map(parse_current_log)
-            .transpose()?
-            .unwrap_or_default(),
-        timing: if timing.exists() {
+        current,
+        timing: if let Some(timing) = timing {
             read_lines_lossy(&timing)?
         } else {
             Vec::new()
         },
-        exposure: if exposure.exists() {
+        exposure: if let Some(exposure) = exposure {
             read_lines_lossy(&exposure)?
         } else {
             Vec::new()
         },
-        camera_image: if camera.exists() {
+        camera_image: if let Some(camera) = camera {
             Some(std::fs::read(&camera).with_context(|| format!("reading {}", camera.display()))?)
         } else {
             None
         },
+        warnings: current_warning.into_iter().collect(),
     })
 }
 
@@ -190,7 +195,7 @@ fn build_fa_run(
     Ok(run)
 }
 
-/// Read a Fragment Analyzer run packaged as a single `.zip` — the whole run
+/// Read a Fragment Analyzer run packaged as a single `.fa.zip`/`.zip` — the whole run
 /// folder (or just its files) compressed into one archive. Locates the `.raw`
 /// entry by its `FA\0\0` magic and reads the sibling `.PKS`/`.txt` entries that
 /// share its stem (directory prefix included, so nested zips work).
@@ -199,25 +204,8 @@ fn read_fa_zip(path: &Path) -> Result<Electrophoresis> {
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
         .with_context(|| format!("reading zip {}", path.display()))?;
 
-    // Entry names, and the `.raw` entry identified by its magic bytes.
-    let mut names = Vec::with_capacity(zip.len());
-    let mut raw_name: Option<String> = None;
-    for i in 0..zip.len() {
-        let mut e = zip.by_index(i)?;
-        let name = e.name().to_string();
-        if raw_name.is_none() {
-            if let Some(name) = fa_raw_entry_name(&mut e) {
-                raw_name = Some(name.clone());
-            }
-        }
-        names.push(name);
-    }
-    let raw_name = raw_name.ok_or_else(|| {
-        anyhow!(
-            "{} is not a Fragment Analyzer run (no .raw entry with FA magic)",
-            path.display()
-        )
-    })?;
+    let (names, raw_name) = fa_zip_names_and_raw_entry(&mut zip)
+        .with_context(|| format!("locating FA run in zip {}", path.display()))?;
 
     let stem = strip_known_ext(&raw_name);
     let pks_name = find_sibling(&names, stem, "PKS")?;
@@ -238,24 +226,8 @@ fn read_fa_metadata_zip(path: &Path) -> Result<FaMetadata> {
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
         .with_context(|| format!("reading zip {}", path.display()))?;
 
-    let mut names = Vec::with_capacity(zip.len());
-    let mut raw_name: Option<String> = None;
-    for i in 0..zip.len() {
-        let mut e = zip.by_index(i)?;
-        let name = e.name().to_string();
-        if raw_name.is_none() {
-            if let Some(name) = fa_raw_entry_name(&mut e) {
-                raw_name = Some(name.clone());
-            }
-        }
-        names.push(name);
-    }
-    let raw_name = raw_name.ok_or_else(|| {
-        anyhow!(
-            "{} is not a Fragment Analyzer run (no .raw entry with FA magic)",
-            path.display()
-        )
-    })?;
+    let (names, raw_name) = fa_zip_names_and_raw_entry(&mut zip)
+        .with_context(|| format!("locating FA run metadata in zip {}", path.display()))?;
     let stem = strip_known_ext(&raw_name);
     let prefix = raw_name
         .rsplit_once('/')
@@ -279,6 +251,9 @@ fn read_fa_metadata_zip(path: &Path) -> Result<FaMetadata> {
     let exposure_name = find_named_entry(&names, &prefix, "ExpTime.txt");
     let camera_name = find_named_entry(&names, &prefix, "CameraImage.bmp");
 
+    let (current, current_warning) =
+        parse_optional_current_log(current.as_deref(), &format!("FA .current entry for {stem}"));
+
     Ok(FaMetadata {
         run_header: txt.as_deref().map(parse_txt_header).unwrap_or_default(),
         method: method_name
@@ -288,11 +263,7 @@ fn read_fa_metadata_zip(path: &Path) -> Result<FaMetadata> {
             .map(parse_ini)
             .unwrap_or_default(),
         analysis: anai.as_deref().map(parse_ini).unwrap_or_default(),
-        current: current
-            .as_deref()
-            .map(parse_current_log)
-            .transpose()?
-            .unwrap_or_default(),
+        current,
         timing: timing_name
             .map(|n| read_zip_entry(&mut zip, &n).map(lossy_string))
             .transpose()?
@@ -308,6 +279,7 @@ fn read_fa_metadata_zip(path: &Path) -> Result<FaMetadata> {
         camera_image: camera_name
             .map(|n| read_zip_entry(&mut zip, &n))
             .transpose()?,
+        warnings: current_warning.into_iter().collect(),
     })
 }
 
@@ -429,6 +401,22 @@ fn parse_current_log(text: &str) -> Result<Vec<FaCurrentPoint>> {
     Ok(rows)
 }
 
+fn parse_optional_current_log(
+    text: Option<&str>,
+    source: &str,
+) -> (Vec<FaCurrentPoint>, Option<String>) {
+    let Some(text) = text else {
+        return (Vec::new(), None);
+    };
+    match parse_current_log(text) {
+        Ok(points) => (points, None),
+        Err(e) => (
+            Vec::new(),
+            Some(format!("{source} ignored because it is malformed: {e:#}")),
+        ),
+    }
+}
+
 fn parse_decimal(s: &str) -> Result<f64> {
     s.trim()
         .replace(',', ".")
@@ -438,57 +426,158 @@ fn parse_decimal(s: &str) -> Result<f64> {
 
 /// Save user-renamed FA sample IDs back to the `.txt` sidecar. The `.raw`
 /// payload is immutable; only `Sample ID:` values are rewritten, preserving the
-/// rest of the human-readable sidecar. For a zipped run the archive is rewritten
-/// in place with only its `.txt` entry patched.
+/// rest of the human-readable sidecar. For a zipped run, the archive is
+/// rewritten in place with entry payloads copied and the `.txt` entry patched.
+/// Archive comments are preserved; entry metadata that cannot be preserved is
+/// rejected before writing.
 pub fn save_txt_names(path: &Path, run: &Electrophoresis) -> Result<()> {
     if has_zip_extension(path) {
         return save_txt_names_zip(path, run);
+    }
+    if !is_concrete_fa_run_entry(path) {
+        bail!(
+            "Fragment Analyzer save destination {} is not a concrete saveable FA run entry",
+            path.display()
+        );
     }
     let raw_path = resolve_raw_path(path)?;
     let dir = raw_path.parent().unwrap_or_else(|| Path::new("."));
     let txt_path = sibling_path(dir, &raw_path, "txt")?
         .ok_or_else(|| anyhow!("FA .txt sidecar not found next to {}", raw_path.display()))?;
-    let text = std::fs::read_to_string(&txt_path)
-        .or_else(|_| std::fs::read(&txt_path).map(|b| String::from_utf8_lossy(&b).into_owned()))
-        .with_context(|| format!("reading {}", txt_path.display()))?;
-    let (patched, changed) = patch_txt_names(&text, run);
-    if changed == 0 {
-        bail!(
-            "FA .txt sidecar {} did not contain any Sample ID entries",
+    let text = std::fs::read_to_string(&txt_path).with_context(|| {
+        format!(
+            "reading {}; FA .txt sidecar must be valid UTF-8 to save sample renames without corrupting bytes",
             txt_path.display()
-        );
-    }
+        )
+    })?;
+    let patched = patch_txt_names_checked(
+        &text,
+        run,
+        &format!("FA .txt sidecar {}", txt_path.display()),
+    )?;
     write_file_atomic(&txt_path, patched.as_bytes())?;
     Ok(())
 }
 
-/// Rewrite a zipped FA run in place, patching only the `.txt` entry's sample
-/// IDs. Other entries are read and written into a fresh archive; the new archive
-/// is written to a unique temp file and swapped in.
+/// True when the concrete FA source has a `.txt` sidecar that `save_txt_names`
+/// can patch in place.
+pub fn has_saveable_txt_sidecar(path: &Path) -> bool {
+    saveable_txt_sidecar_exists(path).unwrap_or(false)
+}
+
+/// True when `path` is a concrete FA run entry that can be used as a save
+/// destination. This is intentionally stricter than [`is_fa_path`], which also
+/// accepts arbitrary sibling files for forgiving load/drop behavior.
+pub fn is_saveable_fa_destination(path: &Path) -> bool {
+    is_concrete_fa_run_entry(path) && saveable_txt_sidecar_exists(path).unwrap_or(false)
+}
+
+/// True when `dst` is a supported save target for this concrete FA source.
+///
+/// Besides zipped runs, filesystem saves are deliberately limited to the exact
+/// source path (in-place) or the actual `.txt` sidecar that will be patched.
+/// Other siblings such as `.PKS` are loadable run entry points but are not
+/// destination paths for save-as style flows.
+pub fn is_saveable_fa_destination_for_source(src: &Path, dst: &Path) -> bool {
+    if has_zip_extension(dst) {
+        return is_saveable_fa_destination(dst) && run_identity(src) == run_identity(dst);
+    }
+
+    if !is_concrete_fa_run_entry(dst) || run_identity(src) != run_identity(dst) {
+        return false;
+    }
+
+    if comparable_path(src) == comparable_path(dst) {
+        return has_saveable_txt_sidecar(src);
+    }
+
+    name_has_ext(&dst.to_string_lossy(), "txt") && is_saveable_fa_destination(dst)
+}
+
+/// True when `path` names an existing concrete member of a single FA run rather
+/// than an arbitrary file in a run directory.
+pub fn is_concrete_fa_run_entry(path: &Path) -> bool {
+    is_concrete_fa_run_entry_impl(path).unwrap_or(false)
+}
+
+fn is_concrete_fa_run_entry_impl(path: &Path) -> Result<bool> {
+    if has_zip_extension(path) {
+        return Ok(path.is_file() && zip_has_fa_raw(path));
+    }
+    if path.is_dir() {
+        return Ok(find_raw_in_dir(path)?.is_some());
+    }
+
+    if !path.is_file() {
+        return Ok(false);
+    }
+
+    let raw_path = resolve_raw_path(path)?;
+    let dir = raw_path.parent().unwrap_or_else(|| Path::new("."));
+    let Some(file_name) = path.file_name() else {
+        return Ok(false);
+    };
+    if path == raw_path {
+        return Ok(is_fa_path(path));
+    }
+
+    let raw_stem = raw_path
+        .file_stem()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default();
+    let stem_matches = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().eq_ignore_ascii_case(&raw_stem))
+        .unwrap_or(false);
+    let extension_matches = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "txt" | "pks" | "anai" | "current" | "raw"
+        )
+    });
+    Ok(stem_matches && extension_matches && dir.join(file_name).is_file())
+}
+
+fn saveable_txt_sidecar_exists(path: &Path) -> Result<bool> {
+    if has_zip_extension(path) {
+        return saveable_txt_sidecar_exists_zip(path);
+    }
+    let raw_path = resolve_raw_path(path)?;
+    let dir = raw_path.parent().unwrap_or_else(|| Path::new("."));
+    Ok(sibling_path(dir, &raw_path, "txt")?.is_some())
+}
+
+fn saveable_txt_sidecar_exists_zip(path: &Path) -> Result<bool> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .with_context(|| format!("reading zip {}", path.display()))?;
+    let (names, raw_name) = fa_zip_names_and_raw_entry(&mut zip)?;
+    if find_sibling(&names, strip_known_ext(&raw_name), "txt")?.is_none() {
+        return Ok(false);
+    }
+    validate_preservable_zip_entry_metadata(&mut zip)?;
+    Ok(true)
+}
+
+/// Rewrite a zipped FA run in place, patching the `.txt` entry's sample IDs.
+/// Other entry payloads are copied into a fresh archive. Archive comments are
+/// preserved; entry metadata that cannot be reconstructed is rejected before
+/// writing so saves never silently strip it.
 fn save_txt_names_zip(path: &Path, run: &Electrophoresis) -> Result<()> {
     use std::io::{Read, Write};
 
     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
         .with_context(|| format!("reading zip {}", path.display()))?;
+    let archive_comment = zip.comment().to_vec();
+    let archive_zip64_comment = zip.zip64_comment().map(<[u8]>::to_vec);
 
     // Locate the `.txt` entry sharing the `.raw` entry's stem.
-    let names: Vec<String> = (0..zip.len())
-        .map(|i| zip.by_index(i).map(|e| e.name().to_string()))
-        .collect::<std::result::Result<_, _>>()?;
-    let raw_name = {
-        let mut found = None;
-        for i in 0..zip.len() {
-            let mut entry = zip.by_index(i)?;
-            if let Some(name) = fa_raw_entry_name(&mut entry) {
-                found = Some(name);
-                break;
-            }
-        }
-        found.ok_or_else(|| anyhow!("zip {} has no FA .raw entry", path.display()))?
-    };
+    let (names, raw_name) = fa_zip_names_and_raw_entry(&mut zip)
+        .with_context(|| format!("locating FA run in zip {}", path.display()))?;
     let txt_name = find_sibling(&names, strip_known_ext(&raw_name), "txt")?
         .ok_or_else(|| anyhow!("zip {} has no .txt entry to rename", path.display()))?;
+    validate_preservable_zip_entry_metadata(&mut zip)?;
 
     let mut entries = Vec::with_capacity(zip.len());
     let mut old_text = None;
@@ -504,7 +593,18 @@ fn save_txt_names_zip(path: &Path, run: &Electrophoresis) -> Result<()> {
                 .with_context(|| format!("reading zip entry {name}"))?;
         }
         if name == txt_name {
-            old_text = Some(String::from_utf8_lossy(&data).into_owned());
+            old_text = Some(String::from_utf8(data).with_context(|| {
+                format!(
+                    "reading zip entry {txt_name}; FA .txt sidecar must be valid UTF-8 to save sample renames without corrupting bytes"
+                )
+            })?);
+            entries.push(ZipEntryData {
+                name,
+                data: Vec::new(),
+                options,
+                is_dir,
+            });
+            continue;
         }
         entries.push(ZipEntryData {
             name,
@@ -514,15 +614,14 @@ fn save_txt_names_zip(path: &Path, run: &Electrophoresis) -> Result<()> {
         });
     }
     let old_text = old_text.ok_or_else(|| anyhow!("zip entry {txt_name} disappeared"))?;
-    let (patched, changed) = patch_txt_names(&old_text, run);
-    if changed == 0 {
-        bail!("FA .txt entry {txt_name} did not contain any Sample ID entries");
-    }
+    let patched = patch_txt_names_checked(&old_text, run, &format!("FA .txt entry {txt_name}"))?;
 
     // Write a fresh archive next to the target, then replace it.
     let (tmp, out) = create_unique_temp_file(path)?;
     {
         let mut writer = zip::ZipWriter::new(std::io::BufWriter::new(out));
+        writer.set_raw_comment(archive_comment.into_boxed_slice());
+        writer.set_raw_zip64_comment(archive_zip64_comment.map(Vec::into_boxed_slice));
         for entry in entries {
             if entry.is_dir {
                 writer.add_directory(&entry.name, entry.options)?;
@@ -534,16 +633,48 @@ fn save_txt_names_zip(path: &Path, run: &Electrophoresis) -> Result<()> {
                 writer.write_all(&entry.data)?;
             }
         }
-        writer.finish()?;
+        let mut out = writer
+            .finish()
+            .with_context(|| format!("finishing updated archive {}", tmp.display()))?;
+        preserve_existing_permissions(&tmp, path)?;
+        out.flush()
+            .with_context(|| format!("flushing updated archive {}", tmp.display()))?;
+        out.get_ref()
+            .sync_all()
+            .with_context(|| format!("syncing updated archive {}", tmp.display()))?;
     }
     drop(zip); // close the original before replacing it (matters on Windows)
     replace_file(&tmp, path)
         .with_context(|| format!("replacing {} with updated archive", path.display()))?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+fn reject_unpreserved_zip_entry_metadata(entry: &zip::read::ZipFile<'_>) -> Result<()> {
+    if !entry.comment().is_empty() {
+        bail!("FA ZIP save cannot preserve per-entry comments yet");
+    }
+    if entry.extra_data().is_some_and(|data| !data.is_empty()) {
+        bail!("FA ZIP save cannot preserve per-entry extra fields yet");
+    }
+    Ok(())
+}
+
+fn validate_preservable_zip_entry_metadata<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<()> {
+    for i in 0..zip.len() {
+        let entry = zip.by_index(i)?;
+        let name = entry.name().to_string();
+        reject_unpreserved_zip_entry_metadata(&entry)
+            .with_context(|| format!("checking ZIP entry metadata for {name}"))?;
+    }
     Ok(())
 }
 
 /// True if `path` looks like a Fragment Analyzer run entry point: a single
-/// `.zip` packaging the run (the recommended form), a `.raw` file with the
+/// `.fa.zip` packaging the run (the recommended form; plain `.zip` is accepted
+/// for compatibility), a `.raw` file with the
 /// `FA\0\0` magic, a directory containing one, or any other sibling file inside
 /// such a directory (so dropping a run's `.PKS`/`.txt`/etc. opens the run).
 pub fn is_fa_path(path: &Path) -> bool {
@@ -559,21 +690,21 @@ pub fn is_fa_path(path: &Path) -> bool {
     }
     // Forgiving: a plain member of an FA run folder. Never steal a Bioanalyzer
     // file — it has its own reader and could legitimately sit in the same dir.
-    if is_bioanalyzer_ext(path) {
+    if is_foreign_electrophoresis_path(path) {
         return false;
     }
     parent_dir(path).is_some_and(|p| matches!(find_raw_in_dir(p), Ok(Some(_))))
 }
 
-/// Canonical identity of an FA run for any path `is_fa_path` accepts: the `.zip`
-/// itself for a zipped run, otherwise the run's `.raw` file. Lets the app tell
+/// Canonical identity of an FA run for any path `is_fa_path` accepts: the
+/// `.fa.zip`/`.zip` itself for a zipped run, otherwise the run's `.raw` file. Lets the app tell
 /// when two entry points (the folder, the `.raw`, or a sibling like `.PKS` /
 /// `.txt`) refer to the same run, so a multi-file drop opens it only once.
 pub fn run_identity(path: &Path) -> PathBuf {
     if has_zip_extension(path) {
-        return path.to_path_buf();
+        return comparable_path(path);
     }
-    resolve_raw_path(path).unwrap_or_else(|_| path.to_path_buf())
+    comparable_path(&resolve_raw_path(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
 /// The path's parent directory, or `None` for a bare filename (empty parent).
@@ -644,6 +775,38 @@ fn sibling_path(dir: &Path, raw_path: &Path, ext: &str) -> Result<Option<PathBuf
     }
 }
 
+fn named_path(dir: &Path, name: &str) -> Result<Option<PathBuf>> {
+    let exact = dir.join(name);
+    if exact.exists() {
+        return Ok(Some(exact));
+    }
+
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name))
+        {
+            matches.push(path);
+        }
+    }
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => Err(anyhow!(
+            "ambiguous FA metadata files named {name} in {}: {}",
+            dir.display(),
+            matches
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 fn create_unique_temp_file(dst: &Path) -> Result<(PathBuf, std::fs::File)> {
     let dir = dst.parent().unwrap_or_else(|| Path::new("."));
     let name = dst
@@ -683,61 +846,108 @@ fn write_file_atomic(dst: &Path, contents: &[u8]) -> Result<()> {
     let (tmp, mut out) = create_unique_temp_file(dst)?;
     out.write_all(contents)
         .with_context(|| format!("writing {}", tmp.display()))?;
+    preserve_existing_permissions(&tmp, dst)?;
     out.sync_all()
         .with_context(|| format!("syncing {}", tmp.display()))?;
     drop(out);
     replace_file(&tmp, dst)?;
+    sync_parent_dir(dst)?;
+    Ok(())
+}
+
+fn preserve_existing_permissions(tmp: &Path, dst: &Path) -> Result<()> {
+    match std::fs::metadata(dst) {
+        Ok(meta) => std::fs::set_permissions(tmp, meta.permissions()).with_context(|| {
+            format!(
+                "preserving permissions from {} on temporary file {}",
+                dst.display(),
+                tmp.display()
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("reading permissions for {}", dst.display())),
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let Some(parent) = parent_dir(path) else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("syncing destination directory {}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
 fn replace_file(tmp: &Path, dst: &Path) -> Result<()> {
-    match std::fs::rename(tmp, dst) {
-        Ok(()) => Ok(()),
-        Err(first) if dst.exists() => {
-            let backup = dst.with_extension(format!(
-                "replace-bak-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            ));
-            std::fs::rename(dst, &backup).with_context(|| {
-                format!(
-                    "moving {} aside after replace failed with {first}",
-                    dst.display()
-                )
-            })?;
-            match std::fs::rename(tmp, dst) {
-                Ok(()) => {
-                    let _ = std::fs::remove_file(&backup);
-                    Ok(())
-                }
-                Err(e) => {
-                    let _ = std::fs::rename(&backup, dst);
-                    Err(e).with_context(|| {
-                        format!(
-                            "renaming {} to {} after moving original aside",
-                            tmp.display(),
-                            dst.display()
-                        )
-                    })
-                }
-            }
-        }
-        Err(e) => {
-            Err(e).with_context(|| format!("renaming {} to {}", tmp.display(), dst.display()))
-        }
+    replace_file_impl(tmp, dst)
+        .with_context(|| format!("replacing {} with {}", dst.display(), tmp.display()))
+}
+
+#[cfg(windows)]
+fn replace_file_impl(tmp: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            dwFlags: u32,
+        ) -> i32;
+    }
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let tmp = wide(tmp);
+    let dst = wide(dst);
+    let ok = unsafe {
+        MoveFileExW(
+            tmp.as_ptr(),
+            dst.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
-/// True for the Bioanalyzer extensions handled by another reader.
-fn is_bioanalyzer_ext(path: &Path) -> bool {
+#[cfg(not(windows))]
+fn replace_file_impl(tmp: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, dst)
+}
+
+/// True for paths handled by another electrophoresis reader.
+fn is_foreign_electrophoresis_path(path: &Path) -> bool {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    name.ends_with(".xad") || name.ends_with(".xml") || name.ends_with(".gz")
+    name.ends_with(".xad")
+        || name.ends_with(".xml")
+        || name.ends_with(".xml.gz")
+        || name.ends_with("_electropherogram.csv")
+        || name.ends_with("_electropherogram.csv.gz")
+}
+
+fn comparable_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// True if `path` is a zip archive containing a `.raw` entry with the FA magic.
@@ -759,6 +969,29 @@ fn zip_has_fa_raw(path: &Path) -> bool {
         }
     }
     false
+}
+
+fn fa_zip_names_and_raw_entry<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<(Vec<String>, String)> {
+    let mut names = Vec::with_capacity(zip.len());
+    let mut raw_names = Vec::new();
+    for i in 0..zip.len() {
+        let mut e = zip.by_index(i)?;
+        let name = e.name().to_string();
+        if let Some(name) = fa_raw_entry_name(&mut e) {
+            raw_names.push(name);
+        }
+        names.push(name);
+    }
+    match raw_names.len() {
+        0 => Err(anyhow!("zip has no FA .raw entry")),
+        1 => Ok((names, raw_names.pop().unwrap())),
+        _ => Err(anyhow!(
+            "zip contains multiple FA .raw entries; refusing ambiguous multi-run archive: {}",
+            raw_names.join(", ")
+        )),
+    }
 }
 
 fn has_zip_extension(path: &Path) -> bool {
@@ -788,7 +1021,13 @@ fn strip_known_ext(name: &str) -> &str {
 /// sidecar path, then accept one unambiguous case-insensitive fallback.
 fn find_sibling(names: &[String], stem: &str, ext: &str) -> Result<Option<String>> {
     let exact = format!("{stem}.{ext}");
-    if names.iter().any(|n| n == &exact) {
+    let exact_matches = names.iter().filter(|n| *n == &exact).count();
+    if exact_matches > 1 {
+        return Err(anyhow!(
+            "duplicate FA .{ext} sidecar entries in zip for stem {stem}: {exact}"
+        ));
+    }
+    if exact_matches == 1 {
         return Ok(Some(exact));
     }
 
@@ -1039,16 +1278,23 @@ fn parse_txt(text: &str) -> Vec<CapInfo> {
 }
 
 fn patch_txt_names(text: &str, run: &Electrophoresis) -> (String, usize) {
+    let samples_by_well: BTreeMap<i32, &Sample> = run
+        .samples
+        .iter()
+        .map(|sample| (sample.well_number, sample))
+        .collect();
     let mut out = String::with_capacity(text.len());
-    let mut cap_idx: Option<usize> = None;
+    let mut capillary_order = 0i32;
+    let mut current_well_number = None;
     let mut current_well = String::new();
     let mut changed = 0usize;
 
     for line in text.split_inclusive('\n') {
         let (body, ending) = line_body_and_ending(line);
         let trimmed = body.trim_start();
-        if trimmed.starts_with("Capillary #:") {
-            cap_idx = Some(cap_idx.map_or(0, |i| i + 1));
+        if trimmed.strip_prefix("Capillary #:").is_some() {
+            capillary_order += 1;
+            current_well_number = Some(capillary_order);
             current_well.clear();
             out.push_str(line);
             continue;
@@ -1059,8 +1305,8 @@ fn patch_txt_names(text: &str, run: &Electrophoresis) -> (String, usize) {
             continue;
         }
         if trimmed.starts_with("Sample ID:") {
-            if let Some(i) = cap_idx {
-                if let Some(sample) = run.samples.get(i) {
+            if let Some(well_number) = current_well_number {
+                if let Some(sample) = samples_by_well.get(&well_number) {
                     let prefix_len = body.find("Sample ID:").unwrap_or(0);
                     let id = sidecar_sample_id(&sample.name, &current_well);
                     out.push_str(&body[..prefix_len]);
@@ -1076,6 +1322,36 @@ fn patch_txt_names(text: &str, run: &Electrophoresis) -> (String, usize) {
     }
 
     (out, changed)
+}
+
+fn patch_txt_names_checked(text: &str, run: &Electrophoresis, label: &str) -> Result<String> {
+    let (patched, changed) = patch_txt_names(text, run);
+    let sidecar_sample_ids = text
+        .lines()
+        .filter(|line| line.trim_start().starts_with("Sample ID:"))
+        .count();
+    let wanted_wells = run
+        .samples
+        .iter()
+        .map(|sample| sample.well_number)
+        .collect::<BTreeSet<_>>();
+
+    if changed == 0 {
+        bail!("{label} did not contain any Sample ID entries matching the loaded run");
+    }
+    if wanted_wells.len() != run.samples.len() {
+        bail!(
+            "loaded Fragment Analyzer run has duplicate sample well numbers; refusing partial .txt save"
+        );
+    }
+    if changed != wanted_wells.len() || changed != sidecar_sample_ids {
+        bail!(
+            "{label} matched {changed} Sample ID entries, but the loaded run has {} samples and the sidecar has {sidecar_sample_ids}; refusing partial .txt save",
+            wanted_wells.len()
+        );
+    }
+
+    Ok(patched)
 }
 
 fn line_body_and_ending(line: &str) -> (&str, &str) {
@@ -1531,6 +1807,62 @@ mod tests {
     }
 
     #[test]
+    fn txt_sidecar_patch_uses_well_number_not_sample_order() {
+        let text = "Capillary #: 1\nWell: D1\nSample ID: old one\n\
+                    Capillary #: 2\nWell: D2\nSample ID: old two\n";
+        let run = Electrophoresis {
+            assay: Default::default(),
+            ladder_peaks: Vec::new(),
+            regions: Vec::new(),
+            samples: vec![make_sample(2, "D2: second"), make_sample(1, "D1: first")],
+        };
+
+        let (patched, changed) = patch_txt_names(text, &run);
+
+        assert_eq!(changed, 2);
+        assert!(patched.contains("Capillary #: 1\nWell: D1\nSample ID: first\n"));
+        assert!(patched.contains("Capillary #: 2\nWell: D2\nSample ID: second\n"));
+    }
+
+    #[test]
+    fn txt_sidecar_patch_matches_non_contiguous_capillary_numbers_by_order() {
+        let text = "Capillary #: 17\nWell: D1\nSample ID: old one\n\
+                    Capillary #: 42\nWell: D2\nSample ID: old two\n";
+        let run = Electrophoresis {
+            assay: Default::default(),
+            ladder_peaks: Vec::new(),
+            regions: Vec::new(),
+            samples: vec![make_sample(1, "D1: first"), make_sample(2, "D2: second")],
+        };
+
+        let (patched, changed) = patch_txt_names(text, &run);
+
+        assert_eq!(changed, 2);
+        assert!(patched.contains("Capillary #: 17\nWell: D1\nSample ID: first\n"));
+        assert!(patched.contains("Capillary #: 42\nWell: D2\nSample ID: second\n"));
+        assert!(!patched.contains("old one"));
+        assert!(!patched.contains("old two"));
+    }
+
+    #[test]
+    fn txt_sidecar_patch_keeps_malformed_capillary_number_fallback_by_order() {
+        let text = "Capillary #: A\nWell: D1\nSample ID: old one\n\
+                    Capillary #: \nWell: D2\nSample ID: old two\n";
+        let run = Electrophoresis {
+            assay: Default::default(),
+            ladder_peaks: Vec::new(),
+            regions: Vec::new(),
+            samples: vec![make_sample(1, "D1: first"), make_sample(2, "D2: second")],
+        };
+
+        let (patched, changed) = patch_txt_names(text, &run);
+
+        assert_eq!(changed, 2);
+        assert!(patched.contains("Capillary #: A\nWell: D1\nSample ID: first\n"));
+        assert!(patched.contains("Capillary #: \nWell: D2\nSample ID: second\n"));
+    }
+
+    #[test]
     fn txt_sidecar_patch_preserves_blank_sample_id_for_well_only_name() {
         let text = "Capillary #: 1\nWell: D1\nSample ID: \n";
         let run = Electrophoresis {
@@ -1544,6 +1876,86 @@ mod tests {
 
         assert_eq!(changed, 1);
         assert_eq!(patched, "Capillary #: 1\nWell: D1\nSample ID: \n");
+    }
+
+    #[test]
+    fn txt_sidecar_checked_patch_rejects_missing_run_sample() {
+        let text = "Capillary #: 1\nWell: D1\nSample ID: old\n";
+        let run = Electrophoresis {
+            assay: Default::default(),
+            ladder_peaks: Vec::new(),
+            regions: Vec::new(),
+            samples: vec![make_sample(1, "D1: renamed"), make_sample(2, "D2: missing")],
+        };
+
+        let err = patch_txt_names_checked(text, &run, "FA .txt sidecar test")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("refusing partial .txt save"), "got {err}");
+    }
+
+    #[test]
+    fn txt_sidecar_checked_patch_rejects_extra_sidecar_capillary() {
+        let text = "Capillary #: 1\nWell: D1\nSample ID: old\n\
+                    Capillary #: 2\nWell: D2\nSample ID: stale\n";
+        let run = Electrophoresis {
+            assay: Default::default(),
+            ladder_peaks: Vec::new(),
+            regions: Vec::new(),
+            samples: vec![make_sample(1, "D1: renamed")],
+        };
+
+        let err = patch_txt_names_checked(text, &run, "FA .txt sidecar test")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("refusing partial .txt save"), "got {err}");
+    }
+
+    #[test]
+    fn replace_file_replaces_existing_destination() {
+        let dir = std::env::temp_dir().join(format!(
+            "traceio_fa_replace_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("run.zip");
+        let tmp = dir.join(".run.zip.tmp");
+        std::fs::write(&dst, b"old").unwrap();
+        std::fs::write(&tmp, b"new").unwrap();
+
+        replace_file(&tmp, &dst).unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+        assert!(!tmp.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replace_file_failure_leaves_destination_in_place() {
+        let dir = std::env::temp_dir().join(format!(
+            "traceio_fa_replace_fail_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("run.zip");
+        let missing_tmp = dir.join(".missing.tmp");
+        std::fs::write(&dst, b"old").unwrap();
+
+        let err = replace_file(&missing_tmp, &dst).unwrap_err().to_string();
+
+        assert!(err.contains("replacing"), "got {err}");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"old");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1576,6 +1988,50 @@ mod tests {
 
         assert!(is_fa_path(&raw));
         assert!(is_fa_path(&dir));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn run_identity_canonicalizes_equivalent_relative_and_absolute_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = cwd.join(format!(
+            "target/traceio_fa_identity_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("run.raw");
+        let txt = dir.join("run.txt");
+        std::fs::write(&raw, b"FA\0\0").unwrap();
+        std::fs::write(&txt, "Capillary #: 1\nWell: D1\nSample ID: old\n").unwrap();
+        let relative_txt = txt.strip_prefix(&cwd).unwrap();
+
+        assert_eq!(run_identity(&raw), run_identity(relative_txt));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tapestation_electropherogram_csv_is_not_fa_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "traceio_fa_ts_csv_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("run.raw");
+        let csv = dir.join("run_Electropherogram.csv");
+        std::fs::write(&raw, b"FA\0\0").unwrap();
+        std::fs::write(&csv, b"Sample,Time,Value\n").unwrap();
+
+        assert!(!is_fa_path(&csv));
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1670,16 +2126,16 @@ mod tests {
              Capillary #: 1\nWell: D1\nSample ID: alpha\n",
         )
         .unwrap();
-        std::fs::write(dir.join("method.mthd"), "[Separation]\nKV=7.00\n").unwrap();
+        std::fs::write(dir.join("METHOD.MTHD"), "[Separation]\nKV=7.00\n").unwrap();
         std::fs::write(dir.join("run.ANAI"), "[General]\nMode = 2\n").unwrap();
         std::fs::write(
             dir.join("run.current"),
             "Current(uA)\tVoltage(kV)\tPressure(PSI)\n54.0\t7.00\t-0.01\n",
         )
         .unwrap();
-        std::fs::write(dir.join("Timing.txt"), "Frame 1: Start\n").unwrap();
-        std::fs::write(dir.join("ExpTime.txt"), "845ms, 50\n").unwrap();
-        std::fs::write(dir.join("CameraImage.bmp"), b"\x89PNG\r\n").unwrap();
+        std::fs::write(dir.join("timing.TXT"), "Frame 1: Start\n").unwrap();
+        std::fs::write(dir.join("EXPTIME.TXT"), "845ms, 50\n").unwrap();
+        std::fs::write(dir.join("cameraimage.BMP"), b"\x89PNG\r\n").unwrap();
 
         let meta = read_fa_metadata(&raw).unwrap();
 
@@ -1690,6 +2146,52 @@ mod tests {
         assert_eq!(meta.timing, vec!["Frame 1: Start"]);
         assert_eq!(meta.exposure, vec!["845ms, 50"]);
         assert_eq!(meta.camera_image.as_deref(), Some(&b"\x89PNG\r\n"[..]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn filesystem_metadata_warns_for_malformed_optional_current_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "traceio_fa_metadata_bad_current_fs_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("run.raw");
+        std::fs::write(&raw, synthetic_raw(20, 3, &[5, 14])).unwrap();
+        std::fs::write(
+            dir.join("run.txt"),
+            "Raw file: C:\\AATI\\Data\\run.raw\nOperator: admin\n\
+             Capillary #: 1\nWell: D1\nSample ID: alpha\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("method.mthd"), "[Separation]\nKV=7.00\n").unwrap();
+        std::fs::write(dir.join("run.ANAI"), "[General]\nMode = 2\n").unwrap();
+        std::fs::write(
+            dir.join("run.current"),
+            "Current(uA)\tVoltage(kV)\tPressure(PSI)\nnot-a-current-row\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("Timing.txt"), "Frame 1: Start\n").unwrap();
+        std::fs::write(dir.join("ExpTime.txt"), "845ms, 50\n").unwrap();
+
+        let meta = read_fa_metadata(&raw).unwrap();
+
+        assert_eq!(meta.run_header["Operator"], "admin");
+        assert_eq!(meta.method["Separation"]["KV"], "7.00");
+        assert_eq!(meta.analysis["General"]["Mode"], "2");
+        assert!(meta.current.is_empty());
+        assert_eq!(meta.warnings.len(), 1);
+        assert!(
+            meta.warnings[0].contains(".current ignored because it is malformed"),
+            "got {:?}",
+            meta.warnings
+        );
+        assert_eq!(meta.timing, vec!["Frame 1: Start"]);
+        assert_eq!(meta.exposure, vec!["845ms, 50"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1739,6 +2241,147 @@ mod tests {
 
         let patched = std::fs::read_to_string(&txt).unwrap();
         assert!(patched.contains("Sample ID: renamed"), "got {patched}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn filesystem_sidecar_save_rejects_partial_matches_without_writing() {
+        let dir = std::env::temp_dir().join(format!(
+            "traceio_fa_sidecar_save_partial_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("run.raw");
+        let txt = dir.join("run.txt");
+        let original = "Capillary #: 1\nWell: D1\nSample ID: old\n";
+        std::fs::write(&raw, synthetic_raw(20, 3, &[5, 14])).unwrap();
+        std::fs::write(&txt, original).unwrap();
+        let run = Electrophoresis {
+            assay: Default::default(),
+            ladder_peaks: Vec::new(),
+            regions: Vec::new(),
+            samples: vec![make_sample(1, "D1: renamed"), make_sample(2, "D2: missing")],
+        };
+
+        let err = save_txt_names(&raw, &run).unwrap_err().to_string();
+
+        assert!(err.contains("refusing partial .txt save"), "got {err}");
+        assert_eq!(std::fs::read_to_string(&txt).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn filesystem_sidecar_save_rejects_non_utf8_without_writing() {
+        let dir = std::env::temp_dir().join(format!(
+            "traceio_fa_sidecar_save_non_utf8_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("run.raw");
+        let txt = dir.join("run.txt");
+        let original = b"Capillary #: 1\nWell: D1\nSample ID: old \xff\n".to_vec();
+        std::fs::write(&raw, synthetic_raw(20, 3, &[5, 14])).unwrap();
+        std::fs::write(&txt, &original).unwrap();
+        let run = Electrophoresis {
+            assay: Default::default(),
+            ladder_peaks: Vec::new(),
+            regions: Vec::new(),
+            samples: vec![make_sample(1, "D1: renamed")],
+        };
+
+        let err = save_txt_names(&raw, &run).unwrap_err().to_string();
+
+        assert!(err.contains("must be valid UTF-8"), "got {err}");
+        assert_eq!(std::fs::read(&txt).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_sidecar_save_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "traceio_fa_sidecar_save_mode_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("run.raw");
+        let txt = dir.join("run.txt");
+        std::fs::write(&raw, synthetic_raw(20, 3, &[5, 14])).unwrap();
+        std::fs::write(&txt, "Capillary #: 1\nWell: D1\nSample ID: old\n").unwrap();
+        std::fs::set_permissions(&txt, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let run = Electrophoresis {
+            assay: Default::default(),
+            ladder_peaks: Vec::new(),
+            regions: Vec::new(),
+            samples: vec![make_sample(1, "D1: renamed")],
+        };
+
+        save_txt_names(&raw, &run).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&txt).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn raw_only_filesystem_run_has_no_saveable_txt_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "traceio_fa_raw_only_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("run.raw");
+        std::fs::write(&raw, synthetic_raw(20, 3, &[5, 14])).unwrap();
+
+        assert!(is_fa_path(&raw));
+        assert!(!has_saveable_txt_sidecar(&raw));
+        assert!(!has_saveable_txt_sidecar(&dir));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn arbitrary_existing_txt_in_run_dir_is_not_saveable_destination() {
+        let dir = std::env::temp_dir().join(format!(
+            "traceio_fa_arbitrary_txt_destination_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("run.raw");
+        let txt = dir.join("run.txt");
+        let arbitrary = dir.join("notes.txt");
+        std::fs::write(&raw, synthetic_raw(20, 3, &[5, 14])).unwrap();
+        std::fs::write(&txt, "Capillary #: 1\nWell: D1\nSample ID: old\n").unwrap();
+        std::fs::write(&arbitrary, "not an FA sidecar").unwrap();
+
+        assert!(is_fa_path(&arbitrary));
+        assert!(!is_saveable_fa_destination(&arbitrary));
+        assert!(!is_saveable_fa_destination(&dir.join("missing.txt")));
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1862,6 +2505,291 @@ mod tests {
         assert_eq!(meta.exposure, vec!["845ms, 50"]);
         assert_eq!(meta.camera_image.as_deref(), Some(&b"\x89PNG\r\n"[..]));
         std::fs::remove_file(zip_path).unwrap();
+    }
+
+    #[test]
+    fn zip_metadata_warns_for_malformed_optional_current_sidecar() {
+        use std::io::Write;
+
+        let zip_path = std::env::temp_dir().join(format!(
+            "traceio_fa_metadata_bad_current_zip_{}_{}.zip",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let out = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(out);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("folder/run.raw", opts).unwrap();
+            zip.write_all(&synthetic_raw(20, 3, &[5, 14])).unwrap();
+            zip.start_file("folder/run.txt", opts).unwrap();
+            zip.write_all(b"Raw file: C:\\AATI\\Data\\run.raw\nOperator: admin\n")
+                .unwrap();
+            zip.start_file("folder/run.ANAI", opts).unwrap();
+            zip.write_all(b"[General]\nMode = 2\n").unwrap();
+            zip.start_file("folder/run.current", opts).unwrap();
+            zip.write_all(b"Current(uA)\tVoltage(kV)\tPressure(PSI)\nnot-a-current-row\n")
+                .unwrap();
+            zip.start_file("folder/method.mthd", opts).unwrap();
+            zip.write_all(b"[Separation]\nKV=7.00\n").unwrap();
+            zip.start_file("folder/Timing.txt", opts).unwrap();
+            zip.write_all(b"Frame 1: Start\n").unwrap();
+            zip.start_file("folder/ExpTime.txt", opts).unwrap();
+            zip.write_all(b"845ms, 50\n").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let meta = read_fa_metadata(&zip_path).unwrap();
+
+        assert_eq!(meta.run_header["Operator"], "admin");
+        assert_eq!(meta.method["Separation"]["KV"], "7.00");
+        assert_eq!(meta.analysis["General"]["Mode"], "2");
+        assert!(meta.current.is_empty());
+        assert_eq!(meta.warnings.len(), 1);
+        assert!(
+            meta.warnings[0].contains(".current entry"),
+            "got {:?}",
+            meta.warnings
+        );
+        assert!(
+            meta.warnings[0].contains("ignored because it is malformed"),
+            "got {:?}",
+            meta.warnings
+        );
+        assert_eq!(meta.timing, vec!["Frame 1: Start"]);
+        assert_eq!(meta.exposure, vec!["845ms, 50"]);
+        std::fs::remove_file(zip_path).unwrap();
+    }
+
+    #[test]
+    fn zip_without_txt_has_no_saveable_txt_sidecar() {
+        use std::io::Write;
+
+        let zip_path = std::env::temp_dir().join(format!(
+            "traceio_fa_zip_raw_only_{}_{}.zip",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let out = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(out);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("run.raw", opts).unwrap();
+            zip.write_all(&synthetic_raw(20, 3, &[5, 14])).unwrap();
+            zip.finish().unwrap();
+        }
+
+        assert!(is_fa_path(&zip_path));
+        assert!(!has_saveable_txt_sidecar(&zip_path));
+
+        std::fs::remove_file(zip_path).unwrap();
+    }
+
+    #[test]
+    fn zip_save_rejects_non_utf8_txt_without_writing() {
+        use std::io::Write;
+
+        let zip_path = std::env::temp_dir().join(format!(
+            "traceio_fa_zip_non_utf8_{}_{}.zip",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let out = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(out);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("run.raw", opts).unwrap();
+            zip.write_all(&synthetic_raw(20, 3, &[5, 14])).unwrap();
+            zip.start_file("run.txt", opts).unwrap();
+            zip.write_all(b"Capillary #: 1\nWell: D1\nSample ID: old \xff\n")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        let original = std::fs::read(&zip_path).unwrap();
+        let run = Electrophoresis {
+            assay: Default::default(),
+            ladder_peaks: Vec::new(),
+            regions: Vec::new(),
+            samples: vec![make_sample(1, "D1: renamed")],
+        };
+
+        let err = format!("{:#}", save_txt_names(&zip_path, &run).unwrap_err());
+
+        assert!(err.contains("must be valid UTF-8"), "got {err}");
+        assert_eq!(std::fs::read(&zip_path).unwrap(), original);
+        std::fs::remove_file(zip_path).unwrap();
+    }
+
+    #[test]
+    fn zip_save_preserves_archive_comment() {
+        use std::io::{Read, Write};
+
+        let zip_path = std::env::temp_dir().join(format!(
+            "traceio_fa_zip_comment_{}_{}.zip",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let out = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(out);
+            zip.set_raw_comment(b"instrument export note".to_vec().into_boxed_slice());
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("run.raw", opts).unwrap();
+            zip.write_all(&synthetic_raw(20, 3, &[5, 14])).unwrap();
+            zip.start_file("run.txt", opts).unwrap();
+            zip.write_all(b"Capillary #: 1\nWell: D1\nSample ID: old\n")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        let run = Electrophoresis {
+            assay: Default::default(),
+            ladder_peaks: Vec::new(),
+            regions: Vec::new(),
+            samples: vec![make_sample(1, "D1: renamed")],
+        };
+
+        save_txt_names(&zip_path, &run).unwrap();
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        assert_eq!(zip.comment(), b"instrument export note");
+        let mut text = String::new();
+        zip.by_name("run.txt")
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert!(text.contains("Sample ID: renamed"), "got {text}");
+        std::fs::remove_file(zip_path).unwrap();
+    }
+
+    #[test]
+    fn zip_save_rejects_entry_extra_data_without_writing() {
+        use std::io::Write;
+
+        let zip_path = std::env::temp_dir().join(format!(
+            "traceio_fa_zip_extra_data_{}_{}.zip",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let out = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(out);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("run.raw", opts).unwrap();
+            zip.write_all(&synthetic_raw(20, 3, &[5, 14])).unwrap();
+            let mut txt_opts: zip::write::FullFileOptions<'_> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            txt_opts
+                .add_extra_data(0xcafe, vec![1, 2, 3].into_boxed_slice(), false)
+                .unwrap();
+            zip.start_file("run.txt", txt_opts).unwrap();
+            zip.write_all(b"Capillary #: 1\nWell: D1\nSample ID: old\n")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        let original = std::fs::read(&zip_path).unwrap();
+        let run = Electrophoresis {
+            assay: Default::default(),
+            ladder_peaks: Vec::new(),
+            regions: Vec::new(),
+            samples: vec![make_sample(1, "D1: renamed")],
+        };
+
+        let err = format!("{:#}", save_txt_names(&zip_path, &run).unwrap_err());
+
+        assert!(
+            err.contains("cannot preserve per-entry extra fields"),
+            "got {err}"
+        );
+        assert_eq!(std::fs::read(&zip_path).unwrap(), original);
+        std::fs::remove_file(zip_path).unwrap();
+    }
+
+    #[test]
+    fn zip_with_multiple_valid_raw_entries_is_rejected() {
+        use std::io::Write;
+
+        let zip_path = std::env::temp_dir().join(format!(
+            "traceio_fa_zip_multi_raw_{}_{}.zip",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let out = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(out);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("one.raw", opts).unwrap();
+            zip.write_all(&synthetic_raw(20, 3, &[5, 14])).unwrap();
+            zip.start_file("one.txt", opts).unwrap();
+            zip.write_all(b"Capillary #: 1\nWell: D1\nSample ID: one\n")
+                .unwrap();
+            zip.start_file("two.raw", opts).unwrap();
+            zip.write_all(&synthetic_raw(20, 3, &[5, 14])).unwrap();
+            zip.start_file("two.txt", opts).unwrap();
+            zip.write_all(b"Capillary #: 1\nWell: D1\nSample ID: two\n")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+
+        let read_err = format!("{:#}", read_fa_run(&zip_path).unwrap_err());
+        let meta_err = format!("{:#}", read_fa_metadata(&zip_path).unwrap_err());
+        let sidecar_err = saveable_txt_sidecar_exists_zip(&zip_path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            read_err.contains("multiple FA .raw entries"),
+            "got {read_err}"
+        );
+        assert!(
+            meta_err.contains("multiple FA .raw entries"),
+            "got {meta_err}"
+        );
+        assert!(
+            sidecar_err.contains("multiple FA .raw entries"),
+            "got {sidecar_err}"
+        );
+        std::fs::remove_file(zip_path).unwrap();
+    }
+
+    #[test]
+    fn zip_sibling_discovery_rejects_duplicate_exact_txt_entries() {
+        let names = vec![
+            "run.raw".to_string(),
+            "run.txt".to_string(),
+            "run.txt".to_string(),
+        ];
+
+        let err = find_sibling(&names, "run", "txt").unwrap_err().to_string();
+
+        assert!(
+            err.contains("duplicate FA .txt sidecar entries"),
+            "got {err}"
+        );
     }
 
     #[test]

@@ -4,12 +4,14 @@ Version=1.0
 Name=Trace analyzer
 GenericName=Electrophoresis analyzer
 Comment=Post-measurement analysis for automated electrophoresis (Bioanalyzer, TapeStation, Fragment Analyzer)
-Exec=traceanalyzer %f
+Exec=traceanalyzer %F
 Icon=traceanalyzer
 Terminal=false
-Categories=Science;Biology;Education;
+Categories=Science;DataVisualization;
 Keywords=electrophoresis;bioanalyzer;tapestation;fragment analyzer;DNA;RNA;gel;
-MimeType=application/xml;
+# Desktop files can advertise MIME types, not filename extensions. The vendor
+# types below are installed from packaging/traceanalyzer-mime.xml.
+MimeType=application/vnd.agilent.xad;application/vnd.agilent.fragment-analyzer.raw;application/vnd.agilent.fragment-analyzer.archive;
 # Must match the window's Wayland app_id / X11 WM_CLASS so the running window
 # associates with this launcher entry (and picks up its icon on Wayland).
 StartupWMClass=traceanalyzer

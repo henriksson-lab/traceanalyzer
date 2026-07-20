@@ -30,8 +30,11 @@ export component AppWindow inherits Window {
     in property <bool> can-export-table: false;
     in property <bool> can-export-run-table: false;
     in property <bool> can-export-traces: false;
+    in property <bool> can-export-raw-channels: false;
     in property <bool> can-export-metadata: false;
     in property <bool> can-export-plot: false;
+    in property <bool> can-export-detail-plot: false;
+    in property <bool> can-export-overview-plot: false;
     in property <bool> can-edit-markers: false;
     in property <string> sample-info: "";
     // Y-axis mode: options for the dropdown and the currently selected index.
@@ -42,6 +45,10 @@ export component AppWindow inherits Window {
     in property <string> error-text: "";
     in property <string> status-text: "";
     in property <string> metadata-text: "";
+    in property <string> metadata-run-summary: "";
+    in property <[[StandardListViewItem]]> metadata-run-rows;
+    in property <string> metadata-source-title: "";
+    in property <[[StandardListViewItem]]> metadata-source-rows;
     in property <image> plot-image;
     in-out property <int> current-index: 0;
 
@@ -74,6 +81,7 @@ export component AppWindow inherits Window {
     callback export-peak-table();
     callback export-run-peak-table();
     callback export-trace-data();
+    callback export-raw-channels();
     callback export-metadata-qc();
     callback export-plot-png();
     callback quit();
@@ -151,13 +159,20 @@ export component AppWindow inherits Window {
                 activated => { root.export-trace-data(); }
             }
             MenuItem {
+                title: "Export Raw Detector Channels CSV…";
+                enabled: root.can-export-raw-channels;
+                activated => { root.export-raw-channels(); }
+            }
+            MenuItem {
                 title: "Export Metadata/QC CSV…";
                 enabled: root.can-export-metadata;
                 activated => { root.export-metadata-qc(); }
             }
             MenuItem {
                 title: "Export Plot PNG…";
-                enabled: root.can-export-plot;
+                enabled: root.active-tab == 0
+                    ? root.can-export-detail-plot
+                    : (root.active-tab == 1 ? root.can-export-overview-plot : false);
                 activated => { root.export-plot-png(); }
             }
             MenuSeparator {}
@@ -214,7 +229,7 @@ export component AppWindow inherits Window {
                     wrap: word-wrap;
                 }
                 Text {
-                    text: "• Bioanalyzer: a .xad, .xml, or .xml.gz file.\n• TapeStation: the exported .xml (or _Electropherogram.csv).\n• Fragment Analyzer: zip the whole run folder into one .zip and open that.";
+                    text: "• Bioanalyzer: a .xad, .xml, or .xml.gz file.\n• TapeStation: the exported .xml (or _Electropherogram.csv).\n• Fragment Analyzer: zip the whole run folder into one .fa.zip and open that.";
                     font-size: 12px;
                     color: #4a5b6b;
                     wrap: word-wrap;
@@ -404,6 +419,7 @@ export component AppWindow inherits Window {
                                     clicked => { root.reset-view(); }
                                 }
                                 ComboBox {
+                                    enabled: root.y-mode-options.length > 0;
                                     model: root.y-mode-options;
                                     current-index: root.y-mode-index;
                                     selected => { root.select-y-mode(self.current-index); }
@@ -592,11 +608,56 @@ export component AppWindow inherits Window {
                 ScrollView {
                     vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
                     horizontal-scrollbar-policy: ScrollBarPolicy.as-needed;
-                    Text {
-                        text: root.metadata-text != "" ? root.metadata-text : "No metadata/QC sidecar data is available for the active run.";
-                        font-size: 12px;
-                        color: #333333;
-                        wrap: word-wrap;
+                    VerticalLayout {
+                        padding: 8px;
+                        spacing: 10px;
+
+                        Text {
+                            text: "Run info";
+                            font-size: 15px;
+                            font-weight: 700;
+                            color: #202020;
+                        }
+                        Text {
+                            text: root.metadata-run-summary != "" ? root.metadata-run-summary : "No file loaded.";
+                            font-size: 12px;
+                            color: #444444;
+                            wrap: word-wrap;
+                        }
+                        StandardTableView {
+                            min-height: 220px;
+                            columns: [
+                                { title: "Field", min-width: 180px },
+                                { title: "Value", min-width: 520px },
+                            ];
+                            rows: root.metadata-run-rows;
+                        }
+
+                        Rectangle {
+                            height: 1px;
+                            background: #dddddd;
+                        }
+
+                        Text {
+                            text: root.metadata-source-title != "" ? root.metadata-source-title : "Source-specific metadata";
+                            font-size: 15px;
+                            font-weight: 700;
+                            color: #202020;
+                        }
+                        if root.metadata-source-rows.length > 0: StandardTableView {
+                            min-height: 170px;
+                            columns: [
+                                { title: "Field", min-width: 180px },
+                                { title: "Value", min-width: 520px },
+                            ];
+                            rows: root.metadata-source-rows;
+                        }
+                        Text {
+                            text: root.metadata-text != "" ? root.metadata-text : "No source-specific metadata sidecar is available for the active run.";
+                            font-size: 12px;
+                            color: #333333;
+                            wrap: word-wrap;
+                        }
                     }
                 }
             }

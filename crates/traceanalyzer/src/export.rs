@@ -7,6 +7,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use anyhow::{bail, Context};
+use traceio::xad::RawChannel;
 use traceio::{Electrophoresis, Sample};
 
 use crate::plot::XAxis;
@@ -67,6 +68,59 @@ pub const DEFAULT_TRACE_COLUMNS: &[TraceColumn] = &[
     TraceColumn::Molarity,
 ];
 
+#[derive(Debug, Clone, Copy)]
+pub struct TraceSample<'a> {
+    /// Zero-based sample position in the source run.
+    pub sample_index: usize,
+    pub sample: &'a Sample,
+}
+
+/// Write long-format raw detector channel data from a native `.xad`.
+pub fn write_raw_channels_csv(dst: &Path, channels: &[&RawChannel]) -> anyhow::Result<()> {
+    if channels.is_empty() {
+        bail!("raw channel export needs at least one channel");
+    }
+
+    let file = File::create(dst).with_context(|| format!("could not create {}", dst.display()))?;
+    let mut out = BufWriter::new(file);
+
+    write_csv_record(
+        &mut out,
+        [
+            "channel_index",
+            "channel_id",
+            "channel_name",
+            "point_index",
+            "time_s",
+            "signal",
+        ],
+    )?;
+
+    for (channel_index, channel) in channels.iter().enumerate() {
+        let prefix = [
+            (channel_index + 1).to_string(),
+            channel.channel_id.clone(),
+            channel.name.clone(),
+        ];
+        for (point_index, signal) in channel.signal.iter().enumerate() {
+            let time = channel.x_start + channel.x_step * point_index as f64;
+            write_csv_record(
+                &mut out,
+                [
+                    prefix[0].clone(),
+                    prefix[1].clone(),
+                    prefix[2].clone(),
+                    (point_index + 1).to_string(),
+                    csv_num(time),
+                    csv_num(*signal as f64),
+                ],
+            )?;
+        }
+    }
+
+    finish_writer(out, dst)
+}
+
 /// Write the focused sample's peak/region table as CSV.
 pub fn write_peak_table_csv(
     dst: &Path,
@@ -114,7 +168,7 @@ pub fn write_run_peak_table_csv(
 /// Write long-format trace data for selected samples and trace columns.
 pub fn write_trace_data_csv(
     dst: &Path,
-    samples: &[&Sample],
+    samples: &[TraceSample<'_>],
     columns: &[TraceColumn],
 ) -> anyhow::Result<()> {
     if columns.is_empty() {
@@ -129,9 +183,10 @@ pub fn write_trace_data_csv(
     headers.extend(columns.iter().map(|c| c.header().to_string()));
     write_csv_record(&mut out, &headers)?;
 
-    for (sample_index, sample) in samples.iter().enumerate() {
+    for row in samples {
+        let sample = row.sample;
         let max_len = columns.iter().map(|c| c.len(sample)).max().unwrap_or(0);
-        let prefix = sample_prefix(sample_index, sample);
+        let prefix = sample_prefix(row.sample_index, sample);
         for point_index in 0..max_len {
             let mut fields = prefix.clone();
             fields.push((point_index + 1).to_string());
@@ -158,6 +213,17 @@ pub fn write_metadata_qc_csv_with_notes(
     dst: &Path,
     run: &Electrophoresis,
     notes: Option<&str>,
+) -> anyhow::Result<()> {
+    write_metadata_qc_csv_with_notes_and_provenance(dst, run, notes, false)
+}
+
+/// Write normalized metadata/QC plus optional source-specific notes and GUI
+/// session provenance.
+pub fn write_metadata_qc_csv_with_notes_and_provenance(
+    dst: &Path,
+    run: &Electrophoresis,
+    notes: Option<&str>,
+    marker_overrides_active: bool,
 ) -> anyhow::Result<()> {
     let file = File::create(dst).with_context(|| format!("could not create {}", dst.display()))?;
     let mut out = BufWriter::new(file);
@@ -194,6 +260,18 @@ pub fn write_metadata_qc_csv_with_notes(
         "has_upper_marker",
         &run.assay.has_upper_marker.to_string(),
     )?;
+    write_run_metric(
+        &mut out,
+        "session_marker_overrides_active",
+        &marker_overrides_active.to_string(),
+    )?;
+    if marker_overrides_active {
+        write_run_metric(
+            &mut out,
+            "session_marker_overrides_provenance",
+            "Manual marker overrides were active in the GUI session; recalibrated values may differ from source-file marker detection and overrides are not persisted by Save/Save As.",
+        )?;
+    }
     write_run_metric(&mut out, "sample_count", &run.samples.len().to_string())?;
     write_run_metric(
         &mut out,
@@ -460,6 +538,7 @@ fn write_csv_field<W: Write>(out: &mut W, field: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use traceio::xad::RawChannel;
     use traceio::{AssayInfo, Peak, Region};
 
     fn sample(well_number: i32, name: &str) -> Sample {
@@ -526,6 +605,23 @@ mod tests {
         path
     }
 
+    fn raw_channel(channel_id: &str, name: &str, x_start: f64, x_step: f64) -> RawChannel {
+        RawChannel {
+            channel_id: channel_id.to_string(),
+            name: name.to_string(),
+            x_start,
+            x_step,
+            signal: vec![1.0, f32::NAN, 3.5],
+        }
+    }
+
+    fn trace_sample(sample_index: usize, sample: &Sample) -> TraceSample<'_> {
+        TraceSample {
+            sample_index,
+            sample,
+        }
+    }
+
     #[test]
     fn csv_fields_escape_commas_quotes_and_newlines() {
         let mut out = Vec::new();
@@ -560,7 +656,7 @@ mod tests {
 
         write_trace_data_csv(
             &dst,
-            &samples,
+            &[trace_sample(0, samples[0])],
             &[
                 TraceColumn::Time,
                 TraceColumn::Fluorescence,
@@ -579,6 +675,72 @@ mod tests {
              1,1,A1,Sample,false,2,1,20,200\n\
              1,1,A1,Sample,false,3,2,15,\n"
         );
+    }
+
+    #[test]
+    fn trace_data_export_preserves_original_sample_indices() {
+        let run = run();
+        let dst = temp_path("trace_original_indices");
+
+        write_trace_data_csv(
+            &dst,
+            &[
+                trace_sample(1, &run.samples[1]),
+                trace_sample(0, &run.samples[0]),
+            ],
+            &[TraceColumn::Time],
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&dst).unwrap();
+        let _ = std::fs::remove_file(&dst);
+
+        assert!(text
+            .starts_with("sample_index,well,sample_name,category,is_ladder,point_index,time_s\n"));
+        assert!(text.contains("2,2,\"B1, quoted\",Sample,false,1,0\n"));
+        assert!(text.contains("1,1,A1,Sample,false,1,0\n"));
+    }
+
+    #[test]
+    fn raw_channel_export_writes_time_and_blank_non_finite_signal() {
+        let dst = temp_path("raw_channels");
+        let ch = raw_channel("BlueFluorescence", "Blue, detector", 0.5, 0.25);
+
+        write_raw_channels_csv(&dst, &[&ch]).unwrap();
+
+        let text = std::fs::read_to_string(&dst).unwrap();
+        let _ = std::fs::remove_file(&dst);
+
+        assert_eq!(
+            text,
+            "channel_index,channel_id,channel_name,point_index,time_s,signal\n\
+             1,BlueFluorescence,\"Blue, detector\",1,0.5,1\n\
+             1,BlueFluorescence,\"Blue, detector\",2,0.75,\n\
+             1,BlueFluorescence,\"Blue, detector\",3,1,3.5\n"
+        );
+    }
+
+    #[test]
+    fn raw_channel_export_writes_all_supplied_channels() {
+        let dst = temp_path("raw_all_channels");
+        let blue = raw_channel("BlueFluorescence", "Blue detector", 0.5, 0.25);
+        let red = raw_channel("RedFluorescence", "Red detector", 1.0, 0.5);
+
+        write_raw_channels_csv(&dst, &[&blue, &red]).unwrap();
+
+        let text = std::fs::read_to_string(&dst).unwrap();
+        let _ = std::fs::remove_file(&dst);
+
+        assert!(text.contains("1,BlueFluorescence,Blue detector,1,0.5,1\n"));
+        assert!(text.contains("2,RedFluorescence,Red detector,1,1,1\n"));
+        assert!(text.contains("2,RedFluorescence,Red detector,3,2,3.5\n"));
+    }
+
+    #[test]
+    fn raw_channel_export_rejects_empty_channel_selection() {
+        let dst = temp_path("raw_empty_channels");
+        let err = write_raw_channels_csv(&dst, &[]).unwrap_err();
+        assert!(err.to_string().contains("at least one channel"));
     }
 
     #[test]
@@ -610,10 +772,22 @@ mod tests {
     }
 
     #[test]
+    fn metadata_qc_export_flags_session_marker_overrides() {
+        let dst = temp_path("metadata_qc_marker_overrides");
+        write_metadata_qc_csv_with_notes_and_provenance(&dst, &run(), None, true).unwrap();
+
+        let text = std::fs::read_to_string(&dst).unwrap();
+        let _ = std::fs::remove_file(&dst);
+
+        assert!(text.contains("run,,,,session_marker_overrides_active,true\n"));
+        assert!(text.contains("run,,,,session_marker_overrides_provenance,"));
+    }
+
+    #[test]
     fn trace_data_export_rejects_empty_column_selection() {
         let dst = temp_path("trace_empty_columns");
         let run = run();
-        let err = write_trace_data_csv(&dst, &[&run.samples[0]], &[]).unwrap_err();
+        let err = write_trace_data_csv(&dst, &[trace_sample(0, &run.samples[0])], &[]).unwrap_err();
         assert!(err.to_string().contains("at least one column"));
     }
 }

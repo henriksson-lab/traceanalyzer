@@ -54,15 +54,26 @@ fn main() -> anyhow::Result<()> {
     for path in &paths {
         match loading::load(path) {
             Ok(loaded) => {
-                let source = source_identity(path);
+                let source = loaded.source.identity.clone();
                 if let Some(idx) = app.find_file_by_source(&source) {
                     app.active = Some(idx);
                     continue;
                 }
-                app.add_file(loaded.run, loaded.raw_channels, Some(source));
-                if let Some((metadata, warning)) = load_fa_metadata_text(path) {
-                    app.set_active_metadata_text(metadata);
-                    if let Some(warning) = warning {
+                let source_capabilities = loaded.source.capabilities;
+                let save_capabilities = loaded.source.save_capabilities();
+                let fa_metadata = loaded.fa_metadata.clone();
+                app.add_file_with_capabilities(
+                    loaded.run,
+                    loaded.raw_channels,
+                    Some(source),
+                    source_capabilities,
+                    save_capabilities,
+                );
+                app.set_active_opened_path(Some(path.to_path_buf()));
+                if let Some(metadata) = loaded_fa_metadata(path, fa_metadata) {
+                    app.set_active_metadata_text(metadata.text);
+                    app.set_active_metadata_rows(metadata.rows);
+                    if let Some(warning) = metadata.warning {
                         warnings.push(warning);
                     }
                 }
@@ -98,11 +109,11 @@ fn main() -> anyhow::Result<()> {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter(
                     "All supported runs",
-                    &["xad", "xml", "gz", "zip", "raw", "csv"],
+                    &["xad", "xml", "gz", "fa.zip", "zip", "raw", "csv"],
                 )
                 .add_filter("Bioanalyzer", &["xad", "xml", "gz"])
                 .add_filter("TapeStation export", &["xml", "gz", "csv"])
-                .add_filter("Fragment Analyzer", &["zip", "raw"])
+                .add_filter("Fragment Analyzer", &["fa.zip", "zip", "raw"])
                 .pick_file()
             {
                 open_added_file(&ui, &st, &path);
@@ -287,6 +298,16 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    // File -> Export Raw Detector Channels CSV...
+    {
+        let ui_weak = ui.as_weak();
+        let st = state.clone();
+        ui.on_export_raw_channels(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            export_raw_channels_dialog(&ui, &st);
+        });
+    }
+
     // File -> Export Metadata/QC CSV...
     {
         let ui_weak = ui.as_weak();
@@ -313,8 +334,13 @@ fn main() -> anyhow::Result<()> {
         let st = state.clone();
         ui.on_toggle_file_expand(move |row| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            st.borrow_mut().toggle_expand_row(row as usize);
-            refresh_tree(&ui, &st.borrow());
+            let table = {
+                let mut s = st.borrow_mut();
+                s.toggle_expand_row(row as usize);
+                refresh_all(&ui, &mut s)
+            };
+            table.apply(&ui);
+            show_selected(&ui, &st.borrow());
         });
     }
 
@@ -338,6 +364,7 @@ fn main() -> anyhow::Result<()> {
             table.apply(&ui);
             let s = st.borrow();
             refresh_selection(&ui, &s);
+            refresh_metadata(&ui, &s);
             show_selected(&ui, &s);
         });
     }
@@ -350,6 +377,9 @@ fn main() -> anyhow::Result<()> {
             let Some(ui) = ui_weak.upgrade() else { return };
             {
                 let mut s = st.borrow_mut();
+                if s.active_file().is_none() {
+                    return;
+                }
                 s.normalize = !s.normalize;
                 s.set_viewport(None); // y-range changes with normalization
             }
@@ -428,10 +458,9 @@ fn main() -> anyhow::Result<()> {
                     let mut s = st.borrow_mut();
                     s.activate_and_select(file_idx, well_idx);
                     ensure_y_mode_available(&mut s);
-                    build_table_refresh(&mut s)
+                    refresh_all(&ui, &mut s)
                 };
                 table.apply(&ui);
-                refresh_selection(&ui, &st.borrow());
                 show_selected(&ui, &st.borrow());
                 ui.set_active_tab(0); // jump to Detail
             }
@@ -446,6 +475,7 @@ fn main() -> anyhow::Result<()> {
             let Some(ui) = ui_weak.upgrade() else { return };
             st.borrow_mut().overview_shared_y ^= true;
             refresh_overview(&ui, &st.borrow());
+            refresh_tree(&ui, &st.borrow());
         });
     }
 
@@ -457,6 +487,7 @@ fn main() -> anyhow::Result<()> {
             let Some(ui) = ui_weak.upgrade() else { return };
             st.borrow_mut().overview_gel ^= true;
             refresh_overview(&ui, &st.borrow());
+            refresh_tree(&ui, &st.borrow());
         });
     }
 
@@ -468,6 +499,7 @@ fn main() -> anyhow::Result<()> {
             let Some(ui) = ui_weak.upgrade() else { return };
             st.borrow_mut().overview_show_ladders ^= true;
             refresh_overview(&ui, &st.borrow());
+            refresh_tree(&ui, &st.borrow());
         });
     }
 
@@ -538,10 +570,12 @@ fn main() -> anyhow::Result<()> {
             };
             if let Some(table) = table {
                 table.apply(&ui);
+                refresh_tree(&ui, &st.borrow());
                 ui.set_error_text(SharedString::from(
                     st.borrow().error.clone().unwrap_or_default(),
                 ));
                 show_selected(&ui, &st.borrow());
+                refresh_metadata(&ui, &st.borrow());
                 refresh_overview(&ui, &st.borrow());
             }
         });
@@ -594,10 +628,12 @@ fn main() -> anyhow::Result<()> {
                 build_table_refresh(&mut s)
             };
             table.apply(&ui);
+            refresh_tree(&ui, &st.borrow());
             ui.set_error_text(SharedString::from(
                 st.borrow().error.clone().unwrap_or_default(),
             ));
             show_selected(&ui, &st.borrow());
+            refresh_metadata(&ui, &st.borrow());
             refresh_overview(&ui, &st.borrow());
         });
     }
@@ -619,6 +655,9 @@ fn main() -> anyhow::Result<()> {
             let Some(ui) = ui_weak.upgrade() else { return };
             {
                 let mut s = st.borrow_mut();
+                if s.active_file().is_none() {
+                    return;
+                }
                 s.y_mode = YMode::from_available_index(s.run(), idx as usize);
                 s.set_viewport(None); // y-range changes with the quantity
                 refresh_overview(&ui, &s);
@@ -640,39 +679,47 @@ fn open_added_file(ui: &AppWindow, state: &SharedState, path: &std::path::Path) 
             ui,
             state,
             format!(
-                "Unsupported input: {}. Open a Bioanalyzer .xad/.xml/.xml.gz file, a TapeStation exported .xml or _Electropherogram.csv file, or a Fragment Analyzer .zip/.raw/run folder.",
+                "Unsupported input: {}. Open a Bioanalyzer .xad/.xml/.xml.gz file, a TapeStation exported .xml or _Electropherogram.csv file, or a Fragment Analyzer .fa.zip/.raw/run folder.",
                 path.display()
             ),
         );
         return;
     }
 
-    let source = source_identity(path);
-
-    // Already open? Re-activate it instead of loading a duplicate.
-    if let Some(idx) = state.borrow().find_file_by_source(&source) {
-        let table = {
-            let mut s = state.borrow_mut();
-            s.activate_file(idx);
-            s.error = None;
-            s.status = Some(format!("Already open: {}", source.display()));
-            refresh_all(ui, &mut s)
-        };
-        table.apply(ui);
-        show_selected(ui, &state.borrow());
-        return;
-    }
-
     match loading::load(path) {
         Ok(loaded) => {
+            let source = loaded.source.identity.clone();
+            // Already open? Re-activate it instead of loading a duplicate.
+            if let Some(idx) = state.borrow().find_file_by_source(&source) {
+                let table = {
+                    let mut s = state.borrow_mut();
+                    s.activate_file(idx);
+                    s.error = None;
+                    s.status = Some(format!("Already open: {}", source.display()));
+                    refresh_all(ui, &mut s)
+                };
+                table.apply(ui);
+                show_selected(ui, &state.borrow());
+                return;
+            }
             let table = {
                 let mut s = state.borrow_mut();
-                s.add_file(loaded.run, loaded.raw_channels, Some(source));
-                let metadata_warning =
-                    load_fa_metadata_text(path).and_then(|(metadata, warning)| {
-                        s.set_active_metadata_text(metadata);
-                        warning
-                    });
+                let source_capabilities = loaded.source.capabilities;
+                let save_capabilities = loaded.source.save_capabilities();
+                let fa_metadata = loaded.fa_metadata.clone();
+                s.add_file_with_capabilities(
+                    loaded.run,
+                    loaded.raw_channels,
+                    Some(source),
+                    source_capabilities,
+                    save_capabilities,
+                );
+                s.set_active_opened_path(Some(path.to_path_buf()));
+                let metadata_warning = loaded_fa_metadata(path, fa_metadata).and_then(|metadata| {
+                    s.set_active_metadata_text(metadata.text);
+                    s.set_active_metadata_rows(metadata.rows);
+                    metadata.warning
+                });
                 s.error = join_optional_messages([loaded.warning, metadata_warning]);
                 s.status = s
                     .error
@@ -707,21 +754,102 @@ fn is_supported_open_path(path: &std::path::Path) -> bool {
     traceio::io::detect_format(path).is_ok_and(|detected| detected.is_some())
 }
 
-fn load_fa_metadata_text(path: &std::path::Path) -> Option<(Option<String>, Option<String>)> {
+struct LoadedFaMetadata {
+    text: Option<String>,
+    rows: Vec<(String, String)>,
+    warning: Option<String>,
+}
+
+fn loaded_fa_metadata(
+    path: &std::path::Path,
+    metadata: Option<traceio::fa::FaMetadata>,
+) -> Option<LoadedFaMetadata> {
     if !traceio::fa::is_fa_path(path) {
         return None;
     }
-
-    Some(match traceio::fa::read_fa_metadata(path) {
-        Ok(metadata) => (format_fa_metadata(&metadata), None),
-        Err(e) => (
-            None,
-            Some(format!(
-                "Fragment Analyzer metadata unavailable for {}: {e:#}",
-                path.display()
-            )),
-        ),
+    metadata.map(|metadata| LoadedFaMetadata {
+        text: format_fa_metadata(&metadata),
+        rows: summarize_fa_metadata(&metadata),
+        warning: None,
     })
+}
+
+fn summarize_fa_metadata(metadata: &traceio::fa::FaMetadata) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    for (key, value) in &metadata.run_header {
+        if !value.trim().is_empty() {
+            rows.push((format!("Run header: {key}"), value.clone()));
+        }
+    }
+    if !metadata.method.is_empty() {
+        rows.push((
+            "Method sections".to_string(),
+            metadata.method.len().to_string(),
+        ));
+    }
+    if !metadata.analysis.is_empty() {
+        rows.push((
+            "Analysis sections".to_string(),
+            metadata.analysis.len().to_string(),
+        ));
+    }
+    if !metadata.current.is_empty() {
+        rows.push((
+            "Current log points".to_string(),
+            metadata.current.len().to_string(),
+        ));
+        push_fa_current_range(
+            &mut rows,
+            "Current range",
+            metadata.current.iter().map(|p| p.current_ua),
+            "uA",
+        );
+        push_fa_current_range(
+            &mut rows,
+            "Voltage range",
+            metadata.current.iter().map(|p| p.voltage_kv),
+            "kV",
+        );
+        push_fa_current_range(
+            &mut rows,
+            "Pressure range",
+            metadata.current.iter().map(|p| p.pressure_psi),
+            "psi",
+        );
+    }
+    if !metadata.timing.is_empty() {
+        rows.push((
+            "Timing lines".to_string(),
+            metadata.timing.len().to_string(),
+        ));
+    }
+    if !metadata.exposure.is_empty() {
+        rows.push((
+            "Exposure lines".to_string(),
+            metadata.exposure.len().to_string(),
+        ));
+    }
+    if let Some(image) = &metadata.camera_image {
+        rows.push(("Camera image bytes".to_string(), image.len().to_string()));
+    }
+    rows
+}
+
+fn push_fa_current_range(
+    rows: &mut Vec<(String, String)>,
+    label: &str,
+    values: impl Iterator<Item = f64>,
+    unit: &str,
+) {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for value in values.filter(|v| v.is_finite()) {
+        min = min.min(value);
+        max = max.max(value);
+    }
+    if min.is_finite() && max.is_finite() {
+        rows.push((label.to_string(), format!("{min:.3} to {max:.3} {unit}")));
+    }
 }
 
 fn format_fa_metadata(metadata: &traceio::fa::FaMetadata) -> Option<String> {
@@ -819,16 +947,6 @@ fn join_optional_messages(messages: impl IntoIterator<Item = Option<String>>) ->
     (!joined.is_empty()).then_some(joined)
 }
 
-/// Canonical run identity used for deduplication, save targeting, and tree
-/// tooltips. Multi-file run formats map their accepted entry points to one path.
-fn source_identity(path: &std::path::Path) -> std::path::PathBuf {
-    traceio::io::detect_format(path)
-        .ok()
-        .flatten()
-        .map(|detected| detected.identity)
-        .unwrap_or_else(|| path.to_path_buf())
-}
-
 /// Push run-level data (title, entry list, error) into the UI and build a table update.
 fn refresh_all(ui: &AppWindow, st: &mut AppState) -> TableRefresh {
     ensure_y_mode_available(st);
@@ -837,9 +955,116 @@ fn refresh_all(ui: &AppWindow, st: &mut AppState) -> TableRefresh {
     ui.set_error_text(SharedString::from(st.error.clone().unwrap_or_default()));
     ui.set_status_text(SharedString::from(st.status.clone().unwrap_or_default()));
     ui.set_metadata_text(SharedString::from(st.metadata_text()));
+    refresh_metadata(ui, st);
     refresh_tree(ui, st);
     refresh_overview(ui, st);
     build_table_refresh(st)
+}
+
+fn refresh_metadata(ui: &AppWindow, st: &AppState) {
+    let (summary, run_rows) = run_metadata_rows(st);
+    ui.set_metadata_run_summary(SharedString::from(summary));
+    ui.set_metadata_run_rows(kv_rows_model(&run_rows));
+
+    let source_title = if st.active_file().is_none() {
+        ""
+    } else if st.fragment_analyzer_mode() {
+        "Fragment Analyzer sidecar"
+    } else {
+        "Source-specific metadata"
+    };
+    ui.set_metadata_source_title(SharedString::from(source_title));
+    ui.set_metadata_source_rows(kv_rows_model(st.metadata_rows()));
+}
+
+fn run_metadata_rows(st: &AppState) -> (String, Vec<(String, String)>) {
+    let Some(file) = st.active_file() else {
+        return (String::new(), Vec::new());
+    };
+    let run = &file.run;
+    let sample_count = run.samples.len();
+    let ladder_count = run.samples.iter().filter(|s| s.is_ladder).count();
+    let peak_count: usize = run.samples.iter().map(|s| s.peaks.len()).sum();
+    let sample_region_count: usize = run.samples.iter().map(|s| s.regions.len()).sum();
+    let trace_point_count: usize = run.samples.iter().map(|s| s.fluorescence.len()).sum();
+    let raw_mode = st.raw_mode();
+
+    let mode = if raw_mode {
+        "raw acquisition"
+    } else {
+        "processed samples"
+    };
+    let summary = format!(
+        "{} samples, {} ladders, {} peaks ({mode})",
+        sample_count, ladder_count, peak_count
+    );
+
+    let mut rows = Vec::new();
+    push_metadata_row(&mut rows, "File name", &run.assay.file_name);
+    if let Some(source) = file.opened_path.as_ref().or(file.source_path.as_ref()) {
+        rows.push(("Loaded from".to_string(), source.display().to_string()));
+    }
+    push_metadata_row(&mut rows, "Created", &run.assay.creation_date);
+    push_metadata_row(&mut rows, "Assay name", &run.assay.assay_name);
+    push_metadata_row(&mut rows, "Assay type", &run.assay.assay_type);
+    push_metadata_row(&mut rows, "Length unit", &run.assay.length_unit);
+    push_metadata_row(
+        &mut rows,
+        "Concentration unit",
+        &run.assay.concentration_unit,
+    );
+    if let Some(unit) = &run.assay.molarity_unit {
+        push_metadata_row(&mut rows, "Molarity unit", unit);
+    }
+    rows.push(("Samples".to_string(), sample_count.to_string()));
+    rows.push(("Ladder samples".to_string(), ladder_count.to_string()));
+    rows.push(("Reported peaks".to_string(), peak_count.to_string()));
+    rows.push((
+        "Ladder peaks".to_string(),
+        run.ladder_peaks.len().to_string(),
+    ));
+    rows.push((
+        "Analysis regions".to_string(),
+        (run.regions.len() + sample_region_count).to_string(),
+    ));
+    if raw_mode {
+        rows.push((
+            "Raw channels".to_string(),
+            file.raw_channels.len().to_string(),
+        ));
+    } else {
+        rows.push(("Trace points".to_string(), trace_point_count.to_string()));
+    }
+    rows.push((
+        "Upper marker".to_string(),
+        if run.assay.has_upper_marker {
+            "yes"
+        } else {
+            "no"
+        }
+        .to_string(),
+    ));
+    rows.push((
+        "Unsaved edits".to_string(),
+        if file.dirty { "yes" } else { "no" }.to_string(),
+    ));
+    rows.push((
+        "Session marker overrides".to_string(),
+        if st.has_marker_overrides() {
+            "yes; recalibration uses manual marker positions that Save/Save As does not persist"
+        } else {
+            "no"
+        }
+        .to_string(),
+    ));
+    (summary, rows)
+}
+
+fn push_metadata_row(rows: &mut Vec<(String, String)>, label: &str, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        rows.push((label.to_string(), value.to_string()));
+    }
 }
 
 /// Clamp global y-mode state after switching files or loading data whose
@@ -879,10 +1104,13 @@ fn refresh_tree(ui: &AppWindow, st: &AppState) {
     ui.set_can_save(st.is_dirty() && st.can_save());
     ui.set_can_save_as(st.can_save_as());
     ui.set_can_export_table(can_export_peak_table(st));
-    ui.set_can_export_run_table(can_export_processed_samples(st));
-    ui.set_can_export_traces(can_export_processed_samples(st));
+    ui.set_can_export_run_table(can_export_run_peak_table(st));
+    ui.set_can_export_traces(can_export_trace_data(st));
+    ui.set_can_export_raw_channels(can_export_raw_channels(st));
     ui.set_can_export_metadata(can_export_metadata_qc(st));
     ui.set_can_export_plot(can_export_plot(st));
+    ui.set_can_export_detail_plot(can_export_plot_for_tab(st, ExportPlotTab::Detail));
+    ui.set_can_export_overview_plot(can_export_plot_for_tab(st, ExportPlotTab::Overview));
     ui.set_can_edit_markers(st.can_edit_markers());
     ui.set_rename_text(SharedString::from(st.primary_name()));
 }
@@ -905,21 +1133,54 @@ fn render_overview_bitmap(st: &AppState) -> Option<(Vec<u8>, u32, u32)> {
         let w = plot::PLOT_W;
         let h = plot::PLOT_H;
         let series: Vec<Series> = st.raw_channels().iter().map(plot::raw_series).collect();
+        if !series.iter().any(series_has_points) {
+            return None;
+        }
         let refs: Vec<&Series> = series.iter().collect();
         let vp = plot::auto_viewport_multi(&refs);
         let buf = plot::render_overlay(&refs, &vp, None, &[], w, h);
         Some((buf, w, h))
     } else if st.overview_gel {
         let (run, _) = overview_combined(st);
+        if !run.samples.iter().any(sample_has_gel_trace_data) {
+            return None;
+        }
         let (w, h) = gel::size(run.samples.len());
         let buf = gel::render(&run, w, h);
         Some((buf, w, h))
     } else {
         let (run, _) = overview_combined(st);
+        if !run
+            .samples
+            .iter()
+            .any(|sample| sample_has_overview_trace_data(&run, sample, st.y_mode))
+        {
+            return None;
+        }
         let layout = overview::layout(run.samples.len());
         let buf = overview::render(&run, st.y_mode, st.overview_shared_y, &layout);
         Some((buf, layout.w, layout.h))
     }
+}
+
+fn series_has_points(series: &Series) -> bool {
+    !series.xs.is_empty() && !series.ys.is_empty()
+}
+
+fn sample_has_overview_trace_data(
+    run: &Electrophoresis,
+    sample: &traceio::Sample,
+    y_mode: YMode,
+) -> bool {
+    series_has_points(&plot::series(run, sample, y_mode, false))
+}
+
+fn sample_has_gel_trace_data(sample: &traceio::Sample) -> bool {
+    sample.time.iter().any(|time| time.is_finite())
+        && sample
+            .fluorescence
+            .iter()
+            .any(|fluorescence| (*fluorescence as f64).is_finite())
 }
 
 /// Every open file's overview samples flattened into one run for the grid/gel,
@@ -929,13 +1190,14 @@ fn render_overview_bitmap(st: &AppState) -> Option<(Vec<u8>, u32, u32)> {
 /// cells stay distinguishable.
 fn overview_combined(st: &AppState) -> (Electrophoresis, Vec<(usize, usize)>) {
     let multi = st.files.len() > 1;
+    let file_labels = overview_file_labels(st);
     // Use the active file's run as the template (assay units, ladder), then swap
     // in the flattened sample set.
     let mut combined = st.run().clone();
     combined.samples = Vec::new();
     let mut origin: Vec<(usize, usize)> = Vec::new();
     for (fi, f) in st.files.iter().enumerate() {
-        let tag = file_base_name(&f.run.assay.file_name);
+        let tag = file_labels.get(fi).map(String::as_str).unwrap_or_default();
         for (wi, sample) in f.run.samples.iter().enumerate() {
             if !st.overview_show_ladders && sample.is_ladder {
                 continue;
@@ -956,6 +1218,37 @@ fn overview_combined(st: &AppState) -> (Electrophoresis, Vec<(usize, usize)>) {
     (combined, origin)
 }
 
+fn overview_file_labels(st: &AppState) -> Vec<String> {
+    let rows = st.tree_rows();
+    rows.labels
+        .into_iter()
+        .zip(rows.is_file)
+        .zip(rows.file_index)
+        .filter_map(|((label, is_file), file_index)| {
+            if is_file {
+                Some((file_index as usize, label))
+            } else {
+                None
+            }
+        })
+        .fold(
+            vec![String::new(); st.files.len()],
+            |mut labels, (idx, label)| {
+                if let Some(slot) = labels.get_mut(idx) {
+                    *slot = label;
+                }
+                labels
+            },
+        )
+}
+
+fn overview_marker_overrides_active(st: &AppState) -> bool {
+    let (_, origin) = overview_combined(st);
+    origin
+        .iter()
+        .any(|&(file_idx, sample_idx)| st.file_sample_has_marker_override(file_idx, sample_idx))
+}
+
 struct TableRefresh {
     rows: ModelRc<ModelRc<StandardListViewItem>>,
     current_row: i32,
@@ -973,6 +1266,20 @@ impl TableRefresh {
         ui.set_table_rows(self.rows);
         ui.set_table_current_row(self.current_row);
     }
+}
+
+fn kv_rows_model(rows: &[(String, String)]) -> ModelRc<ModelRc<StandardListViewItem>> {
+    let model_rows: Vec<ModelRc<StandardListViewItem>> = rows
+        .iter()
+        .map(|(key, value)| {
+            let cells = vec![
+                StandardListViewItem::from(SharedString::from(key.as_str())),
+                StandardListViewItem::from(SharedString::from(value.as_str())),
+            ];
+            ModelRc::from(Rc::new(VecModel::from(cells)))
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(model_rows)))
 }
 
 /// Build the peak/region table for the focused sample.
@@ -1057,12 +1364,8 @@ fn marker_lines(st: &AppState) -> Vec<f64> {
 
 /// Render the current selection into the plot.
 fn show_selected(ui: &AppWindow, st: &AppState) {
-    if st.active_file().is_none() {
-        ui.set_plot_image(blank_plot_image());
-        ui.set_sample_info(SharedString::default());
-        return;
-    }
-    if st.primary() >= st.entry_count() {
+    if st.active_file().is_none() || st.primary() >= st.entry_count() {
+        clear_detail(ui);
         return;
     }
     ui.set_current_index(st.primary() as i32);
@@ -1101,6 +1404,18 @@ fn show_selected(ui: &AppWindow, st: &AppState) {
     ui.set_marker_edit(st.marker_edit);
 }
 
+fn clear_detail(ui: &AppWindow) {
+    ui.set_plot_image(blank_plot_image());
+    ui.set_sample_info(SharedString::default());
+    ui.set_y_mode_options(ModelRc::from(Rc::new(VecModel::from(
+        Vec::<SharedString>::new(),
+    ))));
+    ui.set_y_mode_index(-1);
+    ui.set_current_index(-1);
+    ui.set_normalize_on(false);
+    ui.set_marker_edit(false);
+}
+
 /// Text shown in the Help → About dialog.
 fn about_text() -> String {
     format!(
@@ -1119,10 +1434,16 @@ fn save_current(ui: &AppWindow, st: &SharedState) {
     let dst = st.borrow().source_path();
     match dst {
         // A native .xad cannot be rewritten in place; offer Save As.
-        Some(p) if p.extension().and_then(|e| e.to_str()) == Some("xad") => save_as_dialog(ui, st),
+        Some(p) if is_xad_path(&p) => save_as_dialog(ui, st),
         Some(p) => do_save(ui, st, p),
         None => save_as_dialog(ui, st),
     }
+}
+
+fn is_xad_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("xad"))
 }
 
 /// Ask Save / Don't Save / Cancel for the ACTIVE file's unsaved edits. Returns
@@ -1157,21 +1478,27 @@ fn prompt_unsaved_active(ui: &AppWindow, st: &SharedState) -> bool {
     }
 }
 
-/// Before closing one file, prompt to save its unsaved edits. Makes that file
-/// active (so Save / Save-As target it) and returns whether it may be closed.
+/// Before closing one file, prompt to save its unsaved edits. Temporarily makes
+/// that file active so Save / Save-As target it, then restores the previous
+/// active file before the caller removes an inactive file.
 fn confirm_close_file(ui: &AppWindow, st: &SharedState, file_idx: usize) -> bool {
     let previous_active = st.borrow().active;
+    let switched_active = previous_active != Some(file_idx);
     {
         let mut s = st.borrow_mut();
-        if file_idx < s.files.len() {
-            s.active = Some(file_idx);
+        if file_idx >= s.files.len() {
+            return false;
         }
+        s.active = Some(file_idx);
     }
     if !st.borrow().is_dirty() {
+        if switched_active {
+            st.borrow_mut().active = previous_active;
+        }
         return true;
     }
     let confirmed = prompt_unsaved_active(ui, st);
-    if !confirmed {
+    if switched_active {
         st.borrow_mut().active = previous_active;
     }
     confirmed
@@ -1194,11 +1521,21 @@ fn confirm_exit(ui: &AppWindow, st: &SharedState) -> bool {
             s.active = Some(idx); // target this file for the prompt/save
         }
         if !prompt_unsaved_active(ui, st) {
-            st.borrow_mut().active = previous_active;
+            restore_active_file_ui(ui, st, previous_active);
             return false;
         }
     }
     true
+}
+
+fn restore_active_file_ui(ui: &AppWindow, st: &SharedState, active: Option<usize>) {
+    let table = {
+        let mut s = st.borrow_mut();
+        s.active = active;
+        refresh_all(ui, &mut s)
+    };
+    table.apply(ui);
+    show_selected(ui, &st.borrow());
 }
 
 /// Last path component of an instrument file path (Windows `\` or Unix `/`).
@@ -1207,29 +1544,60 @@ fn file_base_name(path: &str) -> String {
 }
 
 fn save_as_dialog(ui: &AppWindow, st: &SharedState) {
-    if st.borrow().fragment_analyzer_mode() {
-        ui.set_error_text(SharedString::from(
-            "Fragment Analyzer runs can only be saved in place by updating the .txt sidecar",
-        ));
+    let blocking_error = {
+        let s = st.borrow();
+        save_as_blocking_error(&s)
+    };
+    if let Some(message) = blocking_error {
+        set_status_error(ui, st, message);
         return;
     }
 
-    let start_name = st
-        .borrow()
-        .source_path()
-        .as_ref()
-        .and_then(|p| p.file_stem())
-        .and_then(|n| n.to_str())
-        .map(|n| format!("{n}.xml"))
-        .unwrap_or_else(|| "run.xml".to_string());
+    let start_name = save_as_start_name(st.borrow().source_path().as_deref());
 
     if let Some(dst) = rfd::FileDialog::new()
-        .add_filter("Bioanalyzer XML", &["xml"])
-        .add_filter("Bioanalyzer XML (gzip)", &["gz"])
+        .add_filter("Bioanalyzer XML", SAVE_AS_XML_EXTENSIONS)
         .set_file_name(start_name)
         .save_file()
     {
         do_save(ui, st, dst);
+    }
+}
+
+const SAVE_AS_XML_EXTENSIONS: &[&str] = &["xml"];
+
+fn save_as_start_name(source: Option<&std::path::Path>) -> String {
+    let Some(source) = source else {
+        return "run.xml".to_string();
+    };
+    let Some(name) = source.file_name().and_then(|n| n.to_str()) else {
+        return "run.xml".to_string();
+    };
+    for suffix in [".xml.gz", ".xml", ".xad"] {
+        if let Some(stem) = name.strip_suffix(suffix) {
+            return format!("{stem}.xml");
+        }
+    }
+    source
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .map(|n| format!("{n}.xml"))
+        .unwrap_or_else(|| "run.xml".to_string())
+}
+
+fn save_as_blocking_error(st: &AppState) -> Option<String> {
+    if st.fragment_analyzer_mode() {
+        Some(
+            "Fragment Analyzer runs can only be saved in place by updating the .txt sidecar"
+                .to_string(),
+        )
+    } else if st.has_marker_overrides() {
+        Some(
+            "Marker adjustments are session-only; reset markers before Save As, or export CSV/PNG with marker provenance instead."
+                .to_string(),
+        )
+    } else {
+        None
     }
 }
 
@@ -1264,7 +1632,7 @@ fn export_peak_table_dialog(ui: &AppWindow, st: &SharedState) {
 }
 
 fn export_run_peak_table_dialog(ui: &AppWindow, st: &SharedState) {
-    if !can_export_processed_samples(&st.borrow()) {
+    if !can_export_run_peak_table(&st.borrow()) {
         set_status_error(
             ui,
             st,
@@ -1287,7 +1655,7 @@ fn export_run_peak_table_dialog(ui: &AppWindow, st: &SharedState) {
 
     let result = {
         let s = st.borrow();
-        if !can_export_processed_samples(&s) {
+        if !can_export_run_peak_table(&s) {
             Err(anyhow::anyhow!("no processed samples are available"))
         } else {
             export::write_run_peak_table_csv(&dst, s.run(), table_x_axis(&s))
@@ -1297,7 +1665,7 @@ fn export_run_peak_table_dialog(ui: &AppWindow, st: &SharedState) {
 }
 
 fn export_trace_data_dialog(ui: &AppWindow, st: &SharedState) {
-    if !can_export_processed_samples(&st.borrow()) {
+    if !can_export_trace_data(&st.borrow()) {
         set_status_error(
             ui,
             st,
@@ -1320,21 +1688,77 @@ fn export_trace_data_dialog(ui: &AppWindow, st: &SharedState) {
 
     let result = {
         let s = st.borrow();
-        if !can_export_processed_samples(&s) {
+        if !can_export_trace_data(&s) {
             Err(anyhow::anyhow!("no processed trace data is available"))
         } else {
-            let samples: Vec<&traceio::Sample> = if s.selection().len() > 1 {
+            let samples: Vec<export::TraceSample<'_>> = if s.selection().len() > 1 {
                 s.selection()
                     .iter()
-                    .filter_map(|&idx| s.run().samples.get(idx))
+                    .copied()
+                    .filter(|&sample_index| s.sample_has_processed_data(sample_index))
+                    .filter_map(|sample_index| {
+                        s.run()
+                            .samples
+                            .get(sample_index)
+                            .map(|sample| export::TraceSample {
+                                sample_index,
+                                sample,
+                            })
+                    })
                     .collect()
             } else {
-                s.run().samples.get(s.primary()).into_iter().collect()
+                s.run()
+                    .samples
+                    .get(s.primary())
+                    .map(|sample| export::TraceSample {
+                        sample_index: s.primary(),
+                        sample,
+                    })
+                    .into_iter()
+                    .collect()
             };
             export::write_trace_data_csv(&dst, &samples, export::DEFAULT_TRACE_COLUMNS)
         }
     };
     finish_export(ui, st, "Export trace data", &dst, result);
+}
+
+fn export_raw_channels_dialog(ui: &AppWindow, st: &SharedState) {
+    if !can_export_raw_channels(&st.borrow()) {
+        set_status_error(
+            ui,
+            st,
+            "No raw detector channels are available to export".to_string(),
+        );
+        return;
+    }
+
+    let start_name = {
+        let s = st.borrow();
+        format!("{}_raw_channels.csv", export_run_stem(&s))
+    };
+    let Some(dst) = rfd::FileDialog::new()
+        .add_filter("CSV", &["csv"])
+        .set_file_name(start_name)
+        .save_file()
+    else {
+        return;
+    };
+
+    let result = {
+        let s = st.borrow();
+        if !can_export_raw_channels(&s) {
+            Err(anyhow::anyhow!("no raw detector channels are available"))
+        } else {
+            let channels = raw_channels_for_export(&s);
+            export::write_raw_channels_csv(&dst, &channels)
+        }
+    };
+    finish_export(ui, st, "Export raw detector channels", &dst, result);
+}
+
+fn raw_channels_for_export(st: &AppState) -> Vec<&traceio::xad::RawChannel> {
+    st.raw_channels().iter().collect()
 }
 
 fn export_metadata_qc_dialog(ui: &AppWindow, st: &SharedState) {
@@ -1360,23 +1784,35 @@ fn export_metadata_qc_dialog(ui: &AppWindow, st: &SharedState) {
         if !can_export_metadata_qc(&s) {
             Err(anyhow::anyhow!("no run metadata is available"))
         } else {
-            export::write_metadata_qc_csv_with_notes(&dst, s.run(), Some(s.metadata_text()))
+            let notes = metadata_export_notes(&s);
+            export::write_metadata_qc_csv_with_notes_and_provenance(
+                &dst,
+                s.run(),
+                Some(notes.as_str()),
+                s.has_marker_overrides(),
+            )
         }
     };
     finish_export(ui, st, "Export metadata/QC", &dst, result);
 }
 
 fn export_plot_png_dialog(ui: &AppWindow, st: &SharedState) {
-    if !can_export_plot(&st.borrow()) {
+    let Some(tab) = ExportPlotTab::from_tab_index(ui.get_active_tab()) else {
+        set_status_error(ui, st, "No plot is available on this tab".to_string());
+        return;
+    };
+    if !can_export_plot_for_tab(&st.borrow(), tab) {
         set_status_error(ui, st, "No plot is available to export".to_string());
         return;
     }
-    let export_overview = ui.get_active_tab() == 1;
 
     let start_name = {
         let s = st.borrow();
-        let suffix = if export_overview { "overview" } else { "plot" };
-        let stem = if export_overview {
+        let suffix = match tab {
+            ExportPlotTab::Detail => "plot",
+            ExportPlotTab::Overview => "overview",
+        };
+        let stem = if tab == ExportPlotTab::Overview {
             export_run_stem(&s)
         } else {
             export_stem(&s)
@@ -1393,9 +1829,9 @@ fn export_plot_png_dialog(ui: &AppWindow, st: &SharedState) {
 
     let result = {
         let s = st.borrow();
-        if !can_export_plot(&s) {
+        if !can_export_plot_for_tab(&s, tab) {
             Err(anyhow::anyhow!("no plot is available"))
-        } else if export_overview {
+        } else if tab == ExportPlotTab::Overview {
             match render_overview_bitmap(&s) {
                 Some((buf, w, h)) => export::write_rgb_png(&dst, &buf, w, h),
                 None => Err(anyhow::anyhow!("no overview is available")),
@@ -1415,15 +1851,47 @@ fn export_plot_png_dialog(ui: &AppWindow, st: &SharedState) {
             export::write_rgb_png(&dst, &buf, plot::PLOT_W, plot::PLOT_H)
         }
     };
-    finish_export(ui, st, "Export plot", &dst, result);
+    let marker_note = {
+        let s = st.borrow();
+        match tab {
+            ExportPlotTab::Detail => s.has_marker_overrides(),
+            ExportPlotTab::Overview => overview_marker_overrides_active(&s),
+        }
+    };
+    finish_export_with_marker_note(ui, st, "Export plot", &dst, result, marker_note);
 }
 
 fn can_export_peak_table(st: &AppState) -> bool {
-    st.active_file().is_some() && !st.raw_mode() && st.run().samples.get(st.primary()).is_some()
+    st.active_file().is_some()
+        && !st.raw_mode()
+        && st
+            .run()
+            .samples
+            .get(st.primary())
+            .is_some_and(|sample| sample_has_table_rows(st.run(), sample))
 }
 
-fn can_export_processed_samples(st: &AppState) -> bool {
-    st.active_file().is_some() && !st.raw_mode() && !st.run().samples.is_empty()
+fn can_export_run_peak_table(st: &AppState) -> bool {
+    st.active_file().is_some()
+        && !st.raw_mode()
+        && st
+            .run()
+            .samples
+            .iter()
+            .any(|sample| sample_has_table_rows(st.run(), sample))
+}
+
+fn can_export_trace_data(st: &AppState) -> bool {
+    st.active_file().is_some()
+        && !st.raw_mode()
+        && st
+            .selection()
+            .iter()
+            .any(|&sample_index| st.sample_has_processed_data(sample_index))
+}
+
+fn can_export_raw_channels(st: &AppState) -> bool {
+    st.active_file().is_some() && st.raw_mode() && !st.raw_channels().is_empty()
 }
 
 fn can_export_metadata_qc(st: &AppState) -> bool {
@@ -1431,7 +1899,41 @@ fn can_export_metadata_qc(st: &AppState) -> bool {
 }
 
 fn can_export_plot(st: &AppState) -> bool {
-    st.active_file().is_some() && st.primary() < st.entry_count()
+    can_export_plot_for_tab(st, ExportPlotTab::Detail)
+        || can_export_plot_for_tab(st, ExportPlotTab::Overview)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportPlotTab {
+    Detail,
+    Overview,
+}
+
+impl ExportPlotTab {
+    fn from_tab_index(idx: i32) -> Option<Self> {
+        match idx {
+            0 => Some(Self::Detail),
+            1 => Some(Self::Overview),
+            _ => None,
+        }
+    }
+}
+
+fn can_export_plot_for_tab(st: &AppState, tab: ExportPlotTab) -> bool {
+    if st.active_file().is_none() {
+        return false;
+    }
+    match tab {
+        ExportPlotTab::Detail => {
+            st.primary() < st.entry_count()
+                && (st.raw_mode() || st.sample_has_processed_data(st.primary()))
+        }
+        ExportPlotTab::Overview => render_overview_bitmap(st).is_some(),
+    }
+}
+
+fn sample_has_table_rows(run: &traceio::Electrophoresis, sample: &traceio::Sample) -> bool {
+    !sample.peaks.is_empty() || !sample.regions.is_empty() || !run.regions.is_empty()
 }
 
 fn finish_export(
@@ -1441,12 +1943,29 @@ fn finish_export(
     dst: &std::path::Path,
     result: anyhow::Result<()>,
 ) {
+    let marker_note = st.borrow().has_marker_overrides();
+    finish_export_with_marker_note(ui, st, operation, dst, result, marker_note);
+}
+
+fn finish_export_with_marker_note(
+    ui: &AppWindow,
+    st: &SharedState,
+    operation: &str,
+    dst: &std::path::Path,
+    result: anyhow::Result<()>,
+    marker_note: bool,
+) {
     match result {
         Ok(()) => {
             let message = format!(
-                "{}: {}",
+                "{}: {}{}",
                 operation.replacen("Export", "Exported", 1),
-                dst.display()
+                dst.display(),
+                if marker_note {
+                    " (session marker overrides active)"
+                } else {
+                    ""
+                }
             );
             {
                 let mut s = st.borrow_mut();
@@ -1460,14 +1979,31 @@ fn finish_export(
     }
 }
 
+fn metadata_export_notes(st: &AppState) -> String {
+    let mut notes = String::new();
+    if st.has_marker_overrides() {
+        notes.push_str(
+            "Session marker overrides are active; calibrated lengths, concentrations, and molarity values were recomputed in this GUI session and are not persisted in the source file.\n",
+        );
+    }
+    if !st.metadata_text().trim().is_empty() {
+        notes.push_str(st.metadata_text());
+    }
+    notes
+}
+
 fn set_status_error(ui: &AppWindow, st: &SharedState, message: String) {
     {
         let mut s = st.borrow_mut();
-        s.error = Some(message.clone());
-        s.status = None;
+        set_status_error_state(&mut s, message.clone());
     }
     ui.set_error_text(SharedString::from(message));
     ui.set_status_text(SharedString::default());
+}
+
+fn set_status_error_state(st: &mut AppState, message: String) {
+    st.error = Some(message);
+    st.status = None;
 }
 
 fn export_stem(st: &AppState) -> String {
@@ -1508,7 +2044,9 @@ fn export_run_stem(st: &AppState) -> String {
 }
 
 fn strip_known_extension(name: &str) -> &str {
-    for suffix in [".xml.gz", ".csv.gz", ".xml", ".csv", ".xad", ".zip", ".raw"] {
+    for suffix in [
+        ".xml.gz", ".csv.gz", ".fa.zip", ".xml", ".csv", ".xad", ".zip", ".raw",
+    ] {
         if let Some(stripped) = name.strip_suffix(suffix) {
             return stripped;
         }
@@ -1538,28 +2076,74 @@ fn sanitize_export_stem(raw: &str) -> String {
 /// Write the current run to `dst`, using the loaded source file as the template,
 /// then adopt `dst` as the new source and clear the dirty flag.
 fn do_save(ui: &AppWindow, st: &SharedState, dst: std::path::PathBuf) {
-    let result = {
+    struct SavedRun {
+        loaded: loading::Loaded,
+        metadata: Option<LoadedFaMetadata>,
+    }
+
+    let result = (|| -> anyhow::Result<SavedRun> {
         let s = st.borrow();
         match s.source_path() {
-            Some(src) => traceio::save::save_run(s.run(), &src, &dst),
+            Some(src) => {
+                if save_destination_conflict(&s, &dst).is_some() {
+                    anyhow::bail!(
+                        "destination {} is already open; close that file before saving over it",
+                        dst.display()
+                    );
+                }
+                traceio::save::save_run(s.run(), &src, &dst)?;
+                let loaded = loading::load(&dst)?;
+                let metadata = loaded_fa_metadata(&dst, loaded.fa_metadata.clone());
+                Ok(SavedRun { loaded, metadata })
+            }
             None => Err(anyhow::anyhow!("no source file to save from")),
         }
-    };
+    })();
     match result {
-        Ok(()) => {
-            {
+        Ok(saved) => {
+            let marker_note = st.borrow().has_marker_overrides();
+            let table = {
                 let mut s = st.borrow_mut();
-                s.set_dirty(false);
-                s.set_source_path(Some(dst));
-                s.error = None;
-                s.status = Some("Saved changes".to_string());
-            }
+                let source = saved.loaded.source.identity.clone();
+                let source_capabilities = saved.loaded.source.capabilities;
+                let save_capabilities = saved.loaded.source.save_capabilities();
+                s.replace_active_file_with_capabilities(
+                    saved.loaded.run,
+                    saved.loaded.raw_channels,
+                    Some(source),
+                    source_capabilities,
+                    save_capabilities,
+                );
+                s.set_active_opened_path(Some(dst.clone()));
+                let metadata_warning = saved.metadata.and_then(|metadata| {
+                    s.set_active_metadata_text(metadata.text);
+                    s.set_active_metadata_rows(metadata.rows);
+                    metadata.warning
+                });
+                s.error = join_optional_messages([saved.loaded.warning, metadata_warning]);
+                if s.has_marker_overrides() {
+                    if let Err(e) = commit_recalibration(&mut s) {
+                        let recalibration_warning = Some(format!(
+                            "Could not reapply marker overrides after save: {e:#}"
+                        ));
+                        s.error = join_optional_messages([s.error.take(), recalibration_warning]);
+                    }
+                }
+                s.status = Some(if marker_note {
+                    "Saved sample-name changes; marker adjustments remain session-only".to_string()
+                } else {
+                    "Saved changes".to_string()
+                });
+                refresh_all(ui, &mut s)
+            };
+            table.apply(ui);
             let s = st.borrow();
             ui.set_can_save(s.is_dirty() && s.can_save());
             ui.set_can_save_as(s.can_save_as());
-            ui.set_error_text(SharedString::default());
+            ui.set_error_text(SharedString::from(s.error.clone().unwrap_or_default()));
             ui.set_status_text(SharedString::from(s.status.clone().unwrap_or_default()));
             refresh_tree(ui, &s);
+            show_selected(ui, &s);
         }
         Err(e) => {
             let message = format!("Save failed: {e:#}");
@@ -1572,6 +2156,11 @@ fn do_save(ui: &AppWindow, st: &SharedState, dst: std::path::PathBuf) {
             ui.set_status_text(SharedString::default());
         }
     }
+}
+
+fn save_destination_conflict(st: &AppState, dst: &std::path::Path) -> Option<usize> {
+    st.find_file_by_source(dst)
+        .filter(|&existing| Some(existing) != st.active)
 }
 
 fn rgb_to_image(buf: &[u8], w: u32, h: u32) -> Image {
@@ -1684,8 +2273,8 @@ fn drag_marker(ui: &AppWindow, state: &SharedState, drag: MarkerDrag, dfx: f64) 
         }
         let vp = current_viewport(&st);
         let span = vp.x_max - vp.x_min;
-        let ov = st.overrides().get(&idx).copied();
-        let (lo, up) = marker_times(st.run(), idx, ov.as_ref());
+        let previous = st.overrides().get(&idx).copied();
+        let (lo, up) = marker_times(st.run(), idx, previous.as_ref());
         let cur = match drag.marker {
             Marker::Lower => lo,
             Marker::Upper => up,
@@ -1718,6 +2307,7 @@ fn drag_marker(ui: &AppWindow, state: &SharedState, drag: MarkerDrag, dfx: f64) 
         build_table_refresh(&mut st)
     };
     table.apply(ui);
+    refresh_tree(ui, &state.borrow());
     ui.set_error_text(SharedString::from(
         state.borrow().error.clone().unwrap_or_default(),
     ));
@@ -1846,4 +2436,252 @@ fn valid_marker_time(st: &AppState, idx: usize, marker: Marker, requested: f64) 
         }
     }
     (t >= min_t && t <= max_t).then_some(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use traceio::{AssayInfo, Sample};
+
+    fn sample(well_number: i32, is_ladder: bool) -> Sample {
+        Sample {
+            well_number,
+            name: format!("S{well_number}"),
+            category: String::new(),
+            is_ladder,
+            comment: String::new(),
+            observations: String::new(),
+            rin: None,
+            time: vec![0.0, 1.0],
+            fluorescence: vec![1.0, 2.0],
+            aligned_time: Vec::new(),
+            length: Vec::new(),
+            concentration: Vec::new(),
+            molarity: Vec::new(),
+            peaks: Vec::new(),
+            regions: Vec::new(),
+        }
+    }
+
+    fn metadata_only_sample(well_number: i32) -> Sample {
+        Sample {
+            time: Vec::new(),
+            fluorescence: Vec::new(),
+            ..sample(well_number, false)
+        }
+    }
+
+    fn run(name: &str, samples: Vec<Sample>) -> Electrophoresis {
+        Electrophoresis {
+            assay: AssayInfo {
+                file_name: name.to_string(),
+                ..Default::default()
+            },
+            ladder_peaks: Vec::new(),
+            regions: Vec::new(),
+            samples,
+        }
+    }
+
+    #[test]
+    fn overview_export_is_unavailable_when_no_samples_are_visible() {
+        let mut st = AppState::new(
+            run("ladders.xml", vec![sample(1, true)]),
+            Vec::new(),
+            None,
+            None,
+        );
+
+        assert!(!can_export_plot_for_tab(&st, ExportPlotTab::Overview));
+
+        st.overview_show_ladders = true;
+        assert!(can_export_plot_for_tab(&st, ExportPlotTab::Overview));
+    }
+
+    #[test]
+    fn overview_export_is_unavailable_for_metadata_only_samples() {
+        let mut st = AppState::new(
+            run("metadata.xml", vec![metadata_only_sample(1)]),
+            Vec::new(),
+            None,
+            None,
+        );
+
+        assert!(!can_export_plot_for_tab(&st, ExportPlotTab::Overview));
+
+        st.overview_gel = true;
+        assert!(!can_export_plot_for_tab(&st, ExportPlotTab::Overview));
+    }
+
+    #[test]
+    fn overview_export_remains_available_when_any_sample_has_trace_data() {
+        let mut st = AppState::new(
+            run("mixed.xml", vec![metadata_only_sample(1), sample(2, false)]),
+            Vec::new(),
+            None,
+            None,
+        );
+
+        assert!(can_export_plot_for_tab(&st, ExportPlotTab::Overview));
+
+        st.overview_gel = true;
+        assert!(can_export_plot_for_tab(&st, ExportPlotTab::Overview));
+    }
+
+    #[test]
+    fn multi_file_overview_labels_use_opened_file_labels() {
+        let mut st = AppState::new(
+            run("duplicate-assay.xml", vec![sample(1, false)]),
+            Vec::new(),
+            Some(PathBuf::from("/canonical/a.raw")),
+            None,
+        );
+        st.set_active_opened_path(Some(PathBuf::from("/opened/first.fa.zip")));
+        st.add_file(
+            run("duplicate-assay.xml", vec![sample(1, false)]),
+            Vec::new(),
+            Some(PathBuf::from("/canonical/b.raw")),
+        );
+        st.set_active_opened_path(Some(PathBuf::from("/opened/second.fa.zip")));
+
+        let (combined, _) = overview_combined(&st);
+
+        assert_eq!(combined.samples[0].name, "first.fa.zip · S1");
+        assert_eq!(combined.samples[1].name, "second.fa.zip · S1");
+    }
+
+    #[test]
+    fn overview_marker_provenance_checks_all_contributing_files() {
+        let mut st = AppState::new(run("a.xml", vec![sample(1, false)]), Vec::new(), None, None);
+        st.add_file(run("b.xml", vec![sample(1, false)]), Vec::new(), None);
+        st.active = Some(0);
+        st.files[1].overrides.insert(
+            0,
+            MarkerOverride {
+                lower_time: Some(0.2),
+                upper_time: None,
+            },
+        );
+
+        assert!(!st.has_marker_overrides());
+        assert!(overview_marker_overrides_active(&st));
+    }
+
+    #[test]
+    fn save_destination_conflict_rejects_other_open_file() {
+        let mut st = AppState::new(
+            run("a.xml", vec![sample(1, false)]),
+            Vec::new(),
+            Some(PathBuf::from("/tmp/a.xml")),
+            None,
+        );
+        st.add_file(
+            run("b.xml", vec![sample(1, false)]),
+            Vec::new(),
+            Some(PathBuf::from("/tmp/b.xml")),
+        );
+        st.active = Some(0);
+
+        assert_eq!(
+            save_destination_conflict(&st, PathBuf::from("/tmp/b.xml").as_path()),
+            Some(1)
+        );
+        assert_eq!(
+            save_destination_conflict(&st, PathBuf::from("/tmp/a.xml").as_path()),
+            None
+        );
+    }
+
+    #[test]
+    fn overview_marker_provenance_ignores_hidden_sample_overrides() {
+        let mut st = AppState::new(
+            run("run.xml", vec![sample(1, true), sample(2, false)]),
+            Vec::new(),
+            None,
+            None,
+        );
+        st.overview_show_ladders = false;
+        st.overrides_mut().insert(
+            0,
+            MarkerOverride {
+                lower_time: Some(0.2),
+                upper_time: None,
+            },
+        );
+
+        assert!(!overview_marker_overrides_active(&st));
+
+        st.overrides_mut().insert(
+            1,
+            MarkerOverride {
+                lower_time: Some(0.3),
+                upper_time: None,
+            },
+        );
+        assert!(overview_marker_overrides_active(&st));
+    }
+
+    #[test]
+    fn save_as_gui_filter_only_offers_plain_xml_extension() {
+        assert_eq!(SAVE_AS_XML_EXTENSIONS, &["xml"]);
+    }
+
+    #[test]
+    fn save_as_start_name_does_not_double_xml_gz_source_suffix() {
+        assert_eq!(
+            save_as_start_name(Some(PathBuf::from("run.xml.gz").as_path())),
+            "run.xml"
+        );
+        assert_eq!(
+            save_as_start_name(Some(PathBuf::from("run.xad").as_path())),
+            "run.xml"
+        );
+    }
+
+    #[test]
+    fn save_as_fragment_analyzer_reports_state_backed_error() {
+        let mut run = run("run.raw", vec![sample(1, false)]);
+        run.assay.assay_name = "Fragment Analyzer".to_string();
+        let mut st = AppState::new(run, Vec::new(), Some(PathBuf::from("run.raw")), None);
+        st.status = Some("Ready".to_string());
+        let message =
+            "Fragment Analyzer runs can only be saved in place by updating the .txt sidecar"
+                .to_string();
+
+        assert_eq!(save_as_blocking_error(&st), Some(message.clone()));
+
+        set_status_error_state(&mut st, message.clone());
+        assert_eq!(st.error, Some(message));
+        assert_eq!(st.status, None);
+    }
+
+    #[test]
+    fn save_as_marker_overrides_report_state_backed_error() {
+        let mut st = AppState::new(
+            run("run.xml", vec![sample(1, false)]),
+            Vec::new(),
+            Some(PathBuf::from("run.xml")),
+            None,
+        );
+        st.overrides_mut().insert(
+            0,
+            MarkerOverride {
+                lower_time: Some(0.2),
+                upper_time: None,
+            },
+        );
+
+        assert_eq!(
+            save_as_blocking_error(&st),
+            Some(
+                "Marker adjustments are session-only; reset markers before Save As, or export CSV/PNG with marker provenance instead."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn export_plot_is_unavailable_on_metadata_tab() {
+        assert_eq!(ExportPlotTab::from_tab_index(2), None);
+    }
 }

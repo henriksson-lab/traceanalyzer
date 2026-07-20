@@ -15,6 +15,7 @@ fn main() -> anyhow::Result<()> {
     println!("Path:        {}", loaded.source.path.display());
     println!("Identity:    {}", loaded.source.identity.display());
     println!("Format:      {:?}", loaded.source.format);
+    println!("Save:        {:?}", loaded.save_capabilities());
     println!("File:        {}", run.assay.file_name);
     println!(
         "Assay:       {} ({})",

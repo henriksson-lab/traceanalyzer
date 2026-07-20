@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/vnd.agilent.xad">
+    <comment>Agilent Bioanalyzer chip data</comment>
+    <glob pattern="*.xad"/>
+    <glob pattern="*.XAD"/>
+  </mime-type>
+  <mime-type type="application/vnd.agilent.fragment-analyzer.raw">
+    <comment>Agilent Fragment Analyzer raw run data</comment>
+    <magic priority="80">
+      <match type="string" value="FA\0\0" offset="0"/>
+    </magic>
+  </mime-type>
+  <mime-type type="application/vnd.agilent.fragment-analyzer.archive">
+    <comment>Agilent Fragment Analyzer zipped run</comment>
+    <glob pattern="*.fa.zip"/>
+    <glob pattern="*.FA.ZIP"/>
+  </mime-type>
+</mime-info>

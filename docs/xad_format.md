@@ -16,7 +16,7 @@ A `.xad` is a text/XML wrapper file. Its analytical payload is a single
 
 Crucially — see [§5](#5-key-finding-xad-holds-raw-acquisition-not-results) —
 the inner XML of these files is the **raw acquisition** layout: raw detector
-signals plus per-sample *metadata*. It does **not** contain the processed
+signals plus limited per-sample/assay fields. It does **not** contain the processed
 per-well electropherograms, called peaks, sizing, concentration, or RIN. 2100
 Expert recomputes all of those when the file is opened; only exports/reports
 (`File → Export to XML`, PDF) capture the processed results.
@@ -107,10 +107,10 @@ and `RedFluorescence`, each a single **whole-chip continuous acquisition**
 (~38k samples covering *all* wells in time order, before the software splits
 them per well).
 
-### 4b. `Chip/Files/File/Samples/Sample` — per-sample metadata
+### 4b. `Chip/Files/File/Samples/Sample` — per-sample fields
 
 Same path as the export. But in the `.xad` each `<Sample>` contains **only
-metadata**: `Index`, `HasData`, `Category` (e.g. `"Ladder"`), `Name`,
+descriptive fields**: `Index`, `HasData`, `Category` (e.g. `"Ladder"`), `Name`,
 `Comment`, `WellNumber`, `DASampleSetpoints`, review/workflow status, etc.
 There is **no `DASignals`**, no per-well `ProcessedSignal`, and no
 `DAResultStructures`/`PeakMolecular` under the samples.
@@ -138,7 +138,8 @@ peaks, aligns markers, sizes against the ladder and computes RIN on open** — t
 `.xad` persists only the raw signals and setpoints.
 
 **Implication for an open-source replacement:** decoding the container gets you
-the raw detector electropherograms + sample metadata + assay setpoints. To
+the raw detector electropherograms plus the sample/assay fields currently mapped
+by the reader. To
 reproduce the numbers the software shows (and that appear in exports), we must
 implement the processing pipeline ourselves: per-well splitting from the
 continuous acquisition, baseline subtraction, marker alignment, peak detection,
@@ -166,8 +167,9 @@ grimbough/bioanalyzeR `readXAD.R` was the starting point. What we found differs:
    as a fallback for older files.
 3. **Contents.** The inner XML `readXAD.R` + jwfoley `bioanalyzer.R` consume has
    per-well `ProcessedSignal` and `PeakMolecular` (i.e. processed results).
-   These real `.xad` files contain **neither** — only raw signals + metadata
-   (§5). So on current files, native `.xad` is a raw-data source, and the
+   These real `.xad` files contain **neither** — only raw signals plus limited
+   sample/assay fields (§5). So on current files, native `.xad` is a raw-data
+   source, and the
    processed per-well data must be computed or read from an export.
 
 ## 7. Decoder recipe (summary)

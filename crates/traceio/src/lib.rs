@@ -21,9 +21,10 @@
 //!   standard FA ladder setpoints and marker-area scaling. Validated against the
 //!   ProSize CSV export.
 //!
-//! Most applications should start with [`io::read_path`] or
-//! [`io::detect_format`]. The format modules remain available for callers that
-//! already know their input type.
+//! Most applications should start with [`io::detect_format`], [`io::read_path`],
+//! and [`io::save_path`]. The format modules remain available for callers that
+//! already know their input type, and [`save::save_run`] remains available when
+//! the source path and run are tracked separately.
 
 pub mod bioanalyzer;
 pub mod calibration;

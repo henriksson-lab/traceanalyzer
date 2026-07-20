@@ -18,12 +18,74 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checks:
-    name: Tests and package checks
+  release-preflight:
+    name: Release preflight
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+
+      - name: Verify release tag matches Cargo version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "Release tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}" >&2
+            exit 1
+          fi
+
+      - name: Verify traceio path dependency version
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import sys
+          import tomllib
+
+          root = pathlib.Path("Cargo.toml")
+          analyzer = pathlib.Path("crates/traceanalyzer/Cargo.toml")
+          traceio = pathlib.Path("crates/traceio/Cargo.toml")
+
+          root_toml = tomllib.loads(root.read_text())
+          analyzer_toml = tomllib.loads(analyzer.read_text())
+          traceio_toml = tomllib.loads(traceio.read_text())
+
+          workspace_version = root_toml["workspace"]["package"]["version"]
+          traceio_package = traceio_toml["package"]
+          traceio_dep = analyzer_toml["dependencies"]["traceio"]
+          dep_path = pathlib.PurePosixPath(traceio_dep["path"])
+          traceio_version = traceio_package.get("version")
+
+          errors = []
+          if dep_path != pathlib.PurePosixPath("../traceio"):
+              errors.append(f"traceanalyzer traceio dependency path is {dep_path!s}, expected ../traceio")
+          if traceio_dep.get("version") != workspace_version:
+              errors.append(
+                  "traceanalyzer traceio dependency version "
+                  f"{traceio_dep.get('version')!r} does not match workspace version {workspace_version!r}"
+              )
+          if not (
+              traceio_version == workspace_version
+              or (isinstance(traceio_version, dict) and traceio_version.get("workspace") is True)
+          ):
+              errors.append("traceio package version does not resolve to the workspace package version")
+
+          if errors:
+              for error in errors:
+                  print(error, file=sys.stderr)
+              sys.exit(1)
+          PY
+
+  checks:
+    name: Tests and package checks
+    needs: release-preflight
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
 
       - name: Install Linux GUI test dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig1-dev
@@ -31,8 +93,14 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Headless GUI render test
-        run: cargo test -p traceanalyzer --test headless_render
+      - name: Test traceanalyzer
+        run: cargo test -p traceanalyzer
+
+      - name: Fetch real-data parser fixtures
+        run: bash scripts/fetch-testdata.sh
+
+      - name: Test traceio
+        run: cargo test -p traceio
 
       - name: Package traceio
         run: cargo package -p traceio --allow-dirty
@@ -43,7 +111,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -59,19 +127,20 @@ jobs:
           Compress-Archive -Path "dist/Trace analyzer.exe" -DestinationPath trace-analyzer-windows-x64.zip
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: trace-analyzer-windows-x64
           path: trace-analyzer-windows-x64.zip
+          if-no-files-found: error
           retention-days: 14
 
   linux-deb:
     name: Debian package
     needs: checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Linux build dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig1-dev
@@ -82,11 +151,16 @@ jobs:
       - name: Build .deb
         run: make deb
 
+      - name: Derive Debian architecture
+        id: deb_arch
+        run: echo "arch=$(dpkg --print-architecture)" >> "$GITHUB_OUTPUT"
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: trace-analyzer-linux-amd64-deb
+          name: trace-analyzer-linux-${{ steps.deb_arch.outputs.arch }}-deb
           path: target/deb/*.deb
+          if-no-files-found: error
           retention-days: 14
 
   macos-app:
@@ -95,7 +169,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -110,10 +184,11 @@ jobs:
         run: ditto -c -k --sequesterRsrc --keepParent "target/osx/Trace analyzer.app" trace-analyzer-macos-universal.zip
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: trace-analyzer-macos-universal
           path: trace-analyzer-macos-universal.zip
+          if-no-files-found: error
           retention-days: 14
 
   release:
@@ -124,17 +199,21 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: trace-analyzer-*
           path: dist
           merge-multiple: true
 
       - name: Create release and upload assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             dist/*.zip
             dist/*.deb

@@ -15,17 +15,23 @@ use traceio::Electrophoresis;
 /// A loaded run plus any raw detector channels (populated for native `.xad`).
 pub struct Loaded {
     pub run: Electrophoresis,
+    pub source: traceio::io::DetectedFormat,
     pub raw_channels: Vec<RawChannel>,
+    pub fa_metadata: Option<traceio::fa::FaMetadata>,
     pub warning: Option<String>,
 }
 
 /// Load any supported electrophoresis path through the public `traceio` API.
 pub fn load(path: &Path) -> Result<Loaded> {
-    let loaded = traceio::io::read_path(path)?;
+    let loaded = traceio::io::read_path_with_metadata(path)?;
+    let fa_metadata = loaded.fa_metadata();
+    let loaded = loaded.loaded;
 
     Ok(Loaded {
         run: loaded.run,
+        source: loaded.source,
         raw_channels: loaded.raw_channels,
+        fa_metadata,
         warning: warnings_to_gui_warning(loaded.warnings),
     })
 }

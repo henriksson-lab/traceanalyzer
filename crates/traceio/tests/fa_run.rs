@@ -162,6 +162,63 @@ fn fa_concentration_and_molarity_are_computed() {
 }
 
 #[test]
+fn path_api_reads_fa_metadata_from_fa_zip() {
+    let Some(dir) = fa_run_dir() else {
+        eprintln!("skipping: fa_examples run not present");
+        return;
+    };
+    let zip_path = std::env::temp_dir().join(format!(
+        "traceio_fa_path_api_{}_{}.fa.zip",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    zip_run_dir(&dir, &zip_path);
+
+    let loaded = traceio::io::read_path_with_metadata(&zip_path).expect("path API reads FA zip");
+
+    assert_eq!(loaded.loaded.source.identity, zip_path);
+    assert!(matches!(
+        loaded.loaded.source.format,
+        traceio::io::TraceFormat::FragmentAnalyzerRun {
+            entry: traceio::io::FragmentAnalyzerEntry::Zip
+        }
+    ));
+    assert!(loaded.fa_metadata().is_some());
+    assert!(!loaded.loaded.run.samples.is_empty());
+    std::fs::remove_file(zip_path).unwrap();
+}
+
+#[test]
+fn path_api_saves_fa_zip_sidecar_names() {
+    let Some(dir) = fa_run_dir() else {
+        eprintln!("skipping: fa_examples run not present");
+        return;
+    };
+    let zip_path = std::env::temp_dir().join(format!(
+        "traceio_fa_path_save_{}_{}.fa.zip",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    zip_run_dir(&dir, &zip_path);
+
+    let mut loaded = traceio::io::read_path(&zip_path).expect("read path API");
+    loaded.run.samples[0].name = "D1: public api rename".to_string();
+
+    assert!(traceio::io::supports_save_path(&loaded, &zip_path));
+    traceio::io::save_path(&loaded, &zip_path).expect("save path API");
+
+    let reloaded = traceio::io::read_path(&zip_path).expect("reload saved FA zip");
+    assert_eq!(reloaded.run.samples[0].name, "D1: public api rename");
+    std::fs::remove_file(zip_path).unwrap();
+}
+
+#[test]
 fn reads_fa_run_from_zip() {
     let Some(dir) = fa_run_dir() else {
         eprintln!("skipping: fa_examples run not present");

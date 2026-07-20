@@ -12,10 +12,12 @@ bash scripts/fetch-testdata.sh
 cargo test -p traceio
 ```
 
-The fixtures are real demo runs (DNA 1000 and Eukaryote Total RNA Nano) from the
+The fixtures are real demo runs (Bioanalyzer DNA 1000 and Eukaryote Total RNA
+Nano, plus a TapeStation D1000 XML/electropherogram CSV export pair) from the
 MIT-licensed [jwfoley/bioanalyzeR](https://github.com/jwfoley/bioanalyzeR)
-package. The script is idempotent — it skips any fixture already present — and
-verifies each download is a valid gzip file.
+package. The script is idempotent: it skips existing fixtures only after
+validating that they are non-empty gzip files, and replaces stale or corrupt
+cached files.
 
 ## build-macos-app.sh
 

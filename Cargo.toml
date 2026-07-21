@@ -1,15 +1,31 @@
-[workspace]
-resolver = "2"
-members = ["crates/traceio", "crates/traceanalyzer"]
-
-[workspace.package]
+[package]
+name = "traceanalyzer"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["Johan Henriksson"]
 repository = "https://github.com/henriksson-lab/traceanalyzer"
+description = "Trace analyzer: open-source post-measurement analysis for automated electrophoresis (Bioanalyzer/TapeStation/Fragment Analyzer)"
+include = [
+    ".github/**",
+    ".gitignore",
+    "assets/**",
+    "build.rs",
+    "Cargo.lock",
+    "Cargo.toml",
+    "docs/*.md",
+    "docs/screenshot.png",
+    "examples/**",
+    "Makefile",
+    "make_release.txt",
+    "packaging/**",
+    "README.md",
+    "scripts/**",
+    "src/**",
+    "tests/**",
+]
 
-[workspace.dependencies]
+[dependencies]
 roxmltree = "0.20"
 base64 = "0.22"
 flate2 = "1"
@@ -17,3 +33,26 @@ encoding_rs = "0.8"
 anyhow = "1"
 # Lean zip support (STORE + DEFLATE only) for single-file Fragment Analyzer runs.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# unstable-winit-030 = access to the winit window-event hook, used for
+# external file drag-and-drop (see main.rs).
+slint = { version = "1", features = ["unstable-winit-030"] }
+# ab_glyph = bundled font (no system-font dependency; works headless/portable).
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series", "area_series", "ab_glyph"] }
+png = "0.18"
+rfd = "0.15"
+# Live serial/COM-port link (M6). Optional so the default build needs no system
+# libraries; `default-features = false` avoids the libudev enumeration backend.
+serialport = { version = "4", optional = true, default-features = false }
+
+[features]
+# Enable the real serial transport (`tracehw::transport::serial`). Off by
+# default; turn on when building against a physical instrument.
+serial = ["dep:serialport"]
+
+[build-dependencies]
+slint-build = "1"
+
+# Embed the app icon into the Windows .exe (Explorer/taskbar). Only pulled in
+# on Windows hosts; build.rs guards its use with #[cfg(windows)].
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

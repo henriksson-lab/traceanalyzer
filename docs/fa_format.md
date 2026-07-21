@@ -5,7 +5,7 @@ Analyzer** run directory (software version `1.2.0.11`). No public spec or parser
 exists for the binary files; the native reader is intentionally partial, and the
 vendor's ProSize **CSV export** (in `Exported_data/`) was used as ground truth
 while reverse-engineering. Implemented in
-[`crates/traceio/src/fa.rs`](../crates/traceio/src/fa.rs).
+[`src/traceio/fa.rs`](../src/traceio/fa.rs).
 
 A run is a directory of sibling files sharing a timestamp stem, e.g.
 `2025 11 19 16H 03M.{raw,raw2D,PKS,ANNT,GANNT,ANAI,RQN,current,txt}` plus
@@ -178,7 +178,7 @@ run opens it exactly once instead of once per file. Only the `.raw`, `.PKS` and
 Fragment Analyzer runs arrive already size-calibrated, so the FA reader fills
 each `Sample::length` directly (scan→bp interpolation from `.PKS` anchors) and
 **skips** the Bioanalyzer marker-based `calibration` path.
-`traceio::io::read_path` dispatches to it via `fa::is_fa_path` (a
+`traceanalyzer::traceio::io::read_path` dispatches to it via `fa::is_fa_path` (a
 `.fa.zip`/`.zip` holding an FA `.raw`, a `.raw` file with the `FA\0\0` magic, or
 a directory holding one). Peaks (with lower/upper marker labels and ladder-well
 detection) are populated from `.PKS`; per-point and per-peak

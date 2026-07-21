@@ -6,7 +6,7 @@ format, [`xad_format.md`](xad_format.md).
 
 ## Layout
 
-- `crates/traceio` — GUI-free library: file readers + the shared
+- `src/traceio` — GUI-free library: file readers + the shared
   `Electrophoresis` data model. Fast to build and test.
   - `model.rs` — common data model (assay info, samples, traces, peaks, ladder).
   - `bioanalyzer.rs` — parser for the Bioanalyzer inner XML.
@@ -15,7 +15,7 @@ format, [`xad_format.md`](xad_format.md).
     Hyman-filtered FMM spline) giving a size (bp/nt) for every trace point.
   - `concentration.rs` — per-point concentration + molarity (trapezoidal area,
     marker-ratio mass coefficients, molecular weight).
-- `crates/traceanalyzer` — Slint GUI: well tree + electropherogram plot.
+- `src` — Slint GUI: well tree + electropherogram plot.
 - `docs/xad_format.md` — reverse-engineered `.xad` container + schema spec.
 - `scripts/fetch-testdata.sh` — download the demo fixtures (they aren't committed).
 - `testdata/` — real demo runs (from jwfoley/bioanalyzeR, MIT).
@@ -70,5 +70,5 @@ this bp/nt axis when a run is calibrated.
    reads the exported XML + `_Electropherogram.csv` (`docs/tapestation_format.md`),
    both into the same `Electrophoresis` model.
 
-[`calibration`]: ../crates/traceio/src/calibration.rs
-[`concentration`]: ../crates/traceio/src/concentration.rs
+[`calibration`]: ../src/traceio/calibration.rs
+[`concentration`]: ../src/traceio/concentration.rs

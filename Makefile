@@ -43,7 +43,7 @@ DEB_FILE := target/deb/$(DEB_NAME)_$(APP_VERSION)_$(DEB_ARCH).deb
 # freedesktop layout. Uses the scalable SVG (any size, no rasterizer needed)
 # plus the committed 256px PNG as a fallback for themes that ignore SVG.
 install:
-	cargo build -p traceanalyzer --release
+	cargo build --release
 	install -Dm755 "$(APP_BINARY)" "$(BINDIR)/$(LINUX_APP_ID)"
 	install -Dm644 packaging/traceanalyzer.desktop \
 		"$(DATADIR)/applications/$(LINUX_APP_ID).desktop"
@@ -51,7 +51,7 @@ install:
 		"$(MIMEPKGDIR)/$(LINUX_APP_ID).xml"
 	install -Dm644 assets/icon.svg \
 		"$(ICONDIR)/scalable/apps/$(LINUX_APP_ID).svg"
-	install -Dm644 crates/traceanalyzer/assets/window-icon.png \
+	install -Dm644 assets/window-icon.png \
 		"$(ICONDIR)/256x256/apps/$(LINUX_APP_ID).png"
 	if [ -z "$(DESTDIR)" ] && command -v update-mime-database >/dev/null 2>&1; then update-mime-database "$(MIMEDIR)"; fi
 	if [ -z "$(DESTDIR)" ] && command -v update-desktop-database >/dev/null 2>&1; then update-desktop-database "$(DATADIR)/applications"; fi
@@ -181,13 +181,13 @@ deb:
 
 # --- macOS .app bundle ------------------------------------------------------
 osx-app:
-	cargo build -p traceanalyzer --release
+	cargo build --release
 	$(MAKE) osx-bundle APP_BUNDLE_BINARY="$(APP_BINARY)"
 
 osx-app-universal:
 	rustup target add x86_64-apple-darwin aarch64-apple-darwin
-	cargo build -p traceanalyzer --release --target x86_64-apple-darwin
-	cargo build -p traceanalyzer --release --target aarch64-apple-darwin
+	cargo build --release --target x86_64-apple-darwin
+	cargo build --release --target aarch64-apple-darwin
 	mkdir -p target/osx
 	lipo -create \
 		target/x86_64-apple-darwin/release/traceanalyzer \

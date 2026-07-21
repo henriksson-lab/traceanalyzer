@@ -9,7 +9,7 @@ and do not need these downloads.
 
 ```sh
 bash scripts/fetch-testdata.sh
-cargo test -p traceio
+cargo test
 ```
 
 The fixtures are real demo runs (Bioanalyzer DNA 1000 and Eukaryote Total RNA

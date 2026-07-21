@@ -1,7 +1,7 @@
 # Agilent 2100 Bioanalyzer `.xad` file format
 
 Reverse-engineered specification of the native `.xad` "chip data" file written
-by Agilent **2100 Expert** software, as implemented by `crates/traceio/src/xad.rs`.
+by Agilent **2100 Expert** software, as implemented by `src/traceio/xad.rs`.
 
 This documents the format as observed in **real files from current 2100 Expert
 output** (High Sensitivity DNA assay, 2026). Where it differs from the original

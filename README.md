@@ -30,14 +30,14 @@ Requires a [Rust toolchain](https://rustup.rs). Build and open a file with:
 
 ```sh
 # GUI viewer — accepts .xad (native raw channels), .xml/.xml.gz, TapeStation CSV, FA .fa.zip/.raw:
-cargo run -p traceanalyzer -- path/to/run.xad
+cargo run -- path/to/run.xad
 ```
 
 To try it without your own data, download the bundled demo runs and open one:
 
 ```sh
 bash scripts/fetch-testdata.sh
-cargo run -p traceanalyzer -- testdata/demo_dna1000.xml.gz
+cargo run -- testdata/demo_dna1000.xml.gz
 ```
 
 Running the GUI needs a working display. On Linux you may also need X11/Wayland

@@ -9,11 +9,11 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done.
   selection, hover) drawn as Slint elements on top. One shared pixel↔data
   transform, defined in Phase A, used by both.
 - **File dialog:** `rfd` (native picker).
-- Library (`traceio`) changes are confined to Phase H (manual markers); all
-  other phases are GUI-only (`crates/traceanalyzer`).
+- Format-reader (`traceio`) changes are confined to Phase H (manual markers);
+  all other phases are GUI-only (`src`).
 - **Headless/CI:** bitmap render tests and examples run without a display. GUI
-  smoke runs need a real display or Xvfb (`xvfb-run -a cargo run -p
-  traceanalyzer -- testdata/demo_dna1000.xml.gz`). Fetch gitignored fixtures
+  smoke runs need a real display or Xvfb (`xvfb-run -a cargo run --
+  testdata/demo_dna1000.xml.gz`). Fetch gitignored fixtures
   first with `bash scripts/fetch-testdata.sh` for parser/file-loading coverage;
   the headless render smoke test does not need downloaded fixtures.
 - **System packages:** Slint/winit/rfd Linux builds may require X11/Wayland and
@@ -25,10 +25,9 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done.
 - [x] `slint` feature `unstable-winit-030` (file-drop hook) — Phase C
 
 ## Packaging/test coverage
-- [x] `traceanalyzer` path dependency on `traceio` includes a version for
-      registry packaging. `cargo package -p traceanalyzer` is blocked until
-      `traceio 0.1.0` is published to the target registry; `--no-verify` still
-      resolves the registry dependency while preparing the package.
+- [x] Repository collapsed to one package; `traceio` now lives under
+      `src/traceio`, so `cargo package` has no internal path-crate registry
+      dependency.
 - [x] Native `.xad` loading surfaces raw-channel decode errors in the GUI instead
       of silently treating them as no raw channels.
 - [x] Headless render coverage asserts dimensions and nonblank plot output.

@@ -1,6 +1,6 @@
 # Agilent TapeStation export format
 
-Notes for the TapeStation reader ([`crates/traceio/src/tapestation.rs`](../crates/traceio/src/tapestation.rs)),
+Notes for the TapeStation reader ([`src/traceio/tapestation.rs`](../src/traceio/tapestation.rs)),
 ported from jwfoley/bioanalyzeR `R/tapestation.R` (MIT) and validated against
 Agilent's own demo exports (the bioanalyzeR `inst/extdata/tapestation` fixtures)
 plus Benchling's `allotropy` reference XMLs.
@@ -65,7 +65,7 @@ uncalibrated traces still plot on the distance axis.
 
 ## Model mapping & limitations
 
-`traceio::io::read_path` dispatches via `tapestation::is_tapestation_path` and,
+`traceanalyzer::traceio::io::read_path` dispatches via `tapestation::is_tapestation_path` and,
 like the Fragment Analyzer path, fills `length` itself and **skips** the Bioanalyzer
 `calibrate`. Peaks carry size/area/concentration/molarity and marker labels from
 the XML. **Per-sample region bounds** are parsed into `Sample::regions` and
@@ -83,5 +83,5 @@ whereas TapeStation marker concentrations vary per sample. Rather than fabricate
 a misleading concentration trace, the y-axis for TapeStation offers fluorescence
 only.
 
-[`calibration::StandardCurve`]: ../crates/traceio/src/calibration.rs
-[`concentration`]: ../crates/traceio/src/concentration.rs
+[`calibration::StandardCurve`]: ../src/traceio/calibration.rs
+[`concentration`]: ../src/traceio/concentration.rs

@@ -37,48 +37,6 @@ jobs:
             exit 1
           fi
 
-      - name: Verify traceio path dependency version
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import pathlib
-          import sys
-          import tomllib
-
-          root = pathlib.Path("Cargo.toml")
-          analyzer = pathlib.Path("crates/traceanalyzer/Cargo.toml")
-          traceio = pathlib.Path("crates/traceio/Cargo.toml")
-
-          root_toml = tomllib.loads(root.read_text())
-          analyzer_toml = tomllib.loads(analyzer.read_text())
-          traceio_toml = tomllib.loads(traceio.read_text())
-
-          workspace_version = root_toml["workspace"]["package"]["version"]
-          traceio_package = traceio_toml["package"]
-          traceio_dep = analyzer_toml["dependencies"]["traceio"]
-          dep_path = pathlib.PurePosixPath(traceio_dep["path"])
-          traceio_version = traceio_package.get("version")
-
-          errors = []
-          if dep_path != pathlib.PurePosixPath("../traceio"):
-              errors.append(f"traceanalyzer traceio dependency path is {dep_path!s}, expected ../traceio")
-          if traceio_dep.get("version") != workspace_version:
-              errors.append(
-                  "traceanalyzer traceio dependency version "
-                  f"{traceio_dep.get('version')!r} does not match workspace version {workspace_version!r}"
-              )
-          if not (
-              traceio_version == workspace_version
-              or (isinstance(traceio_version, dict) and traceio_version.get("workspace") is True)
-          ):
-              errors.append("traceio package version does not resolve to the workspace package version")
-
-          if errors:
-              for error in errors:
-                  print(error, file=sys.stderr)
-              sys.exit(1)
-          PY
-
   checks:
     name: Tests and package checks
     needs: release-preflight
@@ -93,17 +51,17 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Test traceanalyzer
-        run: cargo test -p traceanalyzer
+      - name: Test
+        run: cargo test
 
       - name: Fetch real-data parser fixtures
         run: bash scripts/fetch-testdata.sh
 
-      - name: Test traceio
-        run: cargo test -p traceio
+      - name: Test with parser fixtures
+        run: cargo test
 
-      - name: Package traceio
-        run: cargo package -p traceio --allow-dirty
+      - name: Package
+        run: cargo package --allow-dirty
 
   windows-exe:
     name: Windows executable
@@ -117,7 +75,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        run: cargo build -p traceanalyzer --release
+        run: cargo build --release
 
       - name: Package
         shell: pwsh
